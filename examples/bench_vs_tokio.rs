@@ -76,8 +76,7 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use std::io::{Read, Write};
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
-    use std::os::fd::AsRawFd;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
     use std::thread;
     use std::time::Instant;
 
@@ -481,8 +480,4 @@ mod linux_impl {
         out
     }
 
-    // 留个未使用 trait 用以让 IDE 不抱怨 TcpStream 的 std import；实际 tokio
-    // 那边自己有完整 TcpStream，server 用 std::net 的同名类型。
-    #[allow(dead_code)]
-    fn _unused_imports(_: TcpStream) {}
 }
