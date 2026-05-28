@@ -263,14 +263,43 @@ mod linux_impl {
                 .submit_recv_multishot(fd, BGID, ud_ms)
                 .expect("arm multishot");
         }
-        proactor.submit().expect("submit");
+        let submitted = proactor.submit().expect("submit");
+        eprintln!("[raw] multishot armed; submit() returned n={submitted}");
+        // 早期探：先小窗口 wait + drain 一次，看 multishot 是否真的活
+        proactor.wait_for_cqe(1).expect("wait first cqe");
+        let mut probe_chunks: Vec<(u16, usize, bool)> = Vec::new();
+        proactor.drain_completions(|c| {
+            probe_chunks.push((
+                c.buffer_id().unwrap_or(u16::MAX),
+                c.to_result().unwrap_or(0),
+                c.has_more(),
+            ));
+        });
+        eprintln!(
+            "[raw] first CQE drain: {} entries, first = {:?}",
+            probe_chunks.len(),
+            probe_chunks.first()
+        );
+        // 把 probe 拿到的 chunk 喂回 leftover 然后 recycle
+        let mut leftover_extra: Vec<u8> = Vec::new();
+        for &(bid, n, _more) in &probe_chunks {
+            if bid != u16::MAX && n > 0 {
+                let slice = &buf_ring.buffer(bid)[..n];
+                leftover_extra.extend_from_slice(slice);
+                buf_ring.recycle(bid);
+            }
+        }
 
         // ── Recv loop ────────────────────────────────────────────────────
         let mut arrivals: Vec<Instant> = Vec::with_capacity(stop.cap_hint());
         let mut frame_count = 0_u64;
         let mut leftover = leftover_bytes;
+        leftover.extend_from_slice(&leftover_extra);
         leftover.reserve(64 * 1024);
-        let mut multishot_armed = true;
+        // 如果 probe 阶段 has_more=false 了就 rearm
+        let mut multishot_armed = probe_chunks
+            .last()
+            .map_or(true, |&(_, _, more)| more);
 
         let bench_start = Instant::now();
         let mut had_initial = !leftover.is_empty();
