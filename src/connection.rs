@@ -138,15 +138,28 @@ impl ConnectionConfig {
 
     /// 覆盖 multishot recv 的 provided buffer ring 配置。
     ///
-    /// - `buf_size`：单格字节数。建议覆盖到 ≥ 最常见 frame 大小的 2 倍，让大
-    ///   多数 frame 不跨 boundary。HFT trades/quotes 200B-1KB 用 4 KiB 已足够；
-    ///   订阅 L2 book delta (1-4 KiB) 用 8 KiB；订阅 full snapshot (4-32 KiB)
-    ///   用 32 KiB 起。
-    /// - `entries`：必须非零 2 的幂。整池字节 `entries × buf_size` 决定 burst
-    ///   buffering 能撑多深。默认 256 × 4 KiB = 1 MiB。
+    /// ## 经验法则
     ///
-    /// 内核上限 `entries ≤ 32768`。`buf_size` 没有硬上限但 `entries × buf_size`
-    /// 受限于进程 lockable memory。
+    /// `buf_size ≈ 20 × payload_size`（即每个 buffer 装 ~20 帧）。太小 → CQE
+    /// 数量过多，每帧 dispatch 开销吃满；太大 → cache pressure 上来，memcpy
+    /// 反超 CQE 摊销收益。实测 `benches/ws_ingress_single`：
+    ///
+    /// | payload   | 最优 buf_size | pump_binary vs tokio |
+    /// |-----------|---------------|----------------------|
+    /// | 200 B     | 4 KiB         | 1.33×                |
+    /// | 400 B     | 8 KiB         | 1.21×                |
+    /// | 800 B     | 16 KiB        | 1.01×                |
+    /// | 4 KiB    | 32 KiB+       | （TODO）             |
+    ///
+    /// HFT trades/quotes 200-400B 用默认 4 KiB 就行；订阅 L2 book delta
+    /// (400-1000B) 上 8 KiB；full snapshot (4-16 KiB) 上 32 KiB。
+    ///
+    /// ## entries
+    ///
+    /// 必须非零 2 的幂。整池字节 `entries × buf_size` 决定 burst buffering 能
+    /// 撑多深；默认 256 × 4 KiB = 1 MiB。内核上限 `entries ≤ 32768`。`buf_size`
+    /// 没有硬上限但 `entries × buf_size` 受限于进程 lockable memory（默认
+    /// `RLIMIT_MEMLOCK`）。
     ///
     /// # Panics
     ///
