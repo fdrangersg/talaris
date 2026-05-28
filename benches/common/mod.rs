@@ -181,31 +181,74 @@ impl StopMode {
     }
 }
 
-// ─── PinGuard：作用域期间钉 CPU，drop 时还原（unpin 到全 CPU mask）─────
+// ─── PinGuard：作用域期间钉 CPU，drop 时**精确还原**到 pin 之前的 mask ───
 //
-// 让 variant function 末尾不会忘记 unpin —— 跨 variant 串行跑时，前一个
-// variant 的 affinity 不能影响下一个。
+// 严格控制变量的关键：跨 variant 串行跑时，前一个 variant 的 affinity 不能
+// 影响下一个。
+//
+// 早期实现用 `talaris::proactor::unpin_current_thread()` 还原，但它内部用
+// `core_affinity::get_core_ids()` 拿可见 CPU 数 —— pin 后该 API 只返回当前
+// 单核，于是 unpin 后线程其实仍被夹在那个核上，下一 variant pin 到别的 index
+// 直接 OutOfRange。
+//
+// 现在 pin 前用 `sched_getaffinity` 抓一份 `cpu_set_t`，drop 时
+// `sched_setaffinity` 写回，跟"先 pin 再 unpin"无关，纯 syscall restore。
+// 进一步 `pin_current_thread_to(N)` 的 N 是 visible-cores 的 index 而不是
+// 真 CPU 号 —— 在 mask 完整时（默认 taskset -c 0-7 后），index 0..7 ≡
+// CPU 0..7；mask 被压窄过的话两者就分裂。restore 让 mask 永远停在初始完整态。
 
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct PinGuard {
+    saved: libc::cpu_set_t,
+}
+
+#[cfg(not(target_os = "linux"))]
 #[derive(Debug)]
 pub struct PinGuard;
 
 #[cfg(target_os = "linux")]
 impl PinGuard {
-    /// 钉当前线程到 `cpu`；返回的 guard drop 时还原 affinity。失败仅 warn，
-    /// 不 panic（bench 还能跑，只是 baseline 偏移）。
+    /// 钉当前线程到 `cpu`（visible-cores 的 index）。返回的 guard drop 时
+    /// 精确还原到 pin 之前的 affinity mask。失败 warn 但不 panic。
     #[must_use]
     pub fn pin(label: &str, cpu: usize) -> Self {
+        // SAFETY: cpu_set_t POD，0-init 合法
+        let mut saved: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: saved 是有效栈对象；size 用 size_of 取
+        let rc = unsafe {
+            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut saved)
+        };
+        if rc != 0 {
+            eprintln!(
+                "[{label}] sched_getaffinity failed (errno {}); will not restore on drop",
+                std::io::Error::last_os_error()
+            );
+        }
         if let Err(e) = talaris::proactor::pin_current_thread_to(cpu) {
             eprintln!("[{label}] pin to CPU {cpu} failed: {e}; continuing unpinned");
         }
-        Self
+        Self { saved }
     }
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for PinGuard {
     fn drop(&mut self) {
-        let _ = talaris::proactor::unpin_current_thread();
+        // SAFETY: self.saved 仍存活；size_of 跟 saved 类型匹配
+        let rc = unsafe {
+            libc::sched_setaffinity(
+                0,
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &self.saved,
+            )
+        };
+        if rc != 0 {
+            eprintln!(
+                "[PinGuard] restore affinity failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
     }
 }
 
@@ -215,12 +258,6 @@ impl PinGuard {
     pub fn pin(_label: &str, _cpu: usize) -> Self {
         Self
     }
-}
-
-/// 当 `cpu.is_some()` 时 pin，否则不 pin 也返回一个 noop guard（统一类型）。
-#[cfg(target_os = "linux")]
-pub fn pin_optional(label: &str, cpu: Option<usize>) -> Option<PinGuard> {
-    cpu.map(|c| PinGuard::pin(label, c))
 }
 
 // ─── Sync TCP echo server（单 conn / 单 OS 线程，bench 用一次性 session）
