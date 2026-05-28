@@ -364,16 +364,27 @@ async fn stream_session(
          Connection: Upgrade\r\n\
          Sec-WebSocket-Accept: {accept}\r\n\r\n"
     );
-    if s.write_all(resp.as_bytes()).await.is_err() {
+    if let Err(e) = s.write_all(resp.as_bytes()).await {
+        eprintln!("[stream_session] write upgrade resp failed: {e}");
         return;
     }
+    eprintln!("[stream_session] upgrade OK, entering stream loop");
 
     // ── Stream loop ──
     // write_all(chunk) → block 在 TCP send buffer 满；client drain → 解除。
     // client 关连接后下一次 write 拿到 EPIPE，session 退。
+    let mut total_written: u64 = 0;
     loop {
-        if s.write_all(&chunk_buf).await.is_err() {
-            return;
+        match s.write_all(&chunk_buf).await {
+            Ok(()) => {
+                total_written += chunk_buf.len() as u64;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[stream_session] write_all failed after {total_written} bytes: {e}"
+                );
+                return;
+            }
         }
     }
 }
@@ -448,9 +459,18 @@ pub async fn tokio_recv_ws_binary_frames(
         }
 
         let n = match s.read(&mut recv_buf).await {
-            Ok(0) => break,
+            Ok(0) => {
+                eprintln!(
+                    "[tokio_recv] EOF after {frame_count} frames, leftover={} bytes",
+                    leftover.len()
+                );
+                break;
+            }
             Ok(n) => n,
-            Err(_) => break,
+            Err(e) => {
+                eprintln!("[tokio_recv] read error after {frame_count} frames: {e}");
+                break;
+            }
         };
         leftover.extend_from_slice(&recv_buf[..n]);
 
