@@ -364,27 +364,16 @@ async fn stream_session(
          Connection: Upgrade\r\n\
          Sec-WebSocket-Accept: {accept}\r\n\r\n"
     );
-    if let Err(e) = s.write_all(resp.as_bytes()).await {
-        eprintln!("[stream_session] write upgrade resp failed: {e}");
+    if s.write_all(resp.as_bytes()).await.is_err() {
         return;
     }
-    eprintln!("[stream_session] upgrade OK, entering stream loop");
 
     // ── Stream loop ──
     // write_all(chunk) → block 在 TCP send buffer 满；client drain → 解除。
     // client 关连接后下一次 write 拿到 EPIPE，session 退。
-    let mut total_written: u64 = 0;
     loop {
-        match s.write_all(&chunk_buf).await {
-            Ok(()) => {
-                total_written += chunk_buf.len() as u64;
-            }
-            Err(e) => {
-                eprintln!(
-                    "[stream_session] write_all failed after {total_written} bytes: {e}"
-                );
-                return;
-            }
+        if s.write_all(&chunk_buf).await.is_err() {
+            return;
         }
     }
 }
@@ -394,12 +383,16 @@ async fn stream_session(
 /// 给 bench tokio 端用 —— 用 talaris 自己的 `generate_key` / `parse_header`
 /// 保证两侧 framing 实现完全一致。bench 量的是 IO model（io_uring multishot
 /// vs epoll readiness），不是 tokio-tungstenite 跟 talaris 的 framing 谁快。
+///
+/// 返回 `Ok(leftover)` —— `\r\n\r\n` 之后已经从 socket 拿到的字节。loopback
+/// 上 server 几乎一定把 upgrade response 和第一批 WS 帧合在同一个 TCP packet
+/// 发过来，这块必须传给 recv loop 当 `leftover` 初值，否则前面几千帧凭空消失。
 #[cfg(target_os = "linux")]
 pub async fn tokio_ws_upgrade_client(
     s: &mut tokio::net::TcpStream,
     host: &str,
     path: &str,
-) -> std::io::Result<()> {
+) -> std::io::Result<Vec<u8>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let key = talaris::ws::handshake::generate_key()
@@ -422,21 +415,26 @@ pub async fn tokio_ws_upgrade_client(
             return Err(std::io::Error::other("conn closed mid-handshake"));
         }
         resp.extend_from_slice(&buf[..n]);
-        if resp.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+        if let Some(idx) = resp.windows(4).position(|w| w == b"\r\n\r\n") {
+            // header end = `\r\n\r\n` 后第一字节；之后全是 WS payload
+            let header_end = idx + 4;
+            let leftover = resp[header_end..].to_vec();
+            return Ok(leftover);
         }
     }
-    // bench 不校验 accept hash —— server 是自己起的，trusted
-    Ok(())
 }
 
 /// 在 tokio 端收 WS Binary 帧的 recv loop。每收一帧 push 一个 Instant 到
 /// `arrivals`，给 inter-arrival histogram 用。
 ///
+/// `initial_leftover` 是 upgrade 阶段顺手读到的 WS payload bytes（loopback 上
+/// 这里能有几千字节），必须从这里开始 parse 才不丢帧。
+///
 /// 退出条件：`stop` 触发，或者 socket EOF / 解析错。返回 (arrivals, count)。
 #[cfg(target_os = "linux")]
 pub async fn tokio_recv_ws_binary_frames(
     s: &mut tokio::net::TcpStream,
+    initial_leftover: Vec<u8>,
     stop: StopMode,
     expected_payload: usize,
     bench_start: Instant,
@@ -447,13 +445,48 @@ pub async fn tokio_recv_ws_binary_frames(
     let mut arrivals: Vec<Instant> = Vec::with_capacity(stop.cap_hint());
     let mut frame_count = 0_u64;
 
-    // 256 KiB recv buffer：跟 talaris 的 BUF_RING entry 大小同量级（4KiB × 256
-    // = 1 MiB pool），但 tokio 不能 multi-buffer，单 buffer 就给到 256 KiB 一
-    // 次 read 尽可能多吸。
     let mut recv_buf = vec![0_u8; 256 * 1024];
-    let mut leftover = Vec::<u8>::with_capacity(64 * 1024);
+    let mut leftover: Vec<u8> = initial_leftover;
+    leftover.reserve(64 * 1024);
+
+    // 在进 await 之前先把 initial_leftover 里能解的帧全干掉，免得后面一个空
+    // read 就把这部分扔了。
+    let mut had_initial = !leftover.is_empty();
 
     'outer: loop {
+        // 解 leftover 里现有帧
+        let mut pos = 0_usize;
+        while pos < leftover.len() {
+            match parse_header(&leftover[pos..]) {
+                Ok(Some((hdr, consumed))) => {
+                    let total = consumed + hdr.payload_len as usize;
+                    if leftover.len() - pos < total {
+                        break;
+                    }
+                    debug_assert_eq!(hdr.payload_len as usize, expected_payload);
+                    arrivals.push(Instant::now());
+                    frame_count += 1;
+                    pos += total;
+                    if !stop.keep_going(frame_count, bench_start) {
+                        leftover.drain(..pos);
+                        break 'outer;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("[tokio_recv] parse_header err after {frame_count}: {e}");
+                    leftover.drain(..pos);
+                    break 'outer;
+                }
+            }
+        }
+        leftover.drain(..pos);
+
+        if had_initial {
+            had_initial = false;
+            // 第一轮可能解掉了 initial_leftover 的全部帧；继续 read 流量。
+        }
+
         if !stop.keep_going(frame_count, bench_start) {
             break;
         }
@@ -468,33 +501,11 @@ pub async fn tokio_recv_ws_binary_frames(
             }
             Ok(n) => n,
             Err(e) => {
-                eprintln!("[tokio_recv] read error after {frame_count} frames: {e}");
+                eprintln!("[tokio_recv] read error after {frame_count}: {e}");
                 break;
             }
         };
         leftover.extend_from_slice(&recv_buf[..n]);
-
-        let mut pos = 0_usize;
-        while pos < leftover.len() {
-            match parse_header(&leftover[pos..]) {
-                Ok(Some((hdr, consumed))) => {
-                    let total = consumed + hdr.payload_len as usize;
-                    if leftover.len() - pos < total {
-                        break; // 帧不完整，等下一轮 read
-                    }
-                    debug_assert_eq!(hdr.payload_len as usize, expected_payload);
-                    arrivals.push(Instant::now());
-                    frame_count += 1;
-                    pos += total;
-                    if !stop.keep_going(frame_count, bench_start) {
-                        break 'outer;
-                    }
-                }
-                Ok(None) => break, // 头不完整
-                Err(_) => break 'outer, // 协议错
-            }
-        }
-        leftover.drain(..pos);
     }
 
     (arrivals, frame_count)

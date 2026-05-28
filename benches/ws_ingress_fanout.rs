@@ -321,12 +321,17 @@ mod linux_impl {
                 let h = tokio::spawn(async move {
                     let mut s = TcpStream::connect(addr).await.expect("connect");
                     s.set_nodelay(true).expect("nodelay");
-                    common::tokio_ws_upgrade_client(&mut s, "localhost", "/")
+                    let leftover = common::tokio_ws_upgrade_client(&mut s, "localhost", "/")
                         .await
                         .expect("upgrade");
-                    let (arr, cnt) =
-                        common::tokio_recv_ws_binary_frames(&mut s, stop, payload, bench_start)
-                            .await;
+                    let (arr, cnt) = common::tokio_recv_ws_binary_frames(
+                        &mut s,
+                        leftover,
+                        stop,
+                        payload,
+                        bench_start,
+                    )
+                    .await;
                     use tokio::io::AsyncWriteExt;
                     let _ = s.shutdown().await;
                     (arr, cnt)

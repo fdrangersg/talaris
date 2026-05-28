@@ -284,13 +284,15 @@ mod linux_impl {
             use tokio::net::TcpStream;
             let mut s = TcpStream::connect(addr).await.expect("connect");
             s.set_nodelay(true).expect("nodelay");
-            common::tokio_ws_upgrade_client(&mut s, "localhost", "/")
+            let leftover = common::tokio_ws_upgrade_client(&mut s, "localhost", "/")
                 .await
                 .expect("ws upgrade");
 
             let bench_start = Instant::now();
-            let (arrivals, frame_count) =
-                common::tokio_recv_ws_binary_frames(&mut s, stop, payload, bench_start).await;
+            let (arrivals, frame_count) = common::tokio_recv_ws_binary_frames(
+                &mut s, leftover, stop, payload, bench_start,
+            )
+            .await;
             let elapsed = bench_start.elapsed();
             eprintln!(
                 "[tokio] {} frames in {:.3}s ({:.0} f/s)",
