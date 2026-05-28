@@ -155,7 +155,7 @@ mod linux_impl {
 
         let sock = TcpSocket::new(Domain::V4).expect("socket");
         sock.set_nodelay(true).expect("nodelay");
-        let fd = std::os::fd::AsRawFd::as_raw_fd(&sock);
+        let fd = sock.as_raw_fd();
         let sock_addr = SockAddr::from_std(addr);
 
         let connect_ud = UserData::new(OpKind::Connect, 0);
@@ -230,7 +230,7 @@ mod linux_impl {
         }
 
         // 关连接
-        let raw_fd = std::os::fd::AsRawFd::as_raw_fd(&sock);
+        let raw_fd = sock.as_raw_fd();
         std::mem::forget(sock);
         let close_ud = UserData::new(OpKind::Close, 0);
         // SAFETY: TcpSocket 已 forget，没有别的 RAII 还在追踪 fd

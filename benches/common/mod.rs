@@ -68,7 +68,7 @@ pub fn print_comparison(rows: &[(&str, &Histogram<u64>)]) {
         ("p50", |h| h.value_at_quantile(0.50)),
         ("p99", |h| h.value_at_quantile(0.99)),
         ("p99.9", |h| h.value_at_quantile(0.999)),
-        ("max", Histogram::max),
+        ("max", |h| h.max()),
     ];
 
     print!("{:<10}", "metric");
