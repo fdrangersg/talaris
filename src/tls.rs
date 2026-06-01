@@ -137,6 +137,7 @@ impl TlsAdapter {
     where
         F: FnMut(&[u8]),
     {
+        let mut processed = false;
         while !src.is_empty() {
             if !self.conn.wants_read() {
                 // rustls 的 deframer buffer 满了 —— 先 process_new_packets + drain
@@ -159,8 +160,11 @@ impl TlsAdapter {
                 break;
             }
             self.process_and_drain(dst_ciphertext, &mut on_plaintext)?;
+            processed = true;
         }
-        self.process_and_drain(dst_ciphertext, &mut on_plaintext)?;
+        if !processed {
+            self.process_and_drain(dst_ciphertext, &mut on_plaintext)?;
+        }
         Ok(())
     }
 
