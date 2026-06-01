@@ -104,7 +104,7 @@ pub struct ConnectionConfig {
     pub bgid: u16,
     /// multishot recv 用的 provided buffer 单个 slot 大小（字节）。kernel 每次 RX 最多写满这一格然后 post CQE。
     /// **取多大平衡 latency vs throughput**：
-    /// 小（2 KiB 默认）→ CQE 粒度更细 / 单次 parser 输入更短 / 常见高频小帧更可能落在同一 CQE 内；
+    /// 小（4 KiB 默认）→ CQE 粒度更细 / 单次 parser 输入更短 / 常见高频小帧更可能落在同一 CQE 内；
     /// 大（> 2 KiB）→ CQE 数下降 / 大 payload 不切碎，但 partial frame remainder 处理变贵。详见 [`Self::with_buf_ring`]。
     pub buf_ring_slot_size: u32,
     /// buffer ring entry 数。必须非零 2 的幂。`entries × buf_size` = 整池字节数；

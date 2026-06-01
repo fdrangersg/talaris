@@ -25,7 +25,7 @@
 use super::close::{
     CloseCode, CloseError, encode_close_payload, is_valid_endpoint_sent, parse_close_payload,
 };
-use super::frame::{FrameError, FrameHeader, MAX_HEADER_LEN, OpCode, encode_header};
+use super::frame::{FrameError, FrameHeader, MAX_HEADER_LEN, OpCode, encode_header, parse_header};
 use super::handshake::{
     HandshakeError, UpgradeRequest, encode_upgrade_request, generate_key, verify_upgrade_response,
 };
@@ -131,9 +131,18 @@ enum EmitKind {
     HandshakeComplete,
     Text,
     Binary,
+    BorrowedText,
+    BorrowedBinary,
     Ping,
     Pong,
     Close,
+}
+
+#[derive(Debug)]
+struct BorrowedPayload {
+    payload_start: usize,
+    payload_end: usize,
+    frame_len: usize,
 }
 
 #[derive(Debug)]
@@ -145,6 +154,9 @@ pub struct WsClient {
     recv_buf: CursorBuf,
     /// assembled data message payload。整体 clear 不 drain，仍用 `Vec<u8>`。
     msg_buf: Vec<u8>,
+    /// 未分片、单帧已完整落在 recv_buf 时直接借用 payload，跳过 recv_buf→msg_buf copy。
+    /// `poll_event()` 下一次进入时才 consume 整帧，保证上一轮 Event slice 有效。
+    borrowed_payload: Option<BorrowedPayload>,
     /// 当前 fragmented data message 的初始 opcode（Text 或 Binary）；None = 不在 fragmented 中间
     msg_opcode: Option<OpCode>,
     /// control frame payload buf（≤125 bytes）
@@ -201,6 +213,7 @@ impl WsClient {
             parser: FrameParser::new(),
             recv_buf: CursorBuf::with_capacity(cap_io),
             msg_buf: Vec::with_capacity(cap_msg),
+            borrowed_payload: None,
             msg_opcode: None,
             ctl_buf: [0; 125],
             ctl_len: 0,
@@ -265,6 +278,21 @@ impl WsClient {
                 return None;
             }
 
+            match self.try_emit_borrowed_data() {
+                Ok(BorrowedResult::Emit(kind)) => {
+                    self.last_emitted = Some(kind);
+                    return Some(Ok(self.build_event(kind)));
+                }
+                Ok(BorrowedResult::WaitForMore) => return None,
+                Ok(BorrowedResult::Fallback) => {}
+                Err(e) => {
+                    if self.state != ConnState::Closing {
+                        self.state = ConnState::Closed;
+                    }
+                    return Some(Err(e));
+                }
+            }
+
             match self.advance() {
                 Ok(AdvanceResult::Emit(kind)) => {
                     self.last_emitted = Some(kind);
@@ -280,6 +308,80 @@ impl WsClient {
                 }
             }
         }
+    }
+
+    /// Common inbound market-data path：完整、未分片的 Text/Binary frame 已全部落在
+    /// `recv_buf` 时，直接借用 payload 给 Event。其它情况回退到流式 parser。
+    fn try_emit_borrowed_data(&mut self) -> Result<BorrowedResult, WsError> {
+        if self.state != ConnState::Open
+            || !self.parser.is_idle()
+            || self.msg_opcode.is_some()
+            || self.recv_buf.is_empty()
+        {
+            return Ok(BorrowedResult::Fallback);
+        }
+
+        let Some((header, header_len)) = parse_header(self.recv_buf.as_slice()).map_err(|e| {
+            self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
+            WsError::Frame(e)
+        })?
+        else {
+            return Ok(BorrowedResult::WaitForMore);
+        };
+
+        if header.mask.is_some() {
+            self.queue_close(
+                CloseCode::ProtocolError.as_u16(),
+                "server sent masked frame",
+            );
+            return Err(WsError::Frame(FrameError::ServerSentMaskedFrame));
+        }
+        if !header.fin || !matches!(header.opcode, OpCode::Text | OpCode::Binary) {
+            return Ok(BorrowedResult::Fallback);
+        }
+        if header.payload_len > self.config.max_frame_payload {
+            self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+            return Err(WsError::MessageTooLarge);
+        }
+
+        let payload_len = usize::try_from(header.payload_len).map_err(|_| {
+            self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+            WsError::MessageTooLarge
+        })?;
+        if payload_len > self.config.max_message_size {
+            self.queue_close(
+                CloseCode::MessageTooBig.as_u16(),
+                "message exceeds max_message_size",
+            );
+            return Err(WsError::MessageTooLarge);
+        }
+        let Some(frame_len) = header_len.checked_add(payload_len) else {
+            self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+            return Err(WsError::MessageTooLarge);
+        };
+        if self.recv_buf.len() < frame_len {
+            return Ok(BorrowedResult::WaitForMore);
+        }
+
+        let payload_end = frame_len;
+        let payload = &self.recv_buf.as_slice()[header_len..payload_end];
+        let kind = match header.opcode {
+            OpCode::Text => {
+                if std::str::from_utf8(payload).is_err() {
+                    self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
+                    return Err(WsError::Utf8Invalid);
+                }
+                EmitKind::BorrowedText
+            }
+            OpCode::Binary => EmitKind::BorrowedBinary,
+            _ => unreachable!("guarded above"),
+        };
+        self.borrowed_payload = Some(BorrowedPayload {
+            payload_start: header_len,
+            payload_end,
+            frame_len,
+        });
+        Ok(BorrowedResult::Emit(kind))
     }
 
     /// Drain WS events but only surface Text/Binary data messages to `sink`.
@@ -699,6 +801,14 @@ impl WsClient {
                 Event::Text(s)
             }
             EmitKind::Binary => Event::Binary(&self.msg_buf),
+            EmitKind::BorrowedText => {
+                let payload = self.borrowed_payload();
+                // utf-8 已在 try_emit_borrowed_data 校验
+                let s = std::str::from_utf8(payload)
+                    .unwrap_or_else(|_| unreachable!("borrowed text must retain valid utf-8"));
+                Event::Text(s)
+            }
+            EmitKind::BorrowedBinary => Event::Binary(self.borrowed_payload()),
             EmitKind::Ping => Event::Ping(&self.ctl_buf[..self.ctl_len as usize]),
             EmitKind::Pong => Event::Pong(&self.ctl_buf[..self.ctl_len as usize]),
             EmitKind::Close => {
@@ -725,10 +835,25 @@ impl WsClient {
             Some(EmitKind::Text | EmitKind::Binary) => {
                 self.msg_buf.clear();
             }
+            Some(EmitKind::BorrowedText | EmitKind::BorrowedBinary) => {
+                let borrowed = self
+                    .borrowed_payload
+                    .take()
+                    .expect("borrowed emit must retain payload range");
+                self.recv_buf.consume(borrowed.frame_len);
+            }
             Some(EmitKind::Ping | EmitKind::Pong | EmitKind::Close) => {
                 self.ctl_len = 0;
             }
         }
+    }
+
+    fn borrowed_payload(&self) -> &[u8] {
+        let borrowed = self
+            .borrowed_payload
+            .as_ref()
+            .expect("borrowed emit must retain payload range");
+        &self.recv_buf.as_slice()[borrowed.payload_start..borrowed.payload_end]
     }
 }
 
@@ -745,6 +870,12 @@ enum AdvanceResult {
     Emit(EmitKind),
     Progressed,
     NeedMore,
+}
+
+enum BorrowedResult {
+    Emit(EmitKind),
+    WaitForMore,
+    Fallback,
 }
 
 #[cfg(test)]
@@ -863,6 +994,50 @@ mod tests {
         let err = c.begin_handshake().unwrap_err();
         assert!(matches!(err, WsError::Protocol("handshake already begun")));
         assert_eq!(c.pending_tx().len(), pending_len);
+    }
+
+    #[test]
+    fn complete_text_uses_borrowed_payload_path() {
+        let mut c = mk_client();
+        c.begin_handshake().unwrap();
+        c.ack_tx(c.pending_tx().len());
+        c.feed_recv(&fake_101_response(&c.client_key));
+        c.poll_event(); // consume HandshakeComplete
+
+        c.feed_recv(&server_text(b"borrowed"));
+        match c.poll_event() {
+            Some(Ok(Event::Text(s))) => assert_eq!(s, "borrowed"),
+            other => panic!("expected borrowed Text, got {other:?}"),
+        }
+        assert!(c.msg_buf.is_empty());
+        assert!(c.borrowed_payload.is_some());
+
+        assert!(c.poll_event().is_none());
+        assert!(c.borrowed_payload.is_none());
+        assert!(c.recv_buf.is_empty());
+    }
+
+    #[test]
+    fn split_text_waits_then_uses_borrowed_payload_path() {
+        let mut c = mk_client();
+        c.begin_handshake().unwrap();
+        c.ack_tx(c.pending_tx().len());
+        c.feed_recv(&fake_101_response(&c.client_key));
+        c.poll_event(); // consume HandshakeComplete
+
+        let frame = server_text(b"split");
+        c.feed_recv(&frame[..4]);
+        assert!(c.poll_event().is_none());
+        assert!(c.parser.is_idle());
+        assert!(c.msg_buf.is_empty());
+
+        c.feed_recv(&frame[4..]);
+        match c.poll_event() {
+            Some(Ok(Event::Text(s))) => assert_eq!(s, "split"),
+            other => panic!("expected borrowed Text, got {other:?}"),
+        }
+        assert!(c.msg_buf.is_empty());
+        assert!(c.borrowed_payload.is_some());
     }
 
     #[test]

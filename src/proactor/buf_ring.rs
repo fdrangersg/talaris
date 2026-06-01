@@ -225,7 +225,7 @@ impl BufferRing {
     /// # 边界检查与 panic 行为
     ///
     /// `bid >= self.entries` 直接 panic —— 一个非法 bid 写进 ring 会让 kernel
-    /// 把网络数据 DMA 到 `buf_storage` 之外的随机堆内存（典型 heap UAF / corrupt）。
+    /// 把网络数据写到 `buf_storage` 之外的随机堆内存（典型 heap UAF / corrupt）。
     /// 这是 hot path 但 panic 必须保留：宁可崩在 user space 不要让 kernel 写飞。
     ///
     /// # 与 kernel 的 happens-before

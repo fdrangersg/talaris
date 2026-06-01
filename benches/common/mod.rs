@@ -29,6 +29,8 @@ use hdrhistogram::Histogram;
 
 // ─── HdrHistogram ──────────────────────────────────────────────────────
 
+type Metric = (&'static str, fn(&Histogram<u64>) -> u64);
+
 pub fn new_hist() -> Histogram<u64> {
     Histogram::new_with_bounds(1, 60_000_000_000, 3).expect("hist")
 }
@@ -55,7 +57,7 @@ pub fn print_comparison(rows: &[(&str, &Histogram<u64>)]) {
     if rows.is_empty() {
         return;
     }
-    let cols: [(&str, fn(&Histogram<u64>) -> u64); 5] = [
+    let cols: [Metric; 5] = [
         ("mean", |h| h.mean() as u64),
         ("p50", |h| h.value_at_quantile(0.50)),
         ("p99", |h| h.value_at_quantile(0.99)),
@@ -86,7 +88,7 @@ fn ns(n: u64) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3 + 3);
     for (i, &b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(b as char);
@@ -111,10 +113,10 @@ pub fn arg_opt<T: std::str::FromStr>(key: &str) -> Option<T> {
     let mut it = std::env::args().skip(1);
     let mut found: Option<T> = None;
     while let Some(a) = it.next() {
-        if a == key {
-            if let Some(v) = it.next().and_then(|s| s.parse().ok()) {
-                found = Some(v);
-            }
+        if a == key
+            && let Some(v) = it.next().and_then(|s| s.parse().ok())
+        {
+            found = Some(v);
         }
     }
     found
@@ -138,9 +140,7 @@ impl StopMode {
         let frames: Option<u64> = arg_opt("--frames");
         match (secs, frames) {
             (Some(_), Some(_)) => {
-                eprintln!(
-                    "[bench] --seconds and --frames both given; using --seconds"
-                );
+                eprintln!("[bench] --seconds and --frames both given; using --seconds");
                 Self::Seconds(secs.unwrap())
             }
             (Some(s), None) => Self::Seconds(s),
@@ -212,11 +212,7 @@ impl PinGuard {
 impl Drop for PinGuard {
     fn drop(&mut self) {
         let rc = unsafe {
-            libc::sched_setaffinity(
-                0,
-                std::mem::size_of::<libc::cpu_set_t>(),
-                &self.saved,
-            )
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &self.saved)
         };
         if rc != 0 {
             eprintln!(
@@ -230,7 +226,7 @@ impl Drop for PinGuard {
 #[cfg(not(target_os = "linux"))]
 impl PinGuard {
     #[must_use]
-    pub fn pin(_label: &str, _cpu: usize) -> Self {
+    pub const fn pin(_label: &str, _cpu: usize) -> Self {
         Self
     }
 }
@@ -294,9 +290,7 @@ pub fn spawn_ws_stream_server(
     chunk_buf: std::sync::Arc<Vec<u8>>,
     cpu: Option<usize>,
 ) -> std::thread::JoinHandle<()> {
-    std_listener
-        .set_nonblocking(true)
-        .expect("set_nonblocking");
+    std_listener.set_nonblocking(true).expect("set_nonblocking");
 
     std::thread::Builder::new()
         .name("ws-stream-srv".into())
@@ -324,10 +318,7 @@ pub fn spawn_ws_stream_server(
 }
 
 #[cfg(target_os = "linux")]
-async fn stream_session(
-    mut s: tokio::net::TcpStream,
-    chunk_buf: std::sync::Arc<Vec<u8>>,
-) {
+async fn stream_session(mut s: tokio::net::TcpStream, chunk_buf: std::sync::Arc<Vec<u8>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let _ = s.set_nodelay(true);

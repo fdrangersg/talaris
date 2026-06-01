@@ -20,10 +20,10 @@ socket
   -> BufferRing slot               // TLS ciphertext
   -> rustls.read_tls()
   -> rustls.process_new_packets()
-  -> rustls.reader()               // TLS plaintext
-  -> plain_buf
+  -> rustls.reader().fill_buf()    // borrowed TLS plaintext chunk
   -> WsClient.recv_buf
-  -> pump_out...
+  -> complete Text/Binary frame    // borrowed payload -> sink
+     or fragmented fallback        // copy into msg_buf for reassembly
 ```
 
 talaris 是**为一类很狭窄的 workload 量身做的 io_uring WebSocket client**：
@@ -55,8 +55,8 @@ HFT 行情订阅，单线程吃满 N 条 TCP/TLS WebSocket，要的是 p99.9 尾
 跟 tokio 的最大区别：**没有 executor，没有 future，没有任务调度**。整个 Pool 就是一个
 死循环：`while running { pool.pump(...) }`。你的代码在 `pump` 的回调里同步跑。
 
-这是 1973 年风格的设计 —— 一个线程，一个 hot loop，用 io_uring 让 kernel 直接把数据
-DMA 到你预留的 buffer 里，你只负责取出来用。
+这是 1973 年风格的设计 —— 一个线程，一个 hot loop，用 io_uring 让 kernel 把数据
+copy 到你预留的 buffer 里，你只负责取出来用。
 
 ### 2. Proactor vs Reactor（io_uring 不只是个更快的 epoll）
 
@@ -99,10 +99,11 @@ let mut pool = Pool::new(PoolConfig::default())?;
 [kernel] ─ 生成 CQE: { user_data: conn_id, result: bytes_written, flags: bid|F_MORE }
 [user]   ─ pool.pump() 在 wait_for_cqe 那一行被唤醒
 [user]   ─ Pool 从 CQE 解出 conn_id, 路由到对应 ConnectionState
-[user]   ─ ConnectionState 拿到 buffer ring entry slice, 喂给 WsClient
-[user]   ─ WsClient 先 copy 到自己的 recv buffer，再解 frame header / emit Event::Binary(&[u8])
+[user]   ─ ConnectionState 拿到 buffer ring entry slice, 喂给 rustls 解密
+[user]   ─ rustls plaintext chunk 借给 WsClient, copy 到 recv buffer
+[user]   ─ buf_ring.recycle(bid) 把密文 buffer 那一格还给 kernel
+[user]   ─ 完整单帧直接借用 recv buffer payload；fragmented message 才 copy 到 msg_buf
 [user]   ─ 你的 sink 回调拿到 &[u8] payload, 同步处理
-[user]   ─ buf_ring.recycle(bid) 把那一格还给 kernel
 ```
 
 阻塞 `pump` 路径仍有一次 wait syscall；busy-poll `pump_data_spin` 路径则只轮询
@@ -450,11 +451,15 @@ Tested on Linux 6.x with io_uring features: `SETUP_SQPOLL`,
 | `ws_ingress_raw` | 绕开 Pool + WsClient, 直接 Proactor + BufferRing 收 Binary 帧 |
 | `ws_ingress_single` | Pool.pump vs Pool.pump_data vs tokio (单 conn, 稳态满速) |
 | `ws_ingress_fanout` | N ∈ {1,4,16,64} 条 conn 同时收 (talaris Pool 路由 vs tokio N task) |
+| `binance_live` | Binance Spot 公共 WSS 实盘 TLS ingress：多 symbol 高频 Text JSON 行情 |
 
 跑法：
 ```bash
 taskset -c 0-7 cargo bench --bench ws_ingress_single -- \
     --seconds 5 --payload 400 --buf-size 8192
+
+taskset -c 0-7 cargo bench --bench binance_live -- \
+    --seconds 30 --warmup-seconds 5 --user-cpu 1 --sq-poll-cpu 5
 ```
 
 实测数据见 `src/connection.rs::ConnectionConfig::with_buf_ring` 的 doc。

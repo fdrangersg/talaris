@@ -4,18 +4,20 @@
 //! 这里把 `read_tls` / `process_new_packets` / `reader()` / `writer()` /
 //! `write_tls` 五段封装成 `ingest_ciphertext` + `egress_plaintext` 两个调用，
 //! 强制双向 drain，避免漏 `process_new_packets` 或漏 drain handshake 回包。
+//! ingress plaintext 通过借用 rustls 内部 chunk 的 callback 同步交给 caller，
+//! 不再先复制到中间 `Vec`。
 //!
 //! ALPN 显式声告 `http/1.1` —— 防止 server 协商 HTTP/2（WS upgrade 要 HTTP/1.1）。
 //!
 //! 配套 [`super::ws::WsClient`] 用：
 //! ```text
-//! socket recv → tls.ingest_ciphertext(...) → ws.feed_recv(plaintext)
+//! socket recv → tls.ingest_ciphertext(..., |plaintext| ws.feed_recv(plaintext))
 //! ws.pending_tx() → tls.egress_plaintext(...) → socket send
 //! ```
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::io;
+use std::io::{self, BufRead as _};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -110,15 +112,22 @@ impl TlsAdapter {
         self.conn.send_close_notify();
     }
 
-    /// 喂从 socket 收到的密文字节；明文 append 到 `dst_plaintext`，
+    /// 喂从 socket 收到的密文字节；每块可读明文通过 `on_plaintext` 同步借给 caller，
     /// rustls 在 handshake / alert 阶段需要回发的密文 append 到 `dst_ciphertext`
     /// （caller 必须把这部分也 send 回 socket，否则 handshake 卡死）。
-    pub fn ingest_ciphertext(
+    ///
+    /// `on_plaintext` 返回后对应 chunk 会立刻从 rustls reader 消费掉，因此 callback
+    /// 不能保存传入 slice。借用式 drain 避免了 `reader -> tmp -> plaintext Vec` 的
+    /// staging copy。
+    pub fn ingest_ciphertext<F>(
         &mut self,
         mut src: &[u8],
-        dst_plaintext: &mut Vec<u8>,
         dst_ciphertext: &mut Vec<u8>,
-    ) -> Result<(), TlsError> {
+        mut on_plaintext: F,
+    ) -> Result<(), TlsError>
+    where
+        F: FnMut(&[u8]),
+    {
         while !src.is_empty() {
             if !self.conn.wants_read() {
                 // rustls 的 deframer buffer 满了 —— 先 process_new_packets + drain
@@ -126,7 +135,7 @@ impl TlsAdapter {
                 // （处于 mid-record / post-close / 已经有完整 record 待处理等
                 // 合法状态）。早期版本在此 return Err，会把合法状态当 fatal
                 // 错误抛出关连接。正确做法：return Ok 让 caller 下一轮再喂。
-                self.process_and_drain(dst_plaintext, dst_ciphertext)?;
+                self.process_and_drain(dst_ciphertext, &mut on_plaintext)?;
                 if !self.conn.wants_read() {
                     return Ok(());
                 }
@@ -140,33 +149,43 @@ impl TlsAdapter {
             if n == 0 || src.len() == before {
                 break;
             }
-            self.process_and_drain(dst_plaintext, dst_ciphertext)?;
+            self.process_and_drain(dst_ciphertext, &mut on_plaintext)?;
         }
-        self.process_and_drain(dst_plaintext, dst_ciphertext)?;
+        self.process_and_drain(dst_ciphertext, &mut on_plaintext)?;
         Ok(())
     }
 
-    fn process_and_drain(
+    fn process_and_drain<F>(
         &mut self,
-        dst_plaintext: &mut Vec<u8>,
         dst_ciphertext: &mut Vec<u8>,
-    ) -> Result<(), TlsError> {
+        on_plaintext: &mut F,
+    ) -> Result<(), TlsError>
+    where
+        F: FnMut(&[u8]),
+    {
         let io_state = self.conn.process_new_packets()?;
         // peer_has_closed 是一次性 latching 信号 —— 一旦 true 就不会再变 false。
         // 用 |= 保证即便 caller 在后续 process 中拿到 io_state 又被覆盖回 false（不会，
         // 但防御一下），我们这边永远保留 "见过" 状态。
         self.peer_closed_notify |= io_state.peer_has_closed();
-        self.drain_plaintext(dst_plaintext)?;
+        self.drain_plaintext(on_plaintext)?;
         self.drain_ciphertext(dst_ciphertext)?;
         Ok(())
     }
 
-    fn drain_plaintext(&mut self, dst_plaintext: &mut Vec<u8>) -> Result<(), TlsError> {
-        let mut tmp = [0_u8; 8192];
+    fn drain_plaintext<F>(&mut self, on_plaintext: &mut F) -> Result<(), TlsError>
+    where
+        F: FnMut(&[u8]),
+    {
         loop {
-            match std::io::Read::read(&mut self.conn.reader(), &mut tmp) {
-                Ok(0) => break,
-                Ok(n) => dst_plaintext.extend_from_slice(&tmp[..n]),
+            let mut reader = self.conn.reader();
+            match reader.fill_buf() {
+                Ok([]) => break,
+                Ok(chunk) => {
+                    let n = chunk.len();
+                    on_plaintext(chunk);
+                    reader.consume(n);
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(TlsError::Io(e)),
             }
@@ -185,7 +204,11 @@ impl TlsAdapter {
     }
 
     /// 把要发的明文交给 rustls 加密；密文 append 到 `dst_ciphertext`
-    pub fn egress_plaintext(&mut self, src: &[u8], dst_ciphertext: &mut Vec<u8>) -> Result<(), TlsError> {
+    pub fn egress_plaintext(
+        &mut self,
+        src: &[u8],
+        dst_ciphertext: &mut Vec<u8>,
+    ) -> Result<(), TlsError> {
         if !src.is_empty() {
             std::io::Write::write_all(&mut self.conn.writer(), src)?;
         }

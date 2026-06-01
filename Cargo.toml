@@ -97,6 +97,10 @@ harness = false
 name    = "ws_ingress_raw"
 harness = false
 
+[[bench]]
+name    = "binance_live"
+harness = false
+
 # ─── lints ──────────────────────────────────────────────────────────────
 [lints.rust]
 unsafe_op_in_unsafe_fn        = "warn"

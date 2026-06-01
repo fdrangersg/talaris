@@ -365,8 +365,9 @@ impl Pool {
         self.pump_data_spin_impl(spin_iters, sink)
     }
 
-    /// data-only pump 实现。结构和 [`pump_impl`](Self::pump_impl) 一致，区别是
-    /// per-conn drain 调 [`WsClient::drain_data_events`]，只把 Text/Binary 交给业务。
+    /// data-only pump 实现。每条 CQE 路由完成后立刻 drain 对应连接的 WS 事件，
+    /// 只把 Text/Binary 交给业务。这样 burst 内第一条行情不必等待整批 CQE 都完成
+    /// TLS 解密后才进入 sink。
     fn pump_data_impl<F>(&mut self, wait_nr: usize, mut sink: F) -> Result<(), ConnectionError>
     where
         F: FnMut(ConnHandle, WsDataEvent<'_>),
@@ -400,20 +401,21 @@ impl Pool {
         for &c in completions_buf.iter() {
             let conn_id =
                 u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
-            if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut)
-                && let Err(e) = conn.handle_completion(proactor, c)
-            {
-                fail_conn(conn, e, &mut first_err);
+            if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
+                match conn.handle_completion(proactor, c) {
+                    Ok(()) => {
+                        drain_conn_data_events(conn, &mut sink, &mut first_err);
+                    }
+                    Err(e) => fail_conn(conn, e, &mut first_err),
+                }
             }
         }
 
+        // Catch events that were already buffered before this CQ batch. The common recv path
+        // already drained inline above; this loop is normally a cheap no-op.
         for slot in conns.iter_mut() {
             let Some(conn) = slot.as_mut() else { continue };
-            let handle = ConnHandle(conn.conn_id());
-            if let Err(e) = conn.ws.drain_data_events(|ev| sink(handle, ev)) {
-                fail_conn(conn, ConnectionError::Ws(e), &mut first_err);
-            }
-            conn.sync_ws_close_state();
+            drain_conn_data_events(conn, &mut sink, &mut first_err);
         }
 
         sync_active_count(conns, active_count);
@@ -443,21 +445,18 @@ impl Pool {
         proactor.submit()?;
 
         for iter in 0..=spin_iters {
-            let cqes = drain_conn_completions(conns, proactor, completions_buf, &mut first_err);
+            let cqes = drain_conn_completions_data(
+                conns,
+                proactor,
+                completions_buf,
+                &mut sink,
+                &mut first_err,
+            );
             progressed |= cqes > 0;
 
             for slot in conns.iter_mut() {
                 let Some(conn) = slot.as_mut() else { continue };
-                let handle = ConnHandle(conn.conn_id());
-                match conn.ws.drain_data_events(|ev| sink(handle, ev)) {
-                    Ok(events) => {
-                        progressed |= events > 0;
-                    }
-                    Err(e) => {
-                        fail_conn(conn, ConnectionError::Ws(e), &mut first_err);
-                    }
-                }
-                conn.sync_ws_close_state();
+                progressed |= drain_conn_data_events(conn, &mut sink, &mut first_err) > 0;
             }
 
             if progressed || first_err.is_some() {
@@ -547,6 +546,7 @@ impl Pool {
                     }
                 }
             }
+            conn.sync_ws_open_state();
             conn.sync_ws_close_state();
         }
 
@@ -589,6 +589,7 @@ impl Pool {
                         }
                     }
                 }
+                conn.sync_ws_open_state();
                 conn.sync_ws_close_state();
             }
 
@@ -670,6 +671,56 @@ fn drain_conn_completions(
         }
     }
     count
+}
+
+/// Data-only hot path：每条 CQE 推进完连接状态机后立刻 drain WS data event。
+/// 相比先处理整批 CQE 再统一 drain，减少 burst 内前序行情的排队时间。
+fn drain_conn_completions_data<F>(
+    conns: &mut [Option<ConnectionState>],
+    proactor: &mut Proactor,
+    completions_buf: &mut Vec<Completion>,
+    sink: &mut F,
+    first_err: &mut Option<ConnectionError>,
+) -> usize
+where
+    F: FnMut(ConnHandle, WsDataEvent<'_>),
+{
+    completions_buf.clear();
+    let count = proactor.drain_completions(|c| completions_buf.push(c));
+    for &c in completions_buf.iter() {
+        let conn_id =
+            u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
+        if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
+            match conn.handle_completion(proactor, c) {
+                Ok(()) => {
+                    drain_conn_data_events(conn, sink, first_err);
+                }
+                Err(e) => fail_conn(conn, e, first_err),
+            }
+        }
+    }
+    count
+}
+
+fn drain_conn_data_events<F>(
+    conn: &mut ConnectionState,
+    sink: &mut F,
+    first_err: &mut Option<ConnectionError>,
+) -> usize
+where
+    F: FnMut(ConnHandle, WsDataEvent<'_>),
+{
+    let handle = ConnHandle(conn.conn_id());
+    let events = match conn.ws.drain_data_events(|ev| sink(handle, ev)) {
+        Ok(events) => events,
+        Err(e) => {
+            fail_conn(conn, ConnectionError::Ws(e), first_err);
+            0
+        }
+    };
+    conn.sync_ws_open_state();
+    conn.sync_ws_close_state();
+    events
 }
 
 /// pump 内 per-conn 错误处理：保留第一条错误，把对应 conn 推到 Closed 以便

@@ -51,10 +51,6 @@ pub(crate) struct ConnectionState {
     /// `try_submit_send` 在 `!send_inflight` 时把它 drain 到 `send_buf` 一并提交。
     /// 命名沿用 plan.md / connection.rs 的 `tls_*` 前缀。
     pub(crate) tls_pending_out: Vec<u8>,
-    /// TLS ingress 解密明文 buffer。每帧 clear + extend，复用 capacity 避免
-    /// per-frame alloc（F3 dhat 审计：原 `Vec::with_capacity(n)` 是 hot loop
-    /// 第二大 alloc 点）。
-    pub(crate) plain_buf: Vec<u8>,
     pub(crate) send_inflight: bool,
     pub(crate) multishot_armed: bool,
     pub(crate) ws_handshake_begun: bool,
@@ -92,7 +88,6 @@ impl ConnectionState {
             send_buf: Vec::with_capacity(init_cap),
             send_head: 0,
             tls_pending_out: Vec::with_capacity(init_cap),
-            plain_buf: Vec::with_capacity(init_cap),
             send_inflight: false,
             multishot_armed: false,
             ws_handshake_begun: false,
@@ -368,14 +363,13 @@ impl ConnectionState {
         let bytes: &[u8] = unsafe { std::slice::from_raw_parts(bytes_ptr, n) };
 
         let recv_result = if let Some(tls) = &mut self.tls {
-            self.plain_buf.clear();
             // **不变式**：tls_pending_out 是 in-flight 安全累加器，**绝不 clear**——
             // 它由 try_submit_send 在 `!send_inflight` 时 drain。这里直接 append
             // 让 rustls 把 handshake reply / re-key / alert 密文堆进去。
-            tls.ingest_ciphertext(bytes, &mut self.plain_buf, &mut self.tls_pending_out)?;
-            if !self.plain_buf.is_empty() {
-                self.ws.feed_recv(&self.plain_buf);
-            }
+            let ws = &mut self.ws;
+            tls.ingest_ciphertext(bytes, &mut self.tls_pending_out, |plaintext| {
+                ws.feed_recv(plaintext);
+            })?;
             if !tls.is_handshaking()
                 && matches!(self.state, State::TlsHandshake)
                 && !self.ws_handshake_begun

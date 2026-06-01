@@ -26,7 +26,10 @@ pub enum FeedOutcome<'a> {
     /// 当前缓冲不够推进；`consumed` 是被消化到 parser 内部状态的字节数
     NeedMore { consumed: usize },
     /// 产生一个事件
-    Event { consumed: usize, event: FrameEvent<'a> },
+    Event {
+        consumed: usize,
+        event: FrameEvent<'a>,
+    },
 }
 
 #[derive(Debug)]
@@ -61,6 +64,12 @@ impl FrameParser {
         }
     }
 
+    #[inline]
+    #[must_use]
+    pub const fn is_idle(&self) -> bool {
+        matches!(self.state, ParserState::Idle)
+    }
+
     /// 推一段字节给 parser，最多吐一个事件。
     ///
     /// 调用者循环直到 `NeedMore` 才回到 IO 层取更多字节。
@@ -90,8 +99,10 @@ impl FrameParser {
                         // Unreachable：filled == min_needed == 真实 header size，parse_header
                         // 一定 yield `Some(_)`。原先用 `Err(RsvBitsSet)` 占位会把内部 bug
                         // 伪装成协议错——故障排查时严重误导，改成 unreachable!() 直接暴露。
-                        let (header, _hsize) = parse_header(&snapshot[..len])?
-                            .unwrap_or_else(|| unreachable!("filled >= min_needed: parse_header must yield Some"));
+                        let (header, _hsize) =
+                            parse_header(&snapshot[..len])?.unwrap_or_else(|| {
+                                unreachable!("filled >= min_needed: parse_header must yield Some")
+                            });
 
                         // Server→client frames MUST NOT be masked (RFC §5.1)
                         if header.mask.is_some() {
