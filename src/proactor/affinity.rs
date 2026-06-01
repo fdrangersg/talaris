@@ -88,6 +88,7 @@ pub fn unpin_current_thread() -> Result<(), AffinityError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 fn first_allowed_cpu() -> usize {
     // SAFETY: cpu_set_t 是 POD，0-init 合法。
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };

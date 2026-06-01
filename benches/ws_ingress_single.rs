@@ -385,6 +385,7 @@ mod linux_impl {
 
     /// Same data-only path as `run_talaris_data`, but busy-poll the CQ ring instead
     /// of entering `io_uring_enter(GETEVENTS)` while waiting for each batch.
+    #[allow(clippy::too_many_arguments)]
     fn run_talaris_data_spin(
         addr: SocketAddr,
         stop: StopMode,
