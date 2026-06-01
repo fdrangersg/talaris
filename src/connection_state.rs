@@ -69,7 +69,10 @@ impl ConnectionState {
         socket.set_nodelay(true)?;
 
         let tls = if cfg.use_tls {
-            Some(TlsAdapter::new_client(&cfg.host)?)
+            Some(match cfg.tls_config.clone() {
+                Some(config) => TlsAdapter::new_client_with_config(&cfg.host, config)?,
+                None => TlsAdapter::new_client(&cfg.host)?,
+            })
         } else {
             None
         };

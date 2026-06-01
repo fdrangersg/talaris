@@ -277,6 +277,49 @@ pub fn frames_per_chunk(payload_size: usize) -> usize {
     (TARGET / per_frame).max(1)
 }
 
+// ─── Loopback TLS fixture ──────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+const LOCALHOST_CERT_DER_B64: &str = "MIIBkzCCATmgAwIBAgIUTcifo1Y96DcnxAQDK15ElkaTRJswCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDYwMTEyMDgyMloXDTM2MDUyOTEyMDgyMlowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAElhv7D7P8D77Md0eywp4A6PZWSm+opojV4lMbWm7ZvGXDYqJfa1Ag7k0ORSJbu50+9ZjH6/WgonZGkcnn2BVEwaNpMGcwHQYDVR0OBBYEFL2j5EMi5e2uEHCo2QAzU8cAHaJWMB8GA1UdIwQYMBaAFL2j5EMi5e2uEHCo2QAzU8cAHaJWMA8GA1UdEwEB/wQFMAMBAf8wFAYDVR0RBA0wC4IJbG9jYWxob3N0MAoGCCqGSM49BAMCA0gAMEUCIA+JIivscqLkA0NCXlLelaC+vB/4wPTASRci/8Am3XJTAiEA9ZZaNJyeHCQgXLnPsJ+vlWudznS1wf7WgGcFIgHb+CA=";
+
+#[cfg(target_os = "linux")]
+const LOCALHOST_KEY_DER_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg9tO9QJnz1UbW01rJ9gPtjw+wrxaOG9zRHy3ljqQi9LmhRANCAASWG/sPs/wPvsx3R7LCngDo9lZKb6imiNXiUxtabtm8ZcNiol9rUCDuTQ5FIlu7nT71mMfr9aCidkaRyefYFUTB";
+
+#[cfg(target_os = "linux")]
+fn local_tls_cert() -> rustls::pki_types::CertificateDer<'static> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(LOCALHOST_CERT_DER_B64)
+        .expect("decode localhost cert")
+        .into()
+}
+
+#[cfg(target_os = "linux")]
+pub fn local_tls_client_config() -> std::sync::Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(local_tls_cert()).expect("add localhost cert");
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    std::sync::Arc::new(config)
+}
+
+#[cfg(target_os = "linux")]
+fn local_tls_server_config() -> std::sync::Arc<rustls::ServerConfig> {
+    use base64::Engine as _;
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(LOCALHOST_KEY_DER_B64)
+        .expect("decode localhost key");
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(key.into());
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![local_tls_cert()], key)
+        .expect("localhost server cert");
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    std::sync::Arc::new(config)
+}
+
 // ─── Server：tokio current_thread 单 OS 线程 N 个 stream session ─────────
 //
 // 起一个 OS 线程跑 tokio current_thread runtime。pin 到 isolated CPU。N 条 WS
@@ -370,6 +413,87 @@ async fn stream_session(mut s: tokio::net::TcpStream, chunk_buf: std::sync::Arc<
             return;
         }
     }
+}
+
+// ─── Server：blocking rustls loopback stream session ───────────────────
+
+#[cfg(target_os = "linux")]
+pub fn spawn_tls_ws_stream_server(
+    std_listener: std::net::TcpListener,
+    chunk_buf: std::sync::Arc<Vec<u8>>,
+    cpu: Option<usize>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("tls-ws-stream-srv".into())
+        .spawn(move || {
+            let _g = cpu.map(|c| PinGuard::pin("tls-ws-stream-srv", c));
+            let Ok((stream, _)) = std_listener.accept() else {
+                return;
+            };
+            let _ = stream.set_nodelay(true);
+            let Ok(conn) = rustls::ServerConnection::new(local_tls_server_config()) else {
+                return;
+            };
+            let mut stream = rustls::StreamOwned::new(conn, stream);
+            tls_stream_session(&mut stream, &chunk_buf);
+        })
+        .expect("spawn tls-ws-stream-srv")
+}
+
+#[cfg(target_os = "linux")]
+fn tls_stream_session(
+    s: &mut rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>,
+    chunk_buf: &[u8],
+) {
+    use std::io::{Read as _, Write as _};
+
+    let mut buf = [0_u8; 4096];
+    let mut req = Vec::<u8>::new();
+    loop {
+        let Ok(n) = s.read(&mut buf) else {
+            return;
+        };
+        if n == 0 {
+            return;
+        }
+        req.extend_from_slice(&buf[..n]);
+        if req.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let Ok(req_str) = std::str::from_utf8(&req) else {
+        return;
+    };
+    let Some(key) = websocket_key(req_str) else {
+        return;
+    };
+    let accept = talaris::ws::handshake::compute_accept(key);
+    let resp = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept}\r\n\r\n"
+    );
+    if s.write_all(resp.as_bytes()).is_err() || s.flush().is_err() {
+        return;
+    }
+
+    loop {
+        if s.write_all(chunk_buf).is_err() || s.flush().is_err() {
+            return;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn websocket_key(req: &str) -> Option<&str> {
+    req.lines()
+        .find(|line| {
+            line.get(.."sec-websocket-key:".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sec-websocket-key:"))
+        })
+        .and_then(|line| line.split_once(':'))
+        .map(|(_, value)| value.trim())
 }
 
 // ─── Tokio 侧 client：WS upgrade + 手卷 recv loop（用 talaris parse_header）
@@ -503,4 +627,177 @@ pub async fn tokio_recv_ws_binary_frames(
     }
 
     (arrivals, frame_count)
+}
+
+// ─── Tokio 侧 client：同一 rustls 的 TLS + WS recv loop ───────────────
+
+#[cfg(target_os = "linux")]
+pub fn local_tls_client_connection() -> rustls::ClientConnection {
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .expect("localhost is valid server name")
+        .to_owned();
+    rustls::ClientConnection::new(local_tls_client_config(), server_name)
+        .expect("localhost tls client")
+}
+
+#[cfg(target_os = "linux")]
+pub async fn tokio_tls_ws_upgrade_client(
+    s: &mut tokio::net::TcpStream,
+    tls: &mut rustls::ClientConnection,
+    host: &str,
+    path: &str,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Write as _;
+
+    let mut network_buf = vec![0_u8; 256 * 1024];
+    while tls.is_handshaking() {
+        flush_tokio_tls(s, tls).await?;
+        read_tokio_tls(s, tls, &mut network_buf).await?;
+    }
+
+    let key = talaris::ws::handshake::generate_key()
+        .map_err(|e| std::io::Error::other(format!("generate_key: {e}")))?;
+    let req = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: {key}\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n"
+    );
+    tls.writer().write_all(req.as_bytes())?;
+    flush_tokio_tls(s, tls).await?;
+
+    let mut plaintext = Vec::<u8>::new();
+    loop {
+        read_tokio_tls(s, tls, &mut network_buf).await?;
+        drain_tls_plaintext(tls, &mut plaintext)?;
+        if let Some(idx) = plaintext.windows(4).position(|w| w == b"\r\n\r\n") {
+            let header_end = idx + 4;
+            return Ok(plaintext[header_end..].to_vec());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub async fn tokio_recv_tls_ws_binary_frames(
+    s: &mut tokio::net::TcpStream,
+    tls: &mut rustls::ClientConnection,
+    initial_leftover: Vec<u8>,
+    stop: StopMode,
+    expected_payload: usize,
+    bench_start: Instant,
+) -> (Vec<Instant>, u64) {
+    use talaris::ws::frame::parse_header;
+
+    let mut arrivals: Vec<Instant> = Vec::with_capacity(stop.cap_hint());
+    let mut frame_count = 0_u64;
+    let mut network_buf = vec![0_u8; 256 * 1024];
+    let mut plaintext = initial_leftover;
+    plaintext.reserve(64 * 1024);
+
+    'outer: loop {
+        let mut pos = 0_usize;
+        while pos < plaintext.len() {
+            match parse_header(&plaintext[pos..]) {
+                Ok(Some((hdr, consumed))) => {
+                    let total = consumed + hdr.payload_len as usize;
+                    if plaintext.len() - pos < total {
+                        break;
+                    }
+                    debug_assert_eq!(hdr.payload_len as usize, expected_payload);
+                    arrivals.push(Instant::now());
+                    frame_count += 1;
+                    pos += total;
+                    if !stop.keep_going(frame_count, bench_start) {
+                        plaintext.drain(..pos);
+                        break 'outer;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("[tokio_tls_recv] parse_header err after {frame_count}: {e}");
+                    plaintext.drain(..pos);
+                    break 'outer;
+                }
+            }
+        }
+        plaintext.drain(..pos);
+
+        if !stop.keep_going(frame_count, bench_start) {
+            break;
+        }
+        if let Err(e) = read_tokio_tls(s, tls, &mut network_buf).await {
+            eprintln!("[tokio_tls_recv] read error after {frame_count}: {e}");
+            break;
+        }
+        if let Err(e) = drain_tls_plaintext(tls, &mut plaintext) {
+            eprintln!("[tokio_tls_recv] plaintext error after {frame_count}: {e}");
+            break;
+        }
+    }
+
+    (arrivals, frame_count)
+}
+
+#[cfg(target_os = "linux")]
+async fn read_tokio_tls(
+    s: &mut tokio::net::TcpStream,
+    tls: &mut rustls::ClientConnection,
+    network_buf: &mut [u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt as _;
+
+    let n = s.read(network_buf).await?;
+    if n == 0 {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+    }
+    let mut src = &network_buf[..n];
+    while !src.is_empty() {
+        let consumed = tls.read_tls(&mut src)?;
+        if consumed == 0 {
+            break;
+        }
+        tls.process_new_packets().map_err(std::io::Error::other)?;
+    }
+    flush_tokio_tls(s, tls).await
+}
+
+#[cfg(target_os = "linux")]
+async fn flush_tokio_tls(
+    s: &mut tokio::net::TcpStream,
+    tls: &mut rustls::ClientConnection,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut ciphertext = Vec::new();
+    while tls.wants_write() {
+        tls.write_tls(&mut ciphertext)?;
+    }
+    if !ciphertext.is_empty() {
+        s.write_all(&ciphertext).await?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn drain_tls_plaintext(
+    tls: &mut rustls::ClientConnection,
+    plaintext: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    use std::io::BufRead as _;
+
+    loop {
+        let mut reader = tls.reader();
+        match reader.fill_buf() {
+            Ok([]) => return Ok(()),
+            Ok(chunk) => {
+                let n = chunk.len();
+                plaintext.extend_from_slice(chunk);
+                reader.consume(n);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
 }

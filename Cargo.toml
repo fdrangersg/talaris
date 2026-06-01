@@ -36,8 +36,7 @@ libc         = "0.2"
 
 # hot-path proactor (Linux only — macOS 走 stub)
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring      = "0.7"
-core_affinity = "0.8"
+io-uring = "0.7"
 
 [dev-dependencies]
 # example / bench 用：per-handle latency 测量 + tokio 对照组
@@ -95,6 +94,10 @@ harness = false
 
 [[bench]]
 name    = "ws_ingress_raw"
+harness = false
+
+[[bench]]
+name    = "ws_ingress_tls"
 harness = false
 
 [[bench]]

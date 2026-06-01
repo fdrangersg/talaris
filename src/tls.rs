@@ -69,9 +69,18 @@ impl TlsAdapter {
         // 真的回了 http/1.1（或不回）；某些 misconfig server 会忽略 alpn 通告。
         config.alpn_protocols = vec![REQUIRED_ALPN.to_vec()];
 
+        Self::new_client_with_config(server_name, Arc::new(config))
+    }
+
+    /// 用 caller 提供的 rustls 配置构造 client。私有 CA、session cache、crypto
+    /// provider 或其它 rustls 级调优走这里注入。
+    pub fn new_client_with_config(
+        server_name: &str,
+        config: Arc<rustls::ClientConfig>,
+    ) -> Result<Self, TlsError> {
         let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
             .map_err(|_| TlsError::InvalidServerName(server_name.to_owned()))?;
-        let conn = rustls::ClientConnection::new(Arc::new(config), name)?;
+        let conn = rustls::ClientConnection::new(config, name)?;
         Ok(Self {
             conn,
             peer_closed_notify: false,

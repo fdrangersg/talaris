@@ -111,6 +111,7 @@ mod linux_impl {
         let talaris_cpu: usize = common::arg_or("--talaris-cpu", 1);
         let sq_poll_cpu: u32 = common::arg_or("--sq-poll-cpu", 5);
         let tokio_cpu: usize = common::arg_or("--tokio-cpu", 2);
+        let spin_iters: usize = common::arg_or("--spin-iters", 256);
         let buf_size: u32 = common::arg_or("--buf-size", 4096);
         let buf_entries: u16 = common::arg_or("--buf-entries", 256);
 
@@ -122,6 +123,7 @@ mod linux_impl {
         eprintln!(" server-cpu: {server_cpu}  (fresh tokio runtime per variant)");
         eprintln!(" talaris   : user→CPU {talaris_cpu}, SQ_POLL→CPU {sq_poll_cpu}");
         eprintln!(" tokio     : worker→CPU {tokio_cpu}");
+        eprintln!(" spin_iters: {spin_iters}");
         eprintln!(
             " buf_ring  : {buf_entries} × {buf_size}B = {} KiB pool",
             (u32::from(buf_entries) * buf_size) / 1024
@@ -144,8 +146,8 @@ mod linux_impl {
         );
         eprintln!();
 
-        // ── variant 1/3: talaris pool.pump (general path) ────────────────
-        eprintln!("─── variant 1/3: talaris Pool.pump (general path, Event enum) ───");
+        // ── variant 1/4: talaris pool.pump (general path) ────────────────
+        eprintln!("─── variant 1/4: talaris Pool.pump (general path, Event enum) ───");
         let talaris = with_fresh_stream_server(server_cpu, chunk_buf.clone(), |addr| {
             run_talaris(
                 addr,
@@ -159,8 +161,8 @@ mod linux_impl {
         });
         eprintln!();
 
-        // ── variant 2/3: talaris pool.pump_data (data-only dispatch) ──────
-        eprintln!("─── variant 2/3: talaris Pool.pump_data (data-only dispatch) ───");
+        // ── variant 2/4: talaris pool.pump_data (data-only dispatch) ──────
+        eprintln!("─── variant 2/4: talaris Pool.pump_data (data-only dispatch) ───");
         let talaris_data = with_fresh_stream_server(server_cpu, chunk_buf.clone(), |addr| {
             run_talaris_data(
                 addr,
@@ -174,8 +176,24 @@ mod linux_impl {
         });
         eprintln!();
 
-        // ── variant 3/3: tokio ───────────────────────────────────────────
-        eprintln!("─── variant 3/3: tokio (epoll + current_thread + pin) ───");
+        // ── variant 3/4: talaris pool.pump_data_spin ─────────────────────
+        eprintln!("─── variant 3/4: talaris Pool.pump_data_spin (busy-poll CQ) ───");
+        let talaris_data_spin = with_fresh_stream_server(server_cpu, chunk_buf.clone(), |addr| {
+            run_talaris_data_spin(
+                addr,
+                stop,
+                payload,
+                talaris_cpu,
+                sq_poll_cpu,
+                spin_iters,
+                buf_size,
+                buf_entries,
+            )
+        });
+        eprintln!();
+
+        // ── variant 4/4: tokio ───────────────────────────────────────────
+        eprintln!("─── variant 4/4: tokio (epoll + current_thread + pin) ───");
         let tokio = with_fresh_stream_server(server_cpu, chunk_buf, |addr| {
             run_tokio(addr, stop, payload, tokio_cpu)
         });
@@ -191,6 +209,7 @@ mod linux_impl {
         for (label, o) in [
             ("talaris Pool.pump", &talaris),
             ("talaris pump_data", &talaris_data),
+            ("talaris data spin", &talaris_data_spin),
             ("tokio", &tokio),
         ] {
             println!(
@@ -204,6 +223,7 @@ mod linux_impl {
         }
         let r_data = talaris_data.frames_per_sec() / talaris.frames_per_sec();
         let r_vs_tokio = talaris_data.frames_per_sec() / tokio.frames_per_sec();
+        let r_spin_vs_tokio = talaris_data_spin.frames_per_sec() / tokio.frames_per_sec();
         println!();
         println!(
             "data-only dispatch vs general path: {:.2}× ({:.0} → {:.0} f/s)",
@@ -212,12 +232,14 @@ mod linux_impl {
             talaris_data.frames_per_sec()
         );
         println!("pump_data vs tokio: {r_vs_tokio:.2}× (1.0 = parity)");
+        println!("data spin vs tokio: {r_spin_vs_tokio:.2}× (1.0 = parity)");
 
         println!();
         println!("=== inter-arrival latency (delivery jitter) ===");
         common::print_comparison(&[
             ("talaris Pool.pump", &talaris.inter_arrival),
             ("talaris pump_data", &talaris_data.inter_arrival),
+            ("talaris data spin", &talaris_data_spin.inter_arrival),
             ("tokio", &tokio.inter_arrival),
         ]);
         println!();
@@ -344,6 +366,70 @@ mod linux_impl {
         );
 
         // 干净关：pump_data 仍走完整 WS control path，可以正常 close handshake。
+        pool.initiate_close(h, 1000, "bye").ok();
+        let close_start = Instant::now();
+        while close_start.elapsed() < Duration::from_secs(2) {
+            let _ = pool.pump_data_nowait(|_, _| {});
+            if matches!(pool.state(h), Some(State::Closed)) {
+                break;
+            }
+        }
+
+        let inter_arrival = common::inter_arrival_hist(&arrivals);
+        Outcome {
+            frames: frame_count,
+            elapsed,
+            inter_arrival,
+        }
+    }
+
+    /// Same data-only path as `run_talaris_data`, but busy-poll the CQ ring instead
+    /// of entering `io_uring_enter(GETEVENTS)` while waiting for each batch.
+    fn run_talaris_data_spin(
+        addr: SocketAddr,
+        stop: StopMode,
+        payload: usize,
+        user_cpu: usize,
+        sq_poll_cpu: u32,
+        spin_iters: usize,
+        buf_size: u32,
+        buf_entries: u16,
+    ) -> Outcome {
+        let _guard = PinGuard::pin("talaris-data-spin", user_cpu);
+        eprintln!(
+            "[talaris-data-spin] user→CPU {user_cpu}, SQ_POLL kthread→CPU {sq_poll_cpu}, spin_iters={spin_iters}"
+        );
+
+        let cfg = ConnectionConfig::new("localhost", addr.port(), "/")
+            .with_tls(false)
+            .with_sq_poll(10_000, Some(sq_poll_cpu))
+            .with_buf_ring(buf_size, buf_entries);
+        let mut pool = Pool::new(PoolConfig::new(cfg.proactor)).expect("pool");
+        let h = pool.connect_blocking_to(cfg, addr).expect("connect");
+        assert_eq!(pool.state(h), Some(State::Open));
+
+        let mut arrivals: Vec<Instant> = Vec::with_capacity(stop.cap_hint());
+        let mut frame_count = 0_u64;
+        let bench_start = Instant::now();
+
+        while stop.keep_going(frame_count, bench_start) {
+            pool.pump_data_spin(spin_iters, |_h, ev| {
+                if let WsDataEvent::Binary(data) = ev {
+                    debug_assert_eq!(data.len(), payload);
+                    arrivals.push(Instant::now());
+                    frame_count += 1;
+                }
+            })
+            .expect("pump_data_spin");
+        }
+        let elapsed = bench_start.elapsed();
+        eprintln!(
+            "[talaris-data-spin] {} frames in {:.3}s ({:.0} f/s)",
+            frame_count,
+            elapsed.as_secs_f64(),
+            frame_count as f64 / elapsed.as_secs_f64()
+        );
+
         pool.initiate_close(h, 1000, "bye").ok();
         let close_start = Instant::now();
         while close_start.elapsed() < Duration::from_secs(2) {

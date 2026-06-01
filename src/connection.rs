@@ -9,7 +9,7 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::io;
+use std::{io, sync::Arc};
 
 use thiserror::Error;
 
@@ -94,6 +94,9 @@ pub struct ConnectionConfig {
     pub port: u16,
     pub path: String,
     pub use_tls: bool,
+    /// 自定义 rustls client 配置。`None` 使用 webpki roots + `http/1.1` ALPN
+    /// 的默认配置；私有 CA、session cache 或 crypto provider 调优可注入配置。
+    pub tls_config: Option<Arc<rustls::ClientConfig>>,
     /// 构造 [`PoolConfig`](crate::PoolConfig) 时传给 [`Proactor::new`](crate::proactor::Proactor::new)。
     /// HFT 部署可测试 SQ_POLL + CPU pinning；把 SQ_POLL kthread 放在 client 线程的 SMT sibling 是一个候选拓扑，不是无条件最优（[`with_sq_poll`](Self::with_sq_poll)）。
     pub proactor: ProactorConfig,
@@ -120,6 +123,7 @@ impl ConnectionConfig {
             port,
             path: path.into(),
             use_tls: true,
+            tls_config: None,
             proactor: ProactorConfig::default(),
             conn_id: 0,
             bgid: 0,
@@ -131,6 +135,14 @@ impl ConnectionConfig {
     #[must_use]
     pub const fn with_tls(mut self, on: bool) -> Self {
         self.use_tls = on;
+        self
+    }
+
+    /// 覆盖 TLS client 配置。caller 负责配置 root store；如果 server 返回 ALPN，
+    /// transport 仍会校验它只能是 `http/1.1`。
+    #[must_use]
+    pub fn with_tls_config(mut self, config: Arc<rustls::ClientConfig>) -> Self {
+        self.tls_config = Some(config);
         self
     }
 
