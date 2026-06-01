@@ -386,10 +386,10 @@ impl WsClient {
 
     /// Drain WS events but only surface Text/Binary data messages to `sink`.
     ///
-    /// 这不是 binary-only shortcut：它完整走 [`poll_event`](Self::poll_event)，
-    /// 因此 Ping/Pong/Close、fragmentation、UTF-8 校验和 auto-pong 语义都与通用
-    /// 路径一致。适合交易所 feed：Text JSON 和 Binary SBE 都会被分发，control
-    /// frame 由 WS 层处理。
+    /// 完整、未分片的 Text/Binary frame 直接 dispatch；其它 frame 回退到
+    /// [`poll_event`](Self::poll_event)。因此 Ping/Pong/Close、fragmentation、
+    /// UTF-8 校验和 auto-pong 语义都与通用路径一致。适合交易所 feed：
+    /// Text JSON 和 Binary SBE 都会被分发，control frame 由 WS 层处理。
     ///
     /// 返回这一轮处理掉的 WS event 数量（包含被内部消费的 Ping/Pong/Close）。
     pub fn drain_data_events<F>(&mut self, mut sink: F) -> Result<usize, WsError>
@@ -397,7 +397,22 @@ impl WsClient {
         F: FnMut(DataEvent<'_>),
     {
         let mut events = 0_usize;
-        while let Some(res) = self.poll_event() {
+        loop {
+            // poll_event 的 borrowed payload 在下一次 poll 才 consume。data-only
+            // fast path 也必须先完成这步，才能安全继续看 recv_buf 的下一帧。
+            self.clear_after_emit();
+            match self.try_drain_data_event(&mut sink)? {
+                DirectDataResult::Emit => {
+                    events += 1;
+                    continue;
+                }
+                DirectDataResult::WaitForMore => return Ok(events),
+                DirectDataResult::Fallback => {}
+            }
+
+            let Some(res) = self.poll_event() else {
+                return Ok(events);
+            };
             let ev = res?;
             events += 1;
             match ev {
@@ -409,7 +424,83 @@ impl WsClient {
                 | Event::Close { .. } => {}
             }
         }
-        Ok(events)
+    }
+
+    /// data-only 常见路径：完整单帧直接借 recv_buf payload 给 sink，回调返回后
+    /// 立即 consume。control / fragmented frame 返回 Fallback，由 poll_event
+    /// 完整状态机接手。
+    fn try_drain_data_event<F>(&mut self, sink: &mut F) -> Result<DirectDataResult, WsError>
+    where
+        F: FnMut(DataEvent<'_>),
+    {
+        if self.state != ConnState::Open
+            || !self.parser.is_idle()
+            || self.msg_opcode.is_some()
+            || self.recv_buf.is_empty()
+        {
+            return Ok(DirectDataResult::Fallback);
+        }
+
+        let Some((header, header_len)) = parse_header(self.recv_buf.as_slice()).map_err(|e| {
+            self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
+            WsError::Frame(e)
+        })?
+        else {
+            return Ok(DirectDataResult::WaitForMore);
+        };
+
+        if header.mask.is_some() {
+            self.queue_close(
+                CloseCode::ProtocolError.as_u16(),
+                "server sent masked frame",
+            );
+            return Err(WsError::Frame(FrameError::ServerSentMaskedFrame));
+        }
+        if !header.fin || !matches!(header.opcode, OpCode::Text | OpCode::Binary) {
+            return Ok(DirectDataResult::Fallback);
+        }
+        if header.payload_len > self.config.max_frame_payload {
+            self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+            return Err(WsError::MessageTooLarge);
+        }
+
+        let payload_len = usize::try_from(header.payload_len).map_err(|_| {
+            self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+            WsError::MessageTooLarge
+        })?;
+        if payload_len > self.config.max_message_size {
+            self.queue_close(
+                CloseCode::MessageTooBig.as_u16(),
+                "message exceeds max_message_size",
+            );
+            return Err(WsError::MessageTooLarge);
+        }
+        let Some(frame_len) = header_len.checked_add(payload_len) else {
+            self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+            return Err(WsError::MessageTooLarge);
+        };
+        if self.recv_buf.len() < frame_len {
+            return Ok(DirectDataResult::WaitForMore);
+        }
+
+        let payload = &self.recv_buf.as_slice()[header_len..frame_len];
+        match header.opcode {
+            OpCode::Text => {
+                let text = std::str::from_utf8(payload).map_err(|_| WsError::Utf8Invalid);
+                let text = match text {
+                    Ok(text) => text,
+                    Err(e) => {
+                        self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
+                        return Err(e);
+                    }
+                };
+                sink(DataEvent::Text(text));
+            }
+            OpCode::Binary => sink(DataEvent::Binary(payload)),
+            _ => unreachable!("guarded above"),
+        }
+        self.recv_buf.consume(frame_len);
+        Ok(DirectDataResult::Emit)
     }
 
     /// 主动发 Text。`payload` 必须是合法 UTF-8。仅在 `ConnState::Open` 生效。
@@ -874,6 +965,12 @@ enum AdvanceResult {
 
 enum BorrowedResult {
     Emit(EmitKind),
+    WaitForMore,
+    Fallback,
+}
+
+enum DirectDataResult {
+    Emit,
     WaitForMore,
     Fallback,
 }
