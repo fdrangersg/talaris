@@ -100,7 +100,9 @@ mod linux_impl {
                 }
             };
             self.payload_bytes += payload.len() as u64;
-            self.checksum ^= u64::from(payload.first().copied().unwrap_or_default());
+            self.checksum = self.checksum.rotate_left(5)
+                ^ payload.len() as u64
+                ^ u64::from(payload.first().copied().unwrap_or_default());
             self.payload_size.record(payload.len().max(1) as u64).ok();
         }
 
@@ -196,7 +198,7 @@ mod linux_impl {
         println!("checksum      : {}", stats.checksum);
         println!();
         common::print_hist("sink inter-arrival", &stats.inter_arrival);
-        common::print_hist("payload size", &stats.payload_size);
+        print_payload_size_hist(&stats.payload_size);
         println!();
         println!("inter-arrival is callback-to-callback delivery spacing, not exchange latency.");
     }
@@ -275,5 +277,18 @@ mod linux_impl {
             .collect::<Vec<_>>()
             .join(",");
         format!(r#"{{"method":"SUBSCRIBE","params":[{params}],"id":1}}"#)
+    }
+
+    fn print_payload_size_hist(hist: &Histogram<u64>) {
+        println!(
+            "{:<24}  mean={:>10.1} B  p50={:>7} B  p99={:>7} B  p99.9={:>7} B  max={:>7} B  n={}",
+            "payload size",
+            hist.mean(),
+            hist.value_at_quantile(0.50),
+            hist.value_at_quantile(0.99),
+            hist.value_at_quantile(0.999),
+            hist.max(),
+            hist.len(),
+        );
     }
 }
