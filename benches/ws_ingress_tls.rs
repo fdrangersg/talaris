@@ -1,9 +1,10 @@
 // ws_ingress_tls - 1 条 loopback TLS WebSocket conn，server 全力 push，
 // 对比 talaris rustls + io_uring 与 tokio rustls + epoll 的 steady-state ingress。
 //
-// 两侧使用同一 rustls 版本、同一自签 localhost CA、同一 WS parser 和同一
-// pre-encoded payload chunk。这个 bench 才是实盘 WSS transport 的可控对照；
-// `ws_ingress_single` 保留为 plain TCP 拆层诊断。
+// 两侧使用同一 rustls 版本、同一自签 localhost CA、同一 WsClient 和同一
+// pre-encoded payload chunk。额外保留 bare tokio parse_header 作为理论下限。
+// 这个 bench 才是实盘 WSS transport 的可控对照；`ws_ingress_single` 保留为
+// plain TCP 拆层诊断。
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -104,7 +105,7 @@ mod linux_impl {
         );
         eprintln!();
 
-        eprintln!("--- variant 1/3: talaris Pool.pump_data ---");
+        eprintln!("--- variant 1/4: talaris Pool.pump_data ---");
         let talaris = with_fresh_tls_server(server_cpu, chunk_buf.clone(), |addr| {
             run_talaris(
                 addr,
@@ -121,7 +122,7 @@ mod linux_impl {
         });
         eprintln!();
 
-        eprintln!("--- variant 2/3: talaris Pool.pump_data_spin ---");
+        eprintln!("--- variant 2/4: talaris Pool.pump_data_spin ---");
         let talaris_spin = with_fresh_tls_server(server_cpu, chunk_buf.clone(), |addr| {
             run_talaris(
                 addr,
@@ -138,9 +139,15 @@ mod linux_impl {
         });
         eprintln!();
 
-        eprintln!("--- variant 3/3: tokio + rustls ---");
-        let tokio = with_fresh_tls_server(server_cpu, chunk_buf, |addr| {
-            run_tokio(addr, stop, payload, tokio_cpu, sample_every)
+        eprintln!("--- variant 3/4: tokio + rustls + WsClient ---");
+        let tokio_ws = with_fresh_tls_server(server_cpu, chunk_buf.clone(), |addr| {
+            run_tokio_ws_client(addr, stop, payload, tokio_cpu, sample_every)
+        });
+        eprintln!();
+
+        eprintln!("--- variant 4/4: tokio + rustls + bare parse_header lower bound ---");
+        let tokio_bare = with_fresh_tls_server(server_cpu, chunk_buf, |addr| {
+            run_tokio_bare(addr, stop, payload, tokio_cpu, sample_every)
         });
 
         println!();
@@ -154,7 +161,8 @@ mod linux_impl {
         for (label, outcome) in [
             ("talaris pump_data", &talaris),
             ("talaris data spin", &talaris_spin),
-            ("tokio + rustls", &tokio),
+            ("tokio + rustls + WS", &tokio_ws),
+            ("tokio bare lower bound", &tokio_bare),
         ] {
             println!(
                 "{:<22} | {:>14} | {:>9.3}s | {:>14} | {:>11.2}",
@@ -167,12 +175,12 @@ mod linux_impl {
         }
         println!();
         println!(
-            "pump_data vs tokio: {:.2}x (1.0 = parity)",
-            talaris.frames_per_sec() / tokio.frames_per_sec()
+            "pump_data vs tokio same WS: {:.2}x (1.0 = parity)",
+            talaris.frames_per_sec() / tokio_ws.frames_per_sec()
         );
         println!(
-            "data spin vs tokio: {:.2}x (1.0 = parity)",
-            talaris_spin.frames_per_sec() / tokio.frames_per_sec()
+            "data spin vs tokio same WS: {:.2}x (1.0 = parity)",
+            talaris_spin.frames_per_sec() / tokio_ws.frames_per_sec()
         );
 
         println!();
@@ -180,7 +188,8 @@ mod linux_impl {
         common::print_comparison(&[
             ("talaris pump_data", &talaris.inter_arrival),
             ("talaris data spin", &talaris_spin.inter_arrival),
-            ("tokio + rustls", &tokio.inter_arrival),
+            ("tokio + rustls + WS", &tokio_ws.inter_arrival),
+            ("tokio bare lower bound", &tokio_bare.inter_arrival),
         ]);
         if sample_every != 1 {
             println!(
@@ -280,14 +289,65 @@ mod linux_impl {
         }
     }
 
-    fn run_tokio(
+    fn run_tokio_ws_client(
         addr: SocketAddr,
         stop: StopMode,
         payload: usize,
         user_cpu: usize,
         sample_every: u64,
     ) -> Outcome {
-        let _guard = PinGuard::pin("tokio-tls", user_cpu);
+        let _guard = PinGuard::pin("tokio-tls-ws", user_cpu);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("rt");
+
+        rt.block_on(async move {
+            use tokio::io::AsyncWriteExt as _;
+
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            stream.set_nodelay(true).expect("nodelay");
+            let mut tls = common::local_tls_client_connection();
+            let ws = common::tokio_tls_ws_client_connect(&mut stream, &mut tls, "localhost", "/")
+                .await
+                .expect("TLS + WsClient upgrade");
+
+            let bench_start = Instant::now();
+            let (arrivals, frame_count) = common::tokio_recv_tls_ws_data_events(
+                &mut stream,
+                &mut tls,
+                ws,
+                stop,
+                payload,
+                sample_every,
+                bench_start,
+            )
+            .await;
+            let elapsed = bench_start.elapsed();
+            eprintln!(
+                "[tokio-tls-ws] {} frames in {:.3}s ({:.0} f/s)",
+                frame_count,
+                elapsed.as_secs_f64(),
+                frame_count as f64 / elapsed.as_secs_f64()
+            );
+
+            let _ = stream.shutdown().await;
+            Outcome {
+                frames: frame_count,
+                elapsed,
+                inter_arrival: common::inter_arrival_hist(&arrivals),
+            }
+        })
+    }
+
+    fn run_tokio_bare(
+        addr: SocketAddr,
+        stop: StopMode,
+        payload: usize,
+        user_cpu: usize,
+        sample_every: u64,
+    ) -> Outcome {
+        let _guard = PinGuard::pin("tokio-tls-bare", user_cpu);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .build()
@@ -317,7 +377,7 @@ mod linux_impl {
             .await;
             let elapsed = bench_start.elapsed();
             eprintln!(
-                "[tokio-tls] {} frames in {:.3}s ({:.0} f/s)",
+                "[tokio-tls-bare] {} frames in {:.3}s ({:.0} f/s)",
                 frame_count,
                 elapsed.as_secs_f64(),
                 frame_count as f64 / elapsed.as_secs_f64()

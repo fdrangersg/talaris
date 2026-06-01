@@ -693,6 +693,45 @@ pub async fn tokio_tls_ws_upgrade_client(
 }
 
 #[cfg(target_os = "linux")]
+pub async fn tokio_tls_ws_client_connect(
+    s: &mut tokio::net::TcpStream,
+    tls: &mut rustls::ClientConnection,
+    host: &str,
+    path: &str,
+) -> std::io::Result<talaris::ws::WsClient> {
+    let mut network_buf = vec![0_u8; 256 * 1024];
+    let mut plaintext = Vec::<u8>::new();
+    while tls.is_handshaking() {
+        flush_tokio_tls(s, tls).await?;
+        read_tokio_tls(s, tls, &mut network_buf, &mut plaintext).await?;
+    }
+    if !plaintext.is_empty() {
+        return Err(std::io::Error::other(
+            "received application plaintext before websocket request",
+        ));
+    }
+
+    let mut ws = talaris::ws::WsClient::new_client(talaris::ws::WsConfig::new(host, path))
+        .map_err(std::io::Error::other)?;
+    ws.begin_handshake().map_err(std::io::Error::other)?;
+    flush_tokio_ws_tx(s, tls, &mut ws).await?;
+
+    loop {
+        read_tokio_tls(s, tls, &mut network_buf, &mut plaintext).await?;
+        ws.feed_recv(&plaintext);
+        plaintext.clear();
+        while let Some(event) = ws.poll_event() {
+            if matches!(
+                event.map_err(std::io::Error::other)?,
+                talaris::ws::Event::HandshakeComplete
+            ) {
+                return Ok(ws);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub async fn tokio_recv_tls_ws_binary_frames(
     s: &mut tokio::net::TcpStream,
     tls: &mut rustls::ClientConnection,
@@ -751,6 +790,50 @@ pub async fn tokio_recv_tls_ws_binary_frames(
 }
 
 #[cfg(target_os = "linux")]
+pub async fn tokio_recv_tls_ws_data_events(
+    s: &mut tokio::net::TcpStream,
+    tls: &mut rustls::ClientConnection,
+    mut ws: talaris::ws::WsClient,
+    stop: StopMode,
+    expected_payload: usize,
+    sample_every: u64,
+    bench_start: Instant,
+) -> (Vec<Instant>, u64) {
+    let mut arrivals = sampled_arrivals(stop, sample_every);
+    let mut frame_count = 0_u64;
+    let mut network_buf = vec![0_u8; 256 * 1024];
+    let mut plaintext = Vec::with_capacity(64 * 1024);
+
+    loop {
+        if let Err(e) = ws.drain_data_events(|event| {
+            if let talaris::ws::DataEvent::Binary(data) = event {
+                debug_assert_eq!(data.len(), expected_payload);
+                frame_count += 1;
+                record_sampled_arrival(&mut arrivals, frame_count, sample_every);
+            }
+        }) {
+            eprintln!("[tokio_tls_ws] websocket error after {frame_count}: {e}");
+            break;
+        }
+        if !stop.keep_going(frame_count, bench_start) {
+            break;
+        }
+        if let Err(e) = flush_tokio_ws_tx(s, tls, &mut ws).await {
+            eprintln!("[tokio_tls_ws] write error after {frame_count}: {e}");
+            break;
+        }
+        if let Err(e) = read_tokio_tls(s, tls, &mut network_buf, &mut plaintext).await {
+            eprintln!("[tokio_tls_ws] read error after {frame_count}: {e}");
+            break;
+        }
+        ws.feed_recv(&plaintext);
+        plaintext.clear();
+    }
+
+    (arrivals, frame_count)
+}
+
+#[cfg(target_os = "linux")]
 async fn read_tokio_tls(
     s: &mut tokio::net::TcpStream,
     tls: &mut rustls::ClientConnection,
@@ -790,6 +873,22 @@ async fn flush_tokio_tls(
         s.write_all(&ciphertext).await?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn flush_tokio_ws_tx(
+    s: &mut tokio::net::TcpStream,
+    tls: &mut rustls::ClientConnection,
+    ws: &mut talaris::ws::WsClient,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let n = ws.pending_tx().len();
+    if n > 0 {
+        tls.writer().write_all(ws.pending_tx())?;
+        ws.ack_tx(n);
+    }
+    flush_tokio_tls(s, tls).await
 }
 
 #[cfg(target_os = "linux")]
