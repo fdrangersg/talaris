@@ -66,6 +66,7 @@ mod linux_impl {
         let server_cpu: usize = common::arg_or("--server-cpu", 4);
         let talaris_cpu: usize = common::arg_or("--talaris-cpu", 1);
         let sq_poll_cpu: u32 = common::arg_or("--sq-poll-cpu", 5);
+        let sq_poll_idle_ms: u32 = common::arg_or("--sq-poll-idle-ms", 10_000);
         let tokio_cpu: usize = common::arg_or("--tokio-cpu", 2);
         let spin_iters: usize = common::arg_or("--spin-iters", 256);
         let sample_every: u64 = common::arg_or("--sample-every", 1);
@@ -78,7 +79,9 @@ mod linux_impl {
         eprintln!(" stop      : {}", stop.describe());
         eprintln!(" payload   : {payload}B");
         eprintln!(" server-cpu: {server_cpu}");
-        eprintln!(" talaris   : user->CPU {talaris_cpu}, SQ_POLL->CPU {sq_poll_cpu}");
+        eprintln!(
+            " talaris   : user->CPU {talaris_cpu}, SQ_POLL->CPU {sq_poll_cpu}, idle={sq_poll_idle_ms}ms"
+        );
         eprintln!(" tokio     : worker->CPU {tokio_cpu}");
         eprintln!(" spin_iters: {spin_iters}");
         eprintln!(" samples   : every {sample_every} frame(s), 0 disables");
@@ -109,6 +112,7 @@ mod linux_impl {
                 payload,
                 talaris_cpu,
                 sq_poll_cpu,
+                sq_poll_idle_ms,
                 buf_size,
                 buf_entries,
                 sample_every,
@@ -125,6 +129,7 @@ mod linux_impl {
                 payload,
                 talaris_cpu,
                 sq_poll_cpu,
+                sq_poll_idle_ms,
                 buf_size,
                 buf_entries,
                 sample_every,
@@ -205,6 +210,7 @@ mod linux_impl {
         payload: usize,
         user_cpu: usize,
         sq_poll_cpu: u32,
+        sq_poll_idle_ms: u32,
         buf_size: u32,
         buf_entries: u16,
         sample_every: u64,
@@ -219,8 +225,12 @@ mod linux_impl {
 
         let cfg = ConnectionConfig::new("localhost", addr.port(), "/")
             .with_tls_config(common::local_tls_client_config())
-            .with_sq_poll(10_000, Some(sq_poll_cpu))
             .with_buf_ring(buf_size, buf_entries);
+        let cfg = if sq_poll_idle_ms == 0 {
+            cfg
+        } else {
+            cfg.with_sq_poll(sq_poll_idle_ms, Some(sq_poll_cpu))
+        };
         let mut pool = Pool::new(PoolConfig::new(cfg.proactor)).expect("pool");
         let h = pool
             .connect_blocking_to(cfg, addr)

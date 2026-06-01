@@ -78,6 +78,10 @@ pub enum ProactorError {
 /// 包了 `*mut` 元数据，跨线程使用必须由 caller 明确同步，F1 直接禁掉）。
 pub struct Proactor {
     ring: IoUring,
+    /// 是否有尚未 publish / submit 的 SQE。steady-state multishot recv 下通常
+    /// 为 false；空 SQ 时跳过 `Submitter::submit()`，避免 SQ_POLL 路径每轮做
+    /// SeqCst fence + flag loads。
+    has_pending_submissions: bool,
 }
 
 impl std::fmt::Debug for Proactor {
@@ -102,7 +106,10 @@ impl Proactor {
             }
         }
         let ring = builder.build(config.entries).map_err(ProactorError::Init)?;
-        Ok(Self { ring })
+        Ok(Self {
+            ring,
+            has_pending_submissions: false,
+        })
     }
 
     /// 提交 connect。
@@ -132,6 +139,7 @@ impl Proactor {
                 .push(&entry)
                 .map_err(|_| ProactorError::SqFull)?;
         }
+        self.has_pending_submissions = true;
         Ok(())
     }
 
@@ -160,6 +168,7 @@ impl Proactor {
                 .push(&entry)
                 .map_err(|_| ProactorError::SqFull)?;
         }
+        self.has_pending_submissions = true;
         Ok(())
     }
 
@@ -188,6 +197,7 @@ impl Proactor {
                 .push(&entry)
                 .map_err(|_| ProactorError::SqFull)?;
         }
+        self.has_pending_submissions = true;
         Ok(())
     }
 
@@ -214,6 +224,7 @@ impl Proactor {
                 .push(&entry)
                 .map_err(|_| ProactorError::SqFull)?;
         }
+        self.has_pending_submissions = true;
         Ok(())
     }
 
@@ -238,6 +249,7 @@ impl Proactor {
                 .push(&entry)
                 .map_err(|_| ProactorError::SqFull)?;
         }
+        self.has_pending_submissions = true;
         Ok(())
     }
 
@@ -251,6 +263,7 @@ impl Proactor {
                 .push(&entry)
                 .map_err(|_| ProactorError::SqFull)?;
         }
+        self.has_pending_submissions = true;
         Ok(())
     }
 
@@ -281,6 +294,7 @@ impl Proactor {
                 .push(&entry)
                 .map_err(|_| ProactorError::SqFull)?;
         }
+        self.has_pending_submissions = true;
         Ok(())
     }
 
@@ -323,9 +337,12 @@ impl Proactor {
     /// 系统调用，等于抹掉 SQ_POLL 的好处。如果 caller 想要 SQ_POLL 实际生效，
     /// 用 [`submit`](Self::submit) + [`wait_for_cqe`](Self::wait_for_cqe) 拆开。
     pub fn submit_and_wait(&mut self, wait_nr: usize) -> Result<usize, ProactorError> {
-        self.ring
+        let submitted = self
+            .ring
             .submit_and_wait(wait_nr)
-            .map_err(ProactorError::Submit)
+            .map_err(ProactorError::Submit)?;
+        self.has_pending_submissions = false;
+        Ok(submitted)
     }
 
     /// 仅 submit（不等 CQE）。返回 kernel 实际收到的 SQE 数。
@@ -335,11 +352,19 @@ impl Proactor {
     /// flag 让本调用 enter syscall 唤醒它。
     ///
     /// 非 SQ_POLL 模式：等价于 `submit_and_wait(0)`。
+    /// 没有新 SQE 时直接返回 0，避免 steady-state multishot recv loop 空跑
+    /// SQ_POLL fence / flag loads。
     pub fn submit(&mut self) -> Result<usize, ProactorError> {
-        self.ring
+        if !self.has_pending_submissions {
+            return Ok(0);
+        }
+        let submitted = self
+            .ring
             .submitter()
             .submit()
-            .map_err(ProactorError::Submit)
+            .map_err(ProactorError::Submit)?;
+        self.has_pending_submissions = false;
+        Ok(submitted)
     }
 
     /// 仅等 CQE，不 submit 任何新 SQE。若已有 ≥1 个 ready CQE 则立即返回。
@@ -356,9 +381,12 @@ impl Proactor {
         // io-uring crate 的 `submit_with_args` 是底层；这里用 submit_and_wait(N) +
         // 先调 submit() 把已有 SQE 推出去（多数情况 SQ 是空的，submit 是 noop）。
         // 实测：SQ empty 时 submit_and_wait 等价于纯 wait，开销与单独 wait 持平。
-        self.ring
+        let submitted = self
+            .ring
             .submit_and_wait(wait_nr)
-            .map_err(ProactorError::Submit)
+            .map_err(ProactorError::Submit)?;
+        self.has_pending_submissions = false;
+        Ok(submitted)
     }
 
     /// 取走所有 ready CQE，对每个调一次 `sink`。返回取走个数。
@@ -506,5 +534,11 @@ mod tests {
         let n = proactor.drain_completions(|_| sink_called = true);
         assert_eq!(n, 0);
         assert!(!sink_called);
+    }
+
+    #[test]
+    fn submit_without_pending_sqe_returns_zero() {
+        let mut proactor = Proactor::new(ProactorConfig::default()).unwrap();
+        assert_eq!(proactor.submit().unwrap(), 0);
     }
 }
