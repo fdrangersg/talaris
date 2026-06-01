@@ -215,11 +215,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pin_current_thread_to(1)?;
 
     // 2. 配置一条订阅 conn
-    //    - SQ_POLL kthread 钉到 CPU 5（CPU 1 的 SMT sibling；只是候选拓扑，需压测）
+    //    - SQ_POLL kthread 钉到 CPU 3（先试独立 physical core；再与 SMT sibling A/B）
     //    - buf_ring 单格 8 KiB（payload ~400B → 8KiB 一格装 ~20 帧）
     let cfg = ConnectionConfig::new("test.deribit.com", 443, "/ws/api/v2")
         .with_tls(true)
-        .with_sq_poll(10_000, Some(5))
+        .with_sq_poll(10_000, Some(3))
         .with_buf_ring(8 * 1024, 256);
 
     // 3. 起 Pool, handshake
@@ -316,14 +316,15 @@ re-arm，但 burst 头几帧延迟会受影响）。
 ```
 CPU 0          ← OS noise (IRQ / kthread / cron)
 CPU 1   (iso)  ← talaris user thread (pin here)
-CPU 5   (iso)  ← talaris SQ_POLL kthread (CPU 1 的 SMT sibling 候选)
-CPU 2,3,4 (iso)← 备用 / 第二条 Pool
+CPU 3   (iso)  ← talaris SQ_POLL kthread (先试独立 physical core)
+CPU 5   (iso)  ← CPU 1 的 SMT sibling；作为 SQ_POLL A/B 候选
+CPU 2,4 (iso)  ← 备用 / 第二条 Pool
 CPU 6, 7       ← OS noise
 ```
 
-SMT sibling pair 把 user thread 和 SQ_POLL kthread 钉到同一物理核的两条 SMT 上，
-cacheline 传递可能更近，但两条线程也会共享执行资源；是否优于独立 physical core
-要以目标机器上的压测结果为准。
+SQ_POLL 和 user thread 放在独立 physical core 通常是更稳妥的起点。SMT sibling pair
+可能缩短 cacheline 传递距离，但两条线程也会共享执行资源；最终必须在目标机器上
+对独立 physical core、SMT sibling 和关闭 SQ_POLL 三种拓扑做 A/B。
 
 ---
 
@@ -399,7 +400,7 @@ taskset -c 0-7 ./your-binary   # 进程父 affinity 必须覆盖 1-5
 
 # 代码里
 pin_current_thread_to(1);  // 钉到 1
-with_sq_poll(10000, Some(5));  // kthread 钉到 5
+with_sq_poll(10000, Some(3));  // kthread 钉到独立 physical core 候选
 ```
 
 少了 `taskset` → `pin_current_thread_to(1)` 会 fail（CPU 1 不在进程 affinity 里）。
@@ -451,6 +452,7 @@ Tested on Linux 6.x with io_uring features: `SETUP_SQPOLL`,
 | `ws_ingress_raw` | 绕开 Pool + WsClient, 直接 Proactor + BufferRing 收 Binary 帧 |
 | `ws_ingress_single` | Pool.pump vs Pool.pump_data vs tokio (单 conn, 稳态满速) |
 | `ws_ingress_fanout` | N ∈ {1,4,16,64} 条 conn 同时收 (talaris Pool 路由 vs tokio N task) |
+| `ws_ingress_tls` | loopback WSS：talaris、fair tokio rustls + 同一 WsClient、tokio bare 下界、软件 kTLS ceiling probe |
 | `binance_live` | Binance Spot 公共 WSS 实盘 TLS ingress：多 symbol 高频 Text JSON 行情 |
 
 跑法：
@@ -458,9 +460,22 @@ Tested on Linux 6.x with io_uring features: `SETUP_SQPOLL`,
 taskset -c 0-7 cargo bench --bench ws_ingress_single -- \
     --seconds 5 --payload 400 --buf-size 8192
 
+taskset -c 0-7 cargo bench --bench ws_ingress_tls -- \
+    --frames 50000000 --payload 256 --sample-every 0 \
+    --server-cpu 4 --talaris-cpu 1 --sq-poll-cpu 3 --tokio-cpu 2 \
+    --spin-iters 256 --buf-size 4096 --buf-entries 256
+
 taskset -c 0-7 cargo bench --bench binance_live -- \
-    --seconds 30 --warmup-seconds 5 --user-cpu 1 --sq-poll-cpu 5
+    --seconds 30 --warmup-seconds 5 --user-cpu 1 --sq-poll-cpu 3
 ```
+
+`ws_ingress_tls` 的 `--sample-every 0` 用于测吞吐，避免逐帧 `Instant::now()` 污染结果；
+测相邻帧 delivery jitter 时改成 `--sample-every 1`。fair tokio 组复用同一个
+`WsClient`，用来隔离 IO/TLS 驱动开销；bare 组只是理论下界，不是功能等价实现。
+
+Linux 软件 kTLS 组只用于判断 ceiling，不是生产 transport 路径。kTLS RX 的 control
+record 必须经 `recvmsg` ancillary data 处理；完整生产实现还要处理 TLS 1.3 KeyUpdate
+和 session ticket。是否值得引入这条复杂路径，必须先在部署机器上跑 probe。
 
 实测数据见 `src/connection.rs::ConnectionConfig::with_buf_ring` 的 doc。
 
