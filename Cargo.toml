@@ -41,6 +41,7 @@ io-uring = "0.7"
 [dev-dependencies]
 # example / bench 用：per-handle latency 测量 + tokio 对照组
 hdrhistogram = "7"
+serde_json   = "1"
 # benchmark 对照组。features 砍到只够单线程 TCP echo —— 不让 tokio 拉一堆
 # 额外组件（fs / signal / process / sync 等）进 bench 二进制；这样比较更接近
 # "tokio 的 IO 模型" 而非"tokio 的全家桶"。
@@ -99,6 +100,10 @@ harness = false
 
 [[bench]]
 name    = "ws_ingress_tls"
+harness = false
+
+[[bench]]
+name    = "ws_ingress_json"
 harness = false
 
 [[bench]]

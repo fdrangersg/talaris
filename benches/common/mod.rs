@@ -23,7 +23,7 @@
     clippy::needless_pass_by_value
 )]
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 
@@ -83,7 +83,20 @@ pub fn print_comparison(rows: &[(&str, &Histogram<u64>)]) {
     }
 }
 
-fn ns(n: u64) -> String {
+pub fn fmt_int(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
+}
+
+pub fn ns(n: u64) -> String {
     let s = n.to_string();
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3 + 3);
@@ -95,6 +108,62 @@ fn ns(n: u64) -> String {
     }
     out.push_str(" ns");
     out
+}
+
+pub fn ns_per_frame(cpu: Duration, frames: u64) -> u64 {
+    if frames == 0 {
+        return 0;
+    }
+    let per = cpu.as_nanos() / u128::from(frames);
+    u64::try_from(per.min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
+}
+
+pub fn cpu_pct(cpu: Duration, elapsed: Duration) -> f64 {
+    if elapsed.is_zero() {
+        return 0.0;
+    }
+    100.0 * cpu.as_secs_f64() / elapsed.as_secs_f64()
+}
+
+#[cfg(target_os = "linux")]
+pub fn thread_cpu_time() -> Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut ts) };
+    if rc != 0 {
+        return Duration::ZERO;
+    }
+    let secs = u64::try_from(ts.tv_sec).unwrap_or(0);
+    let nanos = u32::try_from(ts.tv_nsec).unwrap_or(0);
+    Duration::new(secs, nanos)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub const fn thread_cpu_time() -> Duration {
+    Duration::ZERO
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ThreadCpuTimer {
+    start: Duration,
+}
+
+impl ThreadCpuTimer {
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn start() -> Self {
+        Self {
+            start: thread_cpu_time(),
+        }
+    }
+
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn elapsed(self) -> Duration {
+        thread_cpu_time().saturating_sub(self.start)
+    }
 }
 
 /// 把每帧的 Instant 序列折算成 inter-arrival histogram。第 0 帧没有"上一帧"
@@ -258,14 +327,24 @@ impl PinGuard {
 /// buffer。payload 用 0..255 循环字节填，方便 client 端校验。
 pub fn pre_encode_ws_binary_chunk(payload_size: usize, n_frames: usize) -> Vec<u8> {
     use talaris::ws::OpCode;
-    use talaris::ws::frame::{MAX_HEADER_LEN, encode_header};
-
     let mut payload = vec![0_u8; payload_size];
     for (i, b) in payload.iter_mut().enumerate() {
         *b = (i % 256) as u8;
     }
+    pre_encode_ws_chunk(OpCode::Binary, payload.as_slice(), n_frames)
+}
+
+pub fn pre_encode_ws_text_chunk(payload: &[u8], n_frames: usize) -> Vec<u8> {
+    use talaris::ws::OpCode;
+    debug_assert!(std::str::from_utf8(payload).is_ok());
+    pre_encode_ws_chunk(OpCode::Text, payload, n_frames)
+}
+
+fn pre_encode_ws_chunk(opcode: talaris::ws::OpCode, payload: &[u8], n_frames: usize) -> Vec<u8> {
+    use talaris::ws::frame::{MAX_HEADER_LEN, encode_header};
 
     // 每帧 header 大小：payload ≤125 是 2B，≤65535 是 4B，否则 10B。
+    let payload_size = payload.len();
     let est_hdr = if payload_size <= 125 {
         2
     } else if payload_size <= 0xFFFF {
@@ -276,11 +355,42 @@ pub fn pre_encode_ws_binary_chunk(payload_size: usize, n_frames: usize) -> Vec<u
     let mut buf = Vec::with_capacity(n_frames * (est_hdr + payload_size));
     let mut hdr = [0_u8; MAX_HEADER_LEN];
     for _ in 0..n_frames {
-        let hn = encode_header(&mut hdr, true, OpCode::Binary, None, payload_size as u64);
+        let hn = encode_header(&mut hdr, true, opcode, None, payload_size as u64);
         buf.extend_from_slice(&hdr[..hn]);
-        buf.extend_from_slice(&payload);
+        buf.extend_from_slice(payload);
     }
     buf
+}
+
+pub fn json_quote_payload(target_size: usize) -> Vec<u8> {
+    let target_size = target_size.max(96);
+    let mut s = String::from(
+        r#"{"stream":"book","symbol":"BTC-PERP","ts":1780000000123456789,"bid":68123.5,"ask":68124.0,"bid_sz":12.5,"ask_sz":9.25,"seq":123456789"#,
+    );
+    if s.len() + 2 < target_size {
+        s.push_str(r#","pad":""#);
+        let pad_len = target_size.saturating_sub(s.len() + 1);
+        for i in 0..pad_len {
+            let c = b'a' + u8::try_from(i % 26).unwrap_or(0);
+            s.push(char::from(c));
+        }
+        s.push('"');
+    }
+    s.push('}');
+    s.into_bytes()
+}
+
+pub fn decode_json_value(payload: &str) -> u64 {
+    let value: serde_json::Value = serde_json::from_str(payload).expect("bench JSON payload");
+    let seq = value
+        .get("seq")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let ts = value
+        .get("ts")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    seq ^ ts
 }
 
 /// 给 server 推荐的 chunk size：~64 KiB（一次 write_all 大致填满 TCP send buffer

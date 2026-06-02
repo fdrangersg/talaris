@@ -59,6 +59,7 @@
     clippy::unwrap_used,
     clippy::doc_markdown,
     clippy::similar_names,
+    clippy::too_many_arguments,
     clippy::too_many_lines
 )]
 
@@ -92,6 +93,7 @@ mod linux_impl {
     struct Outcome {
         frames: u64,
         elapsed: Duration,
+        client_cpu: Duration,
         inter_arrival: Histogram<u64>,
     }
 
@@ -112,6 +114,7 @@ mod linux_impl {
         let sq_poll_cpu: u32 = common::arg_or("--sq-poll-cpu", 5);
         let tokio_cpu: usize = common::arg_or("--tokio-cpu", 2);
         let spin_iters: usize = common::arg_or("--spin-iters", 256);
+        let sample_every: u64 = common::arg_or("--sample-every", 1);
         let buf_size: u32 = common::arg_or("--buf-size", 4096);
         let buf_entries: u16 = common::arg_or("--buf-entries", 256);
 
@@ -124,6 +127,7 @@ mod linux_impl {
         eprintln!(" talaris   : user→CPU {talaris_cpu}, SQ_POLL→CPU {sq_poll_cpu}");
         eprintln!(" tokio     : worker→CPU {tokio_cpu}");
         eprintln!(" spin_iters: {spin_iters}");
+        eprintln!(" samples   : every {sample_every} frame(s), 0 disables");
         eprintln!(
             " buf_ring  : {buf_entries} × {buf_size}B = {} KiB pool",
             (u32::from(buf_entries) * buf_size) / 1024
@@ -157,6 +161,7 @@ mod linux_impl {
                 sq_poll_cpu,
                 buf_size,
                 buf_entries,
+                sample_every,
             )
         });
         eprintln!();
@@ -172,6 +177,7 @@ mod linux_impl {
                 sq_poll_cpu,
                 buf_size,
                 buf_entries,
+                sample_every,
             )
         });
         eprintln!();
@@ -188,6 +194,7 @@ mod linux_impl {
                 spin_iters,
                 buf_size,
                 buf_entries,
+                sample_every,
             )
         });
         eprintln!();
@@ -195,17 +202,17 @@ mod linux_impl {
         // ── variant 4/4: tokio ───────────────────────────────────────────
         eprintln!("─── variant 4/4: tokio (epoll + current_thread + pin) ───");
         let tokio = with_fresh_stream_server(server_cpu, chunk_buf, |addr| {
-            run_tokio(addr, stop, payload, tokio_cpu)
+            run_tokio(addr, stop, payload, tokio_cpu, sample_every)
         });
 
         println!();
         println!("=== ws_ingress_single (payload={payload}B) ===");
         println!();
         println!(
-            "{:<22} │ {:>14} │ {:>10} │ {:>14} │ {:>11}",
-            "variant", "frames", "elapsed", "frames/s", "MiB/s"
+            "{:<22} │ {:>14} │ {:>10} │ {:>14} │ {:>11} │ {:>12} │ {:>9}",
+            "variant", "frames", "elapsed", "frames/s", "MiB/s", "cpu ns/frame", "cpu%"
         );
-        println!("{}", "─".repeat(82));
+        println!("{}", "─".repeat(112));
         for (label, o) in [
             ("talaris Pool.pump", &talaris),
             ("talaris pump_data", &talaris_data),
@@ -213,12 +220,14 @@ mod linux_impl {
             ("tokio", &tokio),
         ] {
             println!(
-                "{:<22} │ {:>14} │ {:>9.3}s │ {:>14} │ {:>11.2}",
+                "{:<22} │ {:>14} │ {:>9.3}s │ {:>14} │ {:>11.2} │ {:>12} │ {:>8.1}%",
                 label,
-                fmt_int(o.frames),
+                common::fmt_int(o.frames),
                 o.elapsed.as_secs_f64(),
-                fmt_int(o.frames_per_sec() as u64),
+                common::fmt_int(o.frames_per_sec() as u64),
                 o.mib_per_sec(payload),
+                common::fmt_int(common::ns_per_frame(o.client_cpu, o.frames)),
+                common::cpu_pct(o.client_cpu, o.elapsed),
             );
         }
         let r_data = talaris_data.frames_per_sec() / talaris.frames_per_sec();
@@ -233,6 +242,9 @@ mod linux_impl {
         );
         println!("pump_data vs tokio: {r_vs_tokio:.2}× (1.0 = parity)");
         println!("data spin vs tokio: {r_spin_vs_tokio:.2}× (1.0 = parity)");
+        println!(
+            "cpu ns/frame is client-thread CPU only; SQ_POLL kernel thread CPU is not included."
+        );
 
         println!();
         println!("=== inter-arrival latency (delivery jitter) ===");
@@ -270,6 +282,7 @@ mod linux_impl {
         sq_poll_cpu: u32,
         buf_size: u32,
         buf_entries: u16,
+        sample_every: u64,
     ) -> Outcome {
         let _guard = PinGuard::pin("talaris", user_cpu);
         eprintln!("[talaris] user→CPU {user_cpu}, SQ_POLL kthread→CPU {sq_poll_cpu}");
@@ -282,21 +295,23 @@ mod linux_impl {
         let h = pool.connect_blocking_to(cfg, addr).expect("connect");
         assert_eq!(pool.state(h), Some(State::Open));
 
-        let mut arrivals: Vec<Instant> = Vec::with_capacity(stop.cap_hint());
+        let mut arrivals = common::sampled_arrivals(stop, sample_every);
         let mut frame_count = 0_u64;
+        let cpu_timer = common::ThreadCpuTimer::start();
         let bench_start = Instant::now();
 
         while stop.keep_going(frame_count, bench_start) {
             pool.pump(|_h, ev| {
                 if let WsEvent::Binary(data) = ev {
                     debug_assert_eq!(data.len(), payload);
-                    arrivals.push(Instant::now());
                     frame_count += 1;
+                    common::record_sampled_arrival(&mut arrivals, frame_count, sample_every);
                 }
             })
             .expect("pump");
         }
         let elapsed = bench_start.elapsed();
+        let client_cpu = cpu_timer.elapsed();
         eprintln!(
             "[talaris] {} frames in {:.3}s ({:.0} f/s)",
             frame_count,
@@ -318,6 +333,7 @@ mod linux_impl {
         Outcome {
             frames: frame_count,
             elapsed,
+            client_cpu,
             inter_arrival,
         }
     }
@@ -331,6 +347,7 @@ mod linux_impl {
         sq_poll_cpu: u32,
         buf_size: u32,
         buf_entries: u16,
+        sample_every: u64,
     ) -> Outcome {
         let _guard = PinGuard::pin("talaris-data", user_cpu);
         eprintln!("[talaris-data] user→CPU {user_cpu}, SQ_POLL kthread→CPU {sq_poll_cpu}");
@@ -343,21 +360,23 @@ mod linux_impl {
         let h = pool.connect_blocking_to(cfg, addr).expect("connect");
         assert_eq!(pool.state(h), Some(State::Open));
 
-        let mut arrivals: Vec<Instant> = Vec::with_capacity(stop.cap_hint());
+        let mut arrivals = common::sampled_arrivals(stop, sample_every);
         let mut frame_count = 0_u64;
+        let cpu_timer = common::ThreadCpuTimer::start();
         let bench_start = Instant::now();
 
         while stop.keep_going(frame_count, bench_start) {
             pool.pump_data(|_h, ev| {
                 if let WsDataEvent::Binary(data) = ev {
                     debug_assert_eq!(data.len(), payload);
-                    arrivals.push(Instant::now());
                     frame_count += 1;
+                    common::record_sampled_arrival(&mut arrivals, frame_count, sample_every);
                 }
             })
             .expect("pump_data");
         }
         let elapsed = bench_start.elapsed();
+        let client_cpu = cpu_timer.elapsed();
         eprintln!(
             "[talaris-data] {} frames in {:.3}s ({:.0} f/s)",
             frame_count,
@@ -379,6 +398,7 @@ mod linux_impl {
         Outcome {
             frames: frame_count,
             elapsed,
+            client_cpu,
             inter_arrival,
         }
     }
@@ -395,6 +415,7 @@ mod linux_impl {
         spin_iters: usize,
         buf_size: u32,
         buf_entries: u16,
+        sample_every: u64,
     ) -> Outcome {
         let _guard = PinGuard::pin("talaris-data-spin", user_cpu);
         eprintln!(
@@ -409,21 +430,23 @@ mod linux_impl {
         let h = pool.connect_blocking_to(cfg, addr).expect("connect");
         assert_eq!(pool.state(h), Some(State::Open));
 
-        let mut arrivals: Vec<Instant> = Vec::with_capacity(stop.cap_hint());
+        let mut arrivals = common::sampled_arrivals(stop, sample_every);
         let mut frame_count = 0_u64;
+        let cpu_timer = common::ThreadCpuTimer::start();
         let bench_start = Instant::now();
 
         while stop.keep_going(frame_count, bench_start) {
             pool.pump_data_spin(spin_iters, |_h, ev| {
                 if let WsDataEvent::Binary(data) = ev {
                     debug_assert_eq!(data.len(), payload);
-                    arrivals.push(Instant::now());
                     frame_count += 1;
+                    common::record_sampled_arrival(&mut arrivals, frame_count, sample_every);
                 }
             })
             .expect("pump_data_spin");
         }
         let elapsed = bench_start.elapsed();
+        let client_cpu = cpu_timer.elapsed();
         eprintln!(
             "[talaris-data-spin] {} frames in {:.3}s ({:.0} f/s)",
             frame_count,
@@ -444,11 +467,18 @@ mod linux_impl {
         Outcome {
             frames: frame_count,
             elapsed,
+            client_cpu,
             inter_arrival,
         }
     }
 
-    fn run_tokio(addr: SocketAddr, stop: StopMode, payload: usize, user_cpu: usize) -> Outcome {
+    fn run_tokio(
+        addr: SocketAddr,
+        stop: StopMode,
+        payload: usize,
+        user_cpu: usize,
+        sample_every: u64,
+    ) -> Outcome {
         let _guard = PinGuard::pin("tokio", user_cpu);
         eprintln!("[tokio] worker→CPU {user_cpu}");
 
@@ -466,11 +496,19 @@ mod linux_impl {
                 .await
                 .expect("ws upgrade");
 
+            let cpu_timer = common::ThreadCpuTimer::start();
             let bench_start = Instant::now();
-            let (arrivals, frame_count) =
-                common::tokio_recv_ws_binary_frames(&mut s, leftover, stop, payload, bench_start)
-                    .await;
+            let (arrivals, frame_count) = tokio_recv_ws_binary_frames_sampled(
+                &mut s,
+                leftover,
+                stop,
+                payload,
+                sample_every,
+                bench_start,
+            )
+            .await;
             let elapsed = bench_start.elapsed();
+            let client_cpu = cpu_timer.elapsed();
             eprintln!(
                 "[tokio] {} frames in {:.3}s ({:.0} f/s)",
                 frame_count,
@@ -484,21 +522,74 @@ mod linux_impl {
             Outcome {
                 frames: frame_count,
                 elapsed,
+                client_cpu,
                 inter_arrival,
             }
         })
     }
 
-    fn fmt_int(n: u64) -> String {
-        let s = n.to_string();
-        let bytes = s.as_bytes();
-        let mut out = String::with_capacity(s.len() + s.len() / 3);
-        for (i, &b) in bytes.iter().enumerate() {
-            if i > 0 && (bytes.len() - i).is_multiple_of(3) {
-                out.push(',');
+    async fn tokio_recv_ws_binary_frames_sampled(
+        s: &mut tokio::net::TcpStream,
+        initial_leftover: Vec<u8>,
+        stop: StopMode,
+        expected_payload: usize,
+        sample_every: u64,
+        bench_start: Instant,
+    ) -> (Vec<Instant>, u64) {
+        use talaris::ws::frame::parse_header;
+        use tokio::io::AsyncReadExt;
+
+        let mut arrivals = common::sampled_arrivals(stop, sample_every);
+        let mut frame_count = 0_u64;
+        let mut recv_buf = vec![0_u8; 256 * 1024];
+        let mut leftover = initial_leftover;
+        leftover.reserve(64 * 1024);
+
+        'outer: loop {
+            let mut pos = 0_usize;
+            while pos < leftover.len() {
+                match parse_header(&leftover[pos..]) {
+                    Ok(Some((hdr, consumed))) => {
+                        let total = consumed + hdr.payload_len as usize;
+                        if leftover.len() - pos < total {
+                            break;
+                        }
+                        debug_assert_eq!(hdr.payload_len as usize, expected_payload);
+                        frame_count += 1;
+                        common::record_sampled_arrival(&mut arrivals, frame_count, sample_every);
+                        pos += total;
+                        if !stop.keep_going(frame_count, bench_start) {
+                            leftover.drain(..pos);
+                            break 'outer;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("[tokio_recv_sampled] parse_header err after {frame_count}: {e}");
+                        leftover.drain(..pos);
+                        break 'outer;
+                    }
+                }
             }
-            out.push(b as char);
+            leftover.drain(..pos);
+
+            if !stop.keep_going(frame_count, bench_start) {
+                break;
+            }
+            let n = match s.read(&mut recv_buf).await {
+                Ok(0) => {
+                    eprintln!("[tokio_recv_sampled] EOF after {frame_count} frames");
+                    break;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("[tokio_recv_sampled] read error after {frame_count}: {e}");
+                    break;
+                }
+            };
+            leftover.extend_from_slice(&recv_buf[..n]);
         }
-        out
+
+        (arrivals, frame_count)
     }
 }

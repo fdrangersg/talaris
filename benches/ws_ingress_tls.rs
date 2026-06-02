@@ -48,6 +48,7 @@ mod linux_impl {
     struct Outcome {
         frames: u64,
         elapsed: Duration,
+        client_cpu: Duration,
         inter_arrival: Histogram<u64>,
         ingress_stats: Option<IngressStats>,
     }
@@ -173,10 +174,10 @@ mod linux_impl {
         println!("=== ws_ingress_tls (payload={payload}B) ===");
         println!();
         println!(
-            "{:<22} | {:>14} | {:>10} | {:>14} | {:>11}",
-            "variant", "frames", "elapsed", "frames/s", "MiB/s"
+            "{:<22} | {:>14} | {:>10} | {:>14} | {:>11} | {:>12} | {:>9}",
+            "variant", "frames", "elapsed", "frames/s", "MiB/s", "cpu ns/frame", "cpu%"
         );
-        println!("{}", "-".repeat(82));
+        println!("{}", "-".repeat(112));
         for (label, outcome) in [
             ("talaris pump_data", &talaris),
             ("talaris data spin", &talaris_spin),
@@ -186,12 +187,14 @@ mod linux_impl {
             ("tokio kTLS ceiling", &tokio_ktls),
         ] {
             println!(
-                "{:<22} | {:>14} | {:>9.3}s | {:>14} | {:>11.2}",
+                "{:<22} | {:>14} | {:>9.3}s | {:>14} | {:>11.2} | {:>12} | {:>8.1}%",
                 label,
-                fmt_int(outcome.frames),
+                common::fmt_int(outcome.frames),
                 outcome.elapsed.as_secs_f64(),
-                fmt_int(outcome.frames_per_sec() as u64),
+                common::fmt_int(outcome.frames_per_sec() as u64),
                 outcome.mib_per_sec(payload),
+                common::fmt_int(common::ns_per_frame(outcome.client_cpu, outcome.frames)),
+                common::cpu_pct(outcome.client_cpu, outcome.elapsed),
             );
         }
         println!();
@@ -210,6 +213,9 @@ mod linux_impl {
         println!(
             "kTLS ceiling vs tokio bare: {:.2}x (probe only)",
             tokio_ktls.frames_per_sec() / tokio_bare.frames_per_sec()
+        );
+        println!(
+            "cpu ns/frame is client-thread CPU only; SQ_POLL kernel thread CPU is not included."
         );
         if ingress_stats {
             println!();
@@ -287,6 +293,7 @@ mod linux_impl {
 
         let mut arrivals = common::sampled_arrivals(stop, sample_every);
         let mut frame_count = 0_u64;
+        let cpu_timer = common::ThreadCpuTimer::start();
         let bench_start = Instant::now();
         if let Some(spin_iters) = spin_iters {
             while stop.keep_going(frame_count, bench_start) {
@@ -312,6 +319,7 @@ mod linux_impl {
             }
         }
         let elapsed = bench_start.elapsed();
+        let client_cpu = cpu_timer.elapsed();
         let ingress_stats = pool.ingress_stats(h);
         eprintln!(
             "[{label}] {} frames in {:.3}s ({:.0} f/s)",
@@ -325,6 +333,7 @@ mod linux_impl {
         Outcome {
             frames: frame_count,
             elapsed,
+            client_cpu,
             inter_arrival,
             ingress_stats,
         }
@@ -353,6 +362,7 @@ mod linux_impl {
                 .await
                 .expect("TLS + WsClient upgrade");
 
+            let cpu_timer = common::ThreadCpuTimer::start();
             let bench_start = Instant::now();
             let (arrivals, frame_count) = common::tokio_recv_tls_ws_data_events(
                 &mut stream,
@@ -365,6 +375,7 @@ mod linux_impl {
             )
             .await;
             let elapsed = bench_start.elapsed();
+            let client_cpu = cpu_timer.elapsed();
             eprintln!(
                 "[tokio-tls-ws] {} frames in {:.3}s ({:.0} f/s)",
                 frame_count,
@@ -376,6 +387,7 @@ mod linux_impl {
             Outcome {
                 frames: frame_count,
                 elapsed,
+                client_cpu,
                 inter_arrival: common::inter_arrival_hist(&arrivals),
                 ingress_stats: None,
             }
@@ -406,6 +418,7 @@ mod linux_impl {
                     .await
                     .expect("TLS + WS upgrade");
 
+            let cpu_timer = common::ThreadCpuTimer::start();
             let bench_start = Instant::now();
             let (arrivals, frame_count) = common::tokio_recv_tls_ws_binary_frames(
                 &mut stream,
@@ -418,6 +431,7 @@ mod linux_impl {
             )
             .await;
             let elapsed = bench_start.elapsed();
+            let client_cpu = cpu_timer.elapsed();
             eprintln!(
                 "[tokio-tls-bare] {} frames in {:.3}s ({:.0} f/s)",
                 frame_count,
@@ -429,6 +443,7 @@ mod linux_impl {
             Outcome {
                 frames: frame_count,
                 elapsed,
+                client_cpu,
                 inter_arrival: common::inter_arrival_hist(&arrivals),
                 ingress_stats: None,
             }
@@ -458,6 +473,7 @@ mod linux_impl {
                 .await
                 .expect("TLS handshake + kTLS install + WS upgrade");
 
+            let cpu_timer = common::ThreadCpuTimer::start();
             let bench_start = Instant::now();
             let (arrivals, frame_count) = common::tokio_recv_ktls_ws_binary_frames_sampled(
                 &stream,
@@ -469,6 +485,7 @@ mod linux_impl {
             )
             .await;
             let elapsed = bench_start.elapsed();
+            let client_cpu = cpu_timer.elapsed();
             eprintln!(
                 "[tokio-ktls-bare] {} frames in {:.3}s ({:.0} f/s)",
                 frame_count,
@@ -480,6 +497,7 @@ mod linux_impl {
             Outcome {
                 frames: frame_count,
                 elapsed,
+                client_cpu,
                 inter_arrival: common::inter_arrival_hist(&arrivals),
                 ingress_stats: None,
             }
@@ -509,6 +527,7 @@ mod linux_impl {
                     .await
                     .expect("unbuffered TLS + WS upgrade");
 
+            let cpu_timer = common::ThreadCpuTimer::start();
             let bench_start = Instant::now();
             let (arrivals, frame_count) = common::tokio_recv_unbuffered_tls_ws_binary_frames(
                 &mut stream,
@@ -521,6 +540,7 @@ mod linux_impl {
             )
             .await;
             let elapsed = bench_start.elapsed();
+            let client_cpu = cpu_timer.elapsed();
             eprintln!(
                 "[tokio-tls-unbuffered-bare] {} frames in {:.3}s ({:.0} f/s)",
                 frame_count,
@@ -532,6 +552,7 @@ mod linux_impl {
             Outcome {
                 frames: frame_count,
                 elapsed,
+                client_cpu,
                 inter_arrival: common::inter_arrival_hist(&arrivals),
                 ingress_stats: None,
             }
@@ -545,26 +566,13 @@ mod linux_impl {
         let bytes_per_cqe = stats.recv_bytes as f64 / stats.recv_data_cqes.max(1) as f64;
         println!(
             "{label:<22} | cqes={:>10} | bytes/cqe={bytes_per_cqe:>8.1} | ENOBUFS={}",
-            fmt_int(stats.recv_data_cqes),
+            common::fmt_int(stats.recv_data_cqes),
             stats.recv_ring_exhaustions,
         );
         println!(
             "{label:<22} | ws-drains={:>10} | ws-drain-skips={:>10}",
-            fmt_int(stats.ws_data_drains),
-            fmt_int(stats.ws_data_drain_skips),
+            common::fmt_int(stats.ws_data_drains),
+            common::fmt_int(stats.ws_data_drain_skips),
         );
-    }
-
-    fn fmt_int(n: u64) -> String {
-        let s = n.to_string();
-        let bytes = s.as_bytes();
-        let mut out = String::with_capacity(s.len() + s.len() / 3);
-        for (i, &b) in bytes.iter().enumerate() {
-            if i > 0 && (bytes.len() - i).is_multiple_of(3) {
-                out.push(',');
-            }
-            out.push(b as char);
-        }
-        out
     }
 }

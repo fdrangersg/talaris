@@ -79,6 +79,7 @@ mod linux_impl {
     struct Outcome {
         frames: u64,
         elapsed: Duration,
+        client_cpu: Duration,
         inter_arrival: Histogram<u64>,
     }
 
@@ -156,32 +157,40 @@ mod linux_impl {
         println!("=== ws_ingress_fanout (payload={payload}B) ===");
         println!();
         println!(
-            "{:<6} │ {:<8} │ {:>14} │ {:>10} │ {:>14} │ {:>10}",
-            "N", "variant", "frames", "elapsed", "frames/s", "MiB/s"
+            "{:<6} │ {:<8} │ {:>14} │ {:>10} │ {:>14} │ {:>10} │ {:>12} │ {:>9}",
+            "N", "variant", "frames", "elapsed", "frames/s", "MiB/s", "cpu ns/frame", "cpu%"
         );
-        println!("{}", "─".repeat(80));
+        println!("{}", "─".repeat(110));
         for r in &rows {
             println!(
-                "{:<6} │ {:<8} │ {:>14} │ {:>9.3}s │ {:>14} │ {:>10.2}",
+                "{:<6} │ {:<8} │ {:>14} │ {:>9.3}s │ {:>14} │ {:>10.2} │ {:>12} │ {:>8.1}%",
                 format!("N={}", r.n),
                 "talaris",
-                fmt_int(r.talaris.frames),
+                common::fmt_int(r.talaris.frames),
                 r.talaris.elapsed.as_secs_f64(),
-                fmt_int(r.talaris.frames_per_sec() as u64),
+                common::fmt_int(r.talaris.frames_per_sec() as u64),
                 r.talaris.mib_per_sec(payload),
+                common::fmt_int(common::ns_per_frame(r.talaris.client_cpu, r.talaris.frames)),
+                common::cpu_pct(r.talaris.client_cpu, r.talaris.elapsed),
             );
             let ratio = r.talaris.frames_per_sec() / r.tokio.frames_per_sec();
             println!(
-                "{:<6} │ {:<8} │ {:>14} │ {:>9.3}s │ {:>14} │ {:>10.2}    (ratio {:.2}×)",
+                "{:<6} │ {:<8} │ {:>14} │ {:>9.3}s │ {:>14} │ {:>10.2} │ {:>12} │ {:>8.1}%    (ratio {:.2}×)",
                 "",
                 "tokio",
-                fmt_int(r.tokio.frames),
+                common::fmt_int(r.tokio.frames),
                 r.tokio.elapsed.as_secs_f64(),
-                fmt_int(r.tokio.frames_per_sec() as u64),
+                common::fmt_int(r.tokio.frames_per_sec() as u64),
                 r.tokio.mib_per_sec(payload),
+                common::fmt_int(common::ns_per_frame(r.tokio.client_cpu, r.tokio.frames)),
+                common::cpu_pct(r.tokio.client_cpu, r.tokio.elapsed),
                 ratio,
             );
         }
+        println!();
+        println!(
+            "cpu ns/frame is client-thread CPU only; SQ_POLL kernel thread CPU is not included."
+        );
 
         println!();
         println!("=== inter-arrival latency (delivery jitter, aggregate over N conns) ===");
@@ -242,6 +251,7 @@ mod linux_impl {
 
         let mut arrivals: Vec<Instant> = Vec::with_capacity(stop.cap_hint());
         let mut frame_count = 0_u64;
+        let cpu_timer = common::ThreadCpuTimer::start();
         let bench_start = Instant::now();
 
         // 注意：stop 在 pump 之间检测；pump 一轮可能 deliver 多帧，会略 overshoot
@@ -256,6 +266,7 @@ mod linux_impl {
             .expect("pump");
         }
         let elapsed = bench_start.elapsed();
+        let client_cpu = cpu_timer.elapsed();
         eprintln!(
             "[talaris N={n_conns}] {} frames in {:.3}s ({:.0} f/s)",
             frame_count,
@@ -282,6 +293,7 @@ mod linux_impl {
         Outcome {
             frames: frame_count,
             elapsed,
+            client_cpu,
             inter_arrival,
         }
     }
@@ -314,6 +326,7 @@ mod linux_impl {
 
             // 起 N 个 task，每个 task 拿自己的 TcpStream + recv loop。N 个 task
             // 全跑在这条 current_thread runtime（=本 OS 线程）上。
+            let cpu_timer = common::ThreadCpuTimer::start();
             let bench_start = Instant::now();
             let mut handles = Vec::with_capacity(n_conns as usize);
             for _ in 0..n_conns {
@@ -347,6 +360,7 @@ mod linux_impl {
                 total_count += cnt;
             }
             let elapsed = bench_start.elapsed();
+            let client_cpu = cpu_timer.elapsed();
             eprintln!(
                 "[tokio N={n_conns}] {} frames in {:.3}s ({:.0} f/s)",
                 total_count,
@@ -361,21 +375,9 @@ mod linux_impl {
             Outcome {
                 frames: total_count,
                 elapsed,
+                client_cpu,
                 inter_arrival,
             }
         })
-    }
-
-    fn fmt_int(n: u64) -> String {
-        let s = n.to_string();
-        let bytes = s.as_bytes();
-        let mut out = String::with_capacity(s.len() + s.len() / 3);
-        for (i, &b) in bytes.iter().enumerate() {
-            if i > 0 && (bytes.len() - i).is_multiple_of(3) {
-                out.push(',');
-            }
-            out.push(b as char);
-        }
-        out
     }
 }
