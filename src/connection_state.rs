@@ -70,10 +70,13 @@ impl ConnectionState {
         socket.set_nodelay(true)?;
 
         let tls = if cfg.use_tls {
-            Some(match cfg.tls_config.clone() {
-                Some(config) => TlsAdapter::new_client_with_config(&cfg.host, config)?,
-                None => TlsAdapter::new_client(&cfg.host)?,
-            })
+            Some(
+                match cfg.tls_config.clone() {
+                    Some(config) => TlsAdapter::new_client_with_config(&cfg.host, config)?,
+                    None => TlsAdapter::new_client(&cfg.host)?,
+                }
+                .with_record_staging(cfg.tls_record_staging),
+            )
         } else {
             None
         };
@@ -111,8 +114,16 @@ impl ConnectionState {
     }
 
     #[inline]
-    pub(crate) const fn ingress_stats(&self) -> IngressStats {
-        self.ingress_stats
+    pub(crate) fn ingress_stats(&self) -> IngressStats {
+        let mut stats = self.ingress_stats;
+        if let Some(tls) = self.tls.as_ref().and_then(TlsAdapter::record_staging_stats) {
+            stats.tls_records = tls.records;
+            stats.tls_direct_records = tls.direct_records;
+            stats.tls_staged_records = tls.staged_records;
+            stats.tls_staged_bytes = tls.copied_bytes;
+            stats.tls_max_staged_bytes = tls.max_pending_bytes;
+        }
+        stats
     }
 
     pub(crate) fn assert_open(&self) -> Result<(), ConnectionError> {

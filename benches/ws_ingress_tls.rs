@@ -75,6 +75,7 @@ mod linux_impl {
         let buf_size: u32 = common::arg_or("--buf-size", 8192);
         let buf_entries: u16 = common::arg_or("--buf-entries", 256);
         let ingress_stats: bool = common::arg_or("--ingress-stats", false);
+        let tls_record_staging: bool = common::arg_or("--tls-record-staging", false);
 
         eprintln!("=========================================================");
         eprintln!(" ws_ingress_tls - loopback WSS TLS ingress");
@@ -93,6 +94,7 @@ mod linux_impl {
             (u32::from(buf_entries) * buf_size) / 1024
         );
         eprintln!(" ingress_stats: {ingress_stats}");
+        eprintln!(" tls_record_staging: {tls_record_staging}");
         eprintln!();
 
         let frames_per_chunk = common::frames_per_chunk(payload);
@@ -120,6 +122,7 @@ mod linux_impl {
                 buf_size,
                 buf_entries,
                 ingress_stats,
+                tls_record_staging,
                 sample_every,
                 None,
             )
@@ -138,6 +141,7 @@ mod linux_impl {
                 buf_size,
                 buf_entries,
                 ingress_stats,
+                tls_record_staging,
                 sample_every,
                 Some(spin_iters),
             )
@@ -260,6 +264,7 @@ mod linux_impl {
         buf_size: u32,
         buf_entries: u16,
         ingress_stats: bool,
+        tls_record_staging: bool,
         sample_every: u64,
         spin_iters: Option<usize>,
     ) -> Outcome {
@@ -273,7 +278,8 @@ mod linux_impl {
         let cfg = ConnectionConfig::new("localhost", addr.port(), "/")
             .with_tls_config(common::local_tls_client_config())
             .with_buf_ring(buf_size, buf_entries)
-            .with_ingress_stats(ingress_stats);
+            .with_ingress_stats(ingress_stats)
+            .with_tls_record_staging(tls_record_staging);
         let cfg = if sq_poll_idle_ms == 0 {
             cfg
         } else {
@@ -548,6 +554,16 @@ mod linux_impl {
             fmt_int(stats.recv_data_cqes),
             stats.recv_ring_exhaustions,
         );
+        if stats.tls_records > 0 {
+            let copied_pct = stats.tls_staged_bytes as f64 / stats.recv_bytes.max(1) as f64 * 100.0;
+            println!(
+                "{label:<22} | records={:>10} | direct={:>10} | staged={:>10} | copied={copied_pct:>5.1}% | max-stage={}B",
+                fmt_int(stats.tls_records),
+                fmt_int(stats.tls_direct_records),
+                fmt_int(stats.tls_staged_records),
+                stats.tls_max_staged_bytes,
+            );
+        }
     }
 
     fn fmt_int(n: u64) -> String {

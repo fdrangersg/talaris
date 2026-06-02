@@ -95,6 +95,16 @@ pub struct IngressStats {
     pub recv_bytes: u64,
     /// Multishot recv terminations caused by provided-buffer ring exhaustion.
     pub recv_ring_exhaustions: u64,
+    /// Complete TLS records handed to rustls by the opt-in record stager.
+    pub tls_records: u64,
+    /// Records already complete in one CQE slice and passed through without staging copy.
+    pub tls_direct_records: u64,
+    /// Records that crossed CQE boundaries and required bounded staging.
+    pub tls_staged_records: u64,
+    /// Ciphertext bytes copied into the bounded staging buffer.
+    pub tls_staged_bytes: u64,
+    /// High-water mark of the one-record staging buffer.
+    pub tls_max_staged_bytes: u64,
 }
 
 /// 构造单条 conn 的参数。`proactor` 是创建 [`Pool`](crate::Pool) 时的便利默认值；
@@ -127,6 +137,8 @@ pub struct ConnectionConfig {
     pub buf_ring_entries: u16,
     /// 收集 [`IngressStats`]。默认关闭，避免在生产 hot path 上无条件更新计数器。
     pub track_ingress_stats: bool,
+    /// 按 TLS record wire length 聚合 ingress 密文。默认关闭；这是调优实验开关。
+    pub tls_record_staging: bool,
 }
 
 impl ConnectionConfig {
@@ -144,6 +156,7 @@ impl ConnectionConfig {
             buf_ring_slot_size: DEFAULT_BUF_RING_SLOT_SIZE,
             buf_ring_entries: DEFAULT_BUF_RING_ENTRIES,
             track_ingress_stats: false,
+            tls_record_staging: false,
         }
     }
 
@@ -201,6 +214,14 @@ impl ConnectionConfig {
     #[must_use]
     pub const fn with_ingress_stats(mut self, on: bool) -> Self {
         self.track_ingress_stats = on;
+        self
+    }
+
+    /// 启用或关闭有界 TLS record-aware ingress staging。最多缓存一条未完成 record；
+    /// 已在单个 CQE 内完整到达的 record 直接借用原 slice。
+    #[must_use]
+    pub const fn with_tls_record_staging(mut self, on: bool) -> Self {
+        self.tls_record_staging = on;
         self
     }
 }

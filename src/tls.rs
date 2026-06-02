@@ -23,6 +23,13 @@ use thiserror::Error;
 
 /// 协商 ALPN 时 client 唯一接受的协议。
 const REQUIRED_ALPN: &[u8] = b"http/1.1";
+/// TLSPlaintext / TLSCiphertext header: content type + legacy version + payload length.
+const TLS_RECORD_HEADER_SIZE: usize = 5;
+/// Match rustls' inbound allowance: 16 KiB plaintext plus 2 KiB ciphertext overhead.
+/// rustls rejects payload lengths greater than or equal to this value.
+const TLS_RECORD_MAX_PAYLOAD_EXCLUSIVE: usize = 16_384 + 2048;
+/// One bounded staging allocation per opted-in connection.
+const TLS_RECORD_MAX_WIRE_SIZE: usize = TLS_RECORD_HEADER_SIZE + TLS_RECORD_MAX_PAYLOAD_EXCLUSIVE;
 
 #[derive(Debug, Error)]
 pub enum TlsError {
@@ -36,6 +43,103 @@ pub enum TlsError {
     /// 提前关连接比让用户 debug 一堆"莫名其妙的 WS 协议错误"更友好。
     #[error("server negotiated unexpected ALPN: {0:?}")]
     BadAlpn(Vec<u8>),
+    #[error("invalid TLS record header: {0}")]
+    InvalidRecordHeader(&'static str),
+}
+
+/// Diagnostics for the opt-in bounded TLS-record staging experiment.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) struct TlsRecordStagingStats {
+    pub(crate) records: u64,
+    pub(crate) direct_records: u64,
+    pub(crate) staged_records: u64,
+    pub(crate) copied_bytes: u64,
+    pub(crate) max_pending_bytes: u64,
+}
+
+/// Buffers at most one incomplete TLS record. Complete records already present in the
+/// caller's CQE slice bypass `pending` entirely.
+#[derive(Debug)]
+struct TlsRecordStager {
+    pending: Vec<u8>,
+    target_len: Option<usize>,
+    stats: TlsRecordStagingStats,
+}
+
+impl TlsRecordStager {
+    fn new() -> Self {
+        Self {
+            pending: Vec::with_capacity(TLS_RECORD_MAX_WIRE_SIZE),
+            target_len: None,
+            stats: TlsRecordStagingStats::default(),
+        }
+    }
+
+    fn ingest<F>(&mut self, mut src: &[u8], mut on_record: F) -> Result<(), TlsError>
+    where
+        F: FnMut(&[u8]) -> Result<(), TlsError>,
+    {
+        while !src.is_empty() {
+            if self.pending.is_empty() && src.len() >= TLS_RECORD_HEADER_SIZE {
+                let record_len = tls_record_wire_len(src)?;
+                if src.len() >= record_len {
+                    self.stats.records = self.stats.records.saturating_add(1);
+                    self.stats.direct_records = self.stats.direct_records.saturating_add(1);
+                    on_record(&src[..record_len])?;
+                    src = &src[record_len..];
+                    continue;
+                }
+                self.target_len = Some(record_len);
+            }
+
+            let target_len = self.target_len.unwrap_or(TLS_RECORD_HEADER_SIZE);
+            let needed = target_len.saturating_sub(self.pending.len());
+            let copied = needed.min(src.len());
+            self.pending.extend_from_slice(&src[..copied]);
+            self.stats.copied_bytes = self.stats.copied_bytes.saturating_add(copied as u64);
+            self.stats.max_pending_bytes =
+                self.stats.max_pending_bytes.max(self.pending.len() as u64);
+            src = &src[copied..];
+
+            if self.pending.len() < TLS_RECORD_HEADER_SIZE {
+                continue;
+            }
+            if self.target_len.is_none() {
+                self.target_len = Some(tls_record_wire_len(&self.pending)?);
+            }
+            let Some(target_len) = self.target_len else {
+                unreachable!("target set after complete header");
+            };
+            if self.pending.len() == target_len {
+                self.stats.records = self.stats.records.saturating_add(1);
+                self.stats.staged_records = self.stats.staged_records.saturating_add(1);
+                on_record(&self.pending)?;
+                self.pending.clear();
+                self.target_len = None;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn tls_record_wire_len(header: &[u8]) -> Result<usize, TlsError> {
+    debug_assert!(header.len() >= TLS_RECORD_HEADER_SIZE);
+    let typ = header[0];
+    if !matches!(typ, 0x14..=0x18) {
+        return Err(TlsError::InvalidRecordHeader("unknown content type"));
+    }
+    let payload_len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+    if typ != 0x17 && payload_len == 0 {
+        return Err(TlsError::InvalidRecordHeader(
+            "empty non-application-data payload",
+        ));
+    }
+    if payload_len >= TLS_RECORD_MAX_PAYLOAD_EXCLUSIVE {
+        return Err(TlsError::InvalidRecordHeader(
+            "payload exceeds rustls limit",
+        ));
+    }
+    Ok(TLS_RECORD_HEADER_SIZE + payload_len)
 }
 
 /// rustls client 包装
@@ -45,12 +149,15 @@ pub struct TlsAdapter {
     /// rustls 0.23 不在 `ClientConnection` 上直接暴露这个 flag —— 它只在
     /// `process_new_packets` 返回的 `IoState` 上。我们 cache 一下。
     peer_closed_notify: bool,
+    /// `Some` only for the explicit record-aware staging experiment.
+    record_stager: Option<TlsRecordStager>,
 }
 
 impl std::fmt::Debug for TlsAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsAdapter")
             .field("is_handshaking", &self.conn.is_handshaking())
+            .field("record_staging", &self.record_stager.is_some())
             .finish()
     }
 }
@@ -84,7 +191,21 @@ impl TlsAdapter {
         Ok(Self {
             conn,
             peer_closed_notify: false,
+            record_stager: None,
         })
+    }
+
+    /// Opt into bounded, record-aware TLS ingress staging. Complete records already present
+    /// in one recv CQE remain zero-copy; split records copy into one bounded 18,437-byte buffer.
+    #[must_use]
+    pub fn with_record_staging(mut self, on: bool) -> Self {
+        self.record_stager = on.then(TlsRecordStager::new);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn record_staging_stats(&self) -> Option<TlsRecordStagingStats> {
+        self.record_stager.as_ref().map(|stager| stager.stats)
     }
 
     /// 是否还在 TLS handshake 阶段
@@ -130,9 +251,28 @@ impl TlsAdapter {
     /// staging copy。
     pub fn ingest_ciphertext<F>(
         &mut self,
-        mut src: &[u8],
+        src: &[u8],
         dst_ciphertext: &mut Vec<u8>,
         mut on_plaintext: F,
+    ) -> Result<(), TlsError>
+    where
+        F: FnMut(&[u8]),
+    {
+        let Some(mut stager) = self.record_stager.take() else {
+            return self.ingest_ciphertext_direct(src, dst_ciphertext, &mut on_plaintext);
+        };
+        let result = stager.ingest(src, |record| {
+            self.ingest_ciphertext_direct(record, dst_ciphertext, &mut on_plaintext)
+        });
+        self.record_stager = Some(stager);
+        result
+    }
+
+    fn ingest_ciphertext_direct<F>(
+        &mut self,
+        mut src: &[u8],
+        dst_ciphertext: &mut Vec<u8>,
+        on_plaintext: &mut F,
     ) -> Result<(), TlsError>
     where
         F: FnMut(&[u8]),
@@ -145,7 +285,7 @@ impl TlsAdapter {
                 // （处于 mid-record / post-close / 已经有完整 record 待处理等
                 // 合法状态）。早期版本在此 return Err，会把合法状态当 fatal
                 // 错误抛出关连接。正确做法：return Ok 让 caller 下一轮再喂。
-                self.process_and_drain(dst_ciphertext, &mut on_plaintext)?;
+                self.process_and_drain(dst_ciphertext, on_plaintext)?;
                 if !self.conn.wants_read() {
                     return Ok(());
                 }
@@ -159,11 +299,11 @@ impl TlsAdapter {
             if n == 0 || src.len() == before {
                 break;
             }
-            self.process_and_drain(dst_ciphertext, &mut on_plaintext)?;
+            self.process_and_drain(dst_ciphertext, on_plaintext)?;
             processed = true;
         }
         if !processed {
-            self.process_and_drain(dst_ciphertext, &mut on_plaintext)?;
+            self.process_and_drain(dst_ciphertext, on_plaintext)?;
         }
         Ok(())
     }
@@ -234,6 +374,13 @@ impl TlsAdapter {
 mod tests {
     use super::*;
 
+    fn app_data_record(payload: &[u8]) -> Vec<u8> {
+        let len = u16::try_from(payload.len()).unwrap();
+        let mut record = vec![0x17, 0x03, 0x03, (len >> 8) as u8, len as u8];
+        record.extend_from_slice(payload);
+        record
+    }
+
     #[test]
     fn construct_with_valid_name() {
         // Doesn't connect — just builds the rustls state machine
@@ -252,5 +399,79 @@ mod tests {
         // empty string is not a valid ServerName
         let r = TlsAdapter::new_client("");
         assert!(matches!(r, Err(TlsError::InvalidServerName(_))));
+    }
+
+    #[test]
+    fn record_stager_passes_complete_records_directly() {
+        let first = app_data_record(b"abc");
+        let second = app_data_record(b"defgh");
+        let wire = [first, second].concat();
+        let mut got = Vec::new();
+        let mut stager = TlsRecordStager::new();
+
+        stager
+            .ingest(&wire, |record| {
+                got.push(record.to_vec());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            got,
+            vec![app_data_record(b"abc"), app_data_record(b"defgh")]
+        );
+        assert!(stager.pending.is_empty());
+        assert_eq!(stager.stats.records, 2);
+        assert_eq!(stager.stats.direct_records, 2);
+        assert_eq!(stager.stats.staged_records, 0);
+        assert_eq!(stager.stats.copied_bytes, 0);
+    }
+
+    #[test]
+    fn record_stager_bounds_split_record_and_then_resumes_direct_path() {
+        let first = app_data_record(b"abcdefgh");
+        let second = app_data_record(b"xyz");
+        let mut got = Vec::new();
+        let mut stager = TlsRecordStager::new();
+
+        stager
+            .ingest(&first[..3], |record| {
+                got.push(record.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        assert!(got.is_empty());
+        assert_eq!(stager.pending.len(), 3);
+
+        let tail_and_second = [&first[3..], &second].concat();
+        stager
+            .ingest(&tail_and_second, |record| {
+                got.push(record.to_vec());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(got, vec![first.clone(), second]);
+        assert!(stager.pending.is_empty());
+        assert_eq!(stager.stats.records, 2);
+        assert_eq!(stager.stats.direct_records, 1);
+        assert_eq!(stager.stats.staged_records, 1);
+        assert_eq!(stager.stats.copied_bytes, first.len() as u64);
+        assert_eq!(stager.stats.max_pending_bytes, first.len() as u64);
+    }
+
+    #[test]
+    fn record_stager_rejects_payload_at_rustls_limit() {
+        let len = u16::try_from(TLS_RECORD_MAX_PAYLOAD_EXCLUSIVE).unwrap();
+        let oversized = [0x17, 0x03, 0x03, (len >> 8) as u8, len as u8];
+        let mut stager = TlsRecordStager::new();
+
+        let err = stager.ingest(&oversized, |_| Ok(())).unwrap_err();
+
+        assert!(matches!(
+            err,
+            TlsError::InvalidRecordHeader("payload exceeds rustls limit")
+        ));
+        assert!(stager.pending.is_empty());
     }
 }
