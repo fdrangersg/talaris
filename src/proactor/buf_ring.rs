@@ -506,6 +506,93 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// Linux 6.10+ recv bundle：一条 CQE 可以消费 ring 中连续多块 buffer。
+    #[test]
+    fn multishot_recv_bundle_roundtrip() {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let mut proactor = Proactor::new(ProactorConfig::default()).unwrap();
+        if !proactor.supports_recvsend_bundle() {
+            return;
+        }
+        let payload: Vec<u8> = (0..16 * 1024).map(|n| (n % 251) as u8).collect();
+        let expected = payload.clone();
+        let server = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_nodelay(true).unwrap();
+            s.write_all(&payload).unwrap();
+        });
+
+        let sock_addr = SockAddr::from_std(local_addr);
+        let socket = TcpSocket::new(Domain::V4).unwrap();
+        socket.set_nodelay(true).unwrap();
+        let fd = socket.as_raw_fd();
+
+        // SAFETY: sock_addr 跟函数同寿命。
+        unsafe {
+            proactor
+                .submit_connect(
+                    fd,
+                    &sock_addr,
+                    UserData::new(OpKind::Connect, 0),
+                    SqeFlags::NONE,
+                )
+                .unwrap();
+        }
+        proactor.submit_and_wait(1).unwrap();
+        proactor.drain_completions(|c| assert!(c.to_result().is_ok()));
+
+        let mut ring = BufferRing::new(
+            &mut proactor,
+            /*bgid=*/ 1,
+            /*entries=*/ 512,
+            /*buf_size=*/ 64,
+        )
+        .expect("BufferRing");
+        // SAFETY: ring 在 proactor 之前 unregister；CQE 间 ring 持续存活。
+        unsafe {
+            proactor
+                .submit_recv_multishot_bundle(fd, ring.bgid(), UserData::new(OpKind::Recv, 0))
+                .unwrap();
+        }
+
+        let mut received = Vec::with_capacity(expected.len());
+        let mut layout = Vec::<(u16, usize)>::new();
+        let mut saw_bundle = false;
+        let mut ended = false;
+        for _ in 0..32 {
+            if ended {
+                break;
+            }
+            proactor.submit_and_wait(1).unwrap();
+            proactor.drain_completions(|c| {
+                assert_eq!(c.user_data.kind(), Some(OpKind::Recv));
+                let Some(bid) = c.buffer_id() else {
+                    assert!(!c.has_more());
+                    ended = true;
+                    return;
+                };
+                let n = c.to_result().unwrap();
+                ring.bundle_layout(bid, n, &mut layout).unwrap();
+                saw_bundle |= layout.len() > 1;
+                for &(bid, n) in &layout {
+                    received.extend_from_slice(&ring.buffer(bid)[..n]);
+                }
+                for &(bid, _) in &layout {
+                    ring.recycle(bid);
+                }
+            });
+        }
+
+        assert_eq!(received, expected);
+        assert!(
+            saw_bundle,
+            "kernel should return at least one multi-buffer CQE"
+        );
+        ring.unregister(&mut proactor).unwrap();
+        server.join().unwrap();
+    }
+
     #[test]
     fn invalid_entry_count_rejected() {
         let mut proactor = Proactor::new(ProactorConfig::default()).unwrap();
