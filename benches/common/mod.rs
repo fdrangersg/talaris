@@ -1026,6 +1026,270 @@ fn drain_tls_plaintext(
 }
 
 #[cfg(target_os = "linux")]
+pub struct TokioUnbufferedTls {
+    conn: rustls::client::UnbufferedClientConnection,
+    incoming: Vec<u8>,
+    incoming_head: usize,
+    outgoing: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+impl TokioUnbufferedTls {
+    fn new() -> Self {
+        let server_name = rustls::pki_types::ServerName::try_from("localhost")
+            .expect("localhost is valid server name")
+            .to_owned();
+        let conn =
+            rustls::client::UnbufferedClientConnection::new(local_tls_client_config(), server_name)
+                .expect("localhost unbuffered tls client");
+        Self {
+            conn,
+            incoming: Vec::with_capacity(256 * 1024),
+            incoming_head: 0,
+            outgoing: Vec::with_capacity(128 * 1024),
+        }
+    }
+
+    async fn handshake(&mut self, s: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+        loop {
+            match self.drive_available(s, None, |_| {}).await? {
+                TokioUnbufferedDrive::NeedRead => self.read_more(s).await?,
+                TokioUnbufferedDrive::WriteTraffic => return Ok(()),
+                TokioUnbufferedDrive::Delivered => {}
+                TokioUnbufferedDrive::Encrypted => unreachable!("handshake has no app plaintext"),
+            }
+        }
+    }
+
+    async fn write_plaintext(
+        &mut self,
+        s: &mut tokio::net::TcpStream,
+        plaintext: &[u8],
+    ) -> std::io::Result<()> {
+        loop {
+            match self.drive_available(s, Some(plaintext), |_| {}).await? {
+                TokioUnbufferedDrive::Encrypted => return Ok(()),
+                TokioUnbufferedDrive::NeedRead | TokioUnbufferedDrive::WriteTraffic => {
+                    self.read_more(s).await?;
+                }
+                TokioUnbufferedDrive::Delivered => {}
+            }
+        }
+    }
+
+    async fn read_plaintext(
+        &mut self,
+        s: &mut tokio::net::TcpStream,
+        mut on_plaintext: impl FnMut(&[u8]),
+    ) -> std::io::Result<()> {
+        loop {
+            match self.drive_available(s, None, &mut on_plaintext).await? {
+                TokioUnbufferedDrive::Delivered => return Ok(()),
+                TokioUnbufferedDrive::NeedRead | TokioUnbufferedDrive::WriteTraffic => {
+                    self.read_more(s).await?;
+                }
+                TokioUnbufferedDrive::Encrypted => unreachable!("read has no app plaintext"),
+            }
+        }
+    }
+
+    async fn drive_available(
+        &mut self,
+        s: &mut tokio::net::TcpStream,
+        mut plaintext_to_encrypt: Option<&[u8]>,
+        mut on_plaintext: impl FnMut(&[u8]),
+    ) -> std::io::Result<TokioUnbufferedDrive> {
+        use rustls::unbuffered::ConnectionState;
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut delivered = false;
+        loop {
+            let status = self
+                .conn
+                .process_tls_records(&mut self.incoming[self.incoming_head..]);
+            let mut discard = status.discard;
+            let next = match status.state.map_err(std::io::Error::other)? {
+                ConnectionState::ReadTraffic(mut traffic) => {
+                    while let Some(record) = traffic.next_record() {
+                        let record = record.map_err(std::io::Error::other)?;
+                        discard += record.discard;
+                        on_plaintext(record.payload);
+                        delivered = true;
+                    }
+                    None
+                }
+                ConnectionState::EncodeTlsData(mut data) => {
+                    const HANDSHAKE_SLACK: usize = 128 * 1024;
+                    let start = self.outgoing.len();
+                    self.outgoing.resize(start + HANDSHAKE_SLACK, 0);
+                    let n = data
+                        .encode(&mut self.outgoing[start..])
+                        .map_err(std::io::Error::other)?;
+                    self.outgoing.truncate(start + n);
+                    None
+                }
+                ConnectionState::TransmitTlsData(data) => {
+                    s.write_all(&self.outgoing).await?;
+                    self.outgoing.clear();
+                    data.done();
+                    None
+                }
+                ConnectionState::BlockedHandshake => Some(TokioUnbufferedDrive::NeedRead),
+                ConnectionState::WriteTraffic(mut traffic) => {
+                    if let Some(plaintext) = plaintext_to_encrypt.take() {
+                        let required = plaintext.len() + 4096;
+                        self.outgoing.resize(required, 0);
+                        let n = traffic
+                            .encrypt(plaintext, &mut self.outgoing)
+                            .map_err(std::io::Error::other)?;
+                        s.write_all(&self.outgoing[..n]).await?;
+                        self.outgoing.clear();
+                        Some(TokioUnbufferedDrive::Encrypted)
+                    } else {
+                        Some(TokioUnbufferedDrive::WriteTraffic)
+                    }
+                }
+                ConnectionState::PeerClosed | ConnectionState::Closed => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+                _ => {
+                    return Err(std::io::Error::other(
+                        "unexpected rustls unbuffered connection state",
+                    ));
+                }
+            };
+            self.incoming_head += discard;
+            if let Some(next) = next {
+                return Ok(match next {
+                    TokioUnbufferedDrive::Encrypted => TokioUnbufferedDrive::Encrypted,
+                    _ if delivered => TokioUnbufferedDrive::Delivered,
+                    _ => next,
+                });
+            }
+        }
+    }
+
+    async fn read_more(&mut self, s: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+        use tokio::io::AsyncReadExt as _;
+
+        if self.incoming_head == self.incoming.len() {
+            self.incoming.clear();
+            self.incoming_head = 0;
+        } else if self.incoming_head > 0 {
+            self.incoming.copy_within(self.incoming_head.., 0);
+            self.incoming
+                .truncate(self.incoming.len() - self.incoming_head);
+            self.incoming_head = 0;
+        }
+        let n = s.read_buf(&mut self.incoming).await?;
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+enum TokioUnbufferedDrive {
+    NeedRead,
+    WriteTraffic,
+    Delivered,
+    Encrypted,
+}
+
+#[cfg(target_os = "linux")]
+pub async fn tokio_unbuffered_tls_ws_upgrade_client(
+    s: &mut tokio::net::TcpStream,
+    host: &str,
+    path: &str,
+) -> std::io::Result<(TokioUnbufferedTls, Vec<u8>)> {
+    let mut tls = TokioUnbufferedTls::new();
+    tls.handshake(s).await?;
+
+    let key = talaris::ws::handshake::generate_key()
+        .map_err(|e| std::io::Error::other(format!("generate_key: {e}")))?;
+    let req = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: {key}\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n"
+    );
+    tls.write_plaintext(s, req.as_bytes()).await?;
+
+    let mut plaintext = Vec::<u8>::new();
+    loop {
+        tls.read_plaintext(s, |chunk| plaintext.extend_from_slice(chunk))
+            .await?;
+        if let Some(idx) = plaintext.windows(4).position(|w| w == b"\r\n\r\n") {
+            let header_end = idx + 4;
+            return Ok((tls, plaintext[header_end..].to_vec()));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub async fn tokio_recv_unbuffered_tls_ws_binary_frames(
+    s: &mut tokio::net::TcpStream,
+    tls: &mut TokioUnbufferedTls,
+    initial_leftover: Vec<u8>,
+    stop: StopMode,
+    expected_payload: usize,
+    sample_every: u64,
+    bench_start: Instant,
+) -> (Vec<Instant>, u64) {
+    use talaris::ws::frame::parse_header;
+
+    let mut arrivals = sampled_arrivals(stop, sample_every);
+    let mut frame_count = 0_u64;
+    let mut leftover = initial_leftover;
+    leftover.reserve(256 * 1024);
+
+    'outer: loop {
+        let mut pos = 0_usize;
+        while pos < leftover.len() {
+            match parse_header(&leftover[pos..]) {
+                Ok(Some((hdr, consumed))) => {
+                    let total = consumed + hdr.payload_len as usize;
+                    if leftover.len() - pos < total {
+                        break;
+                    }
+                    debug_assert_eq!(hdr.payload_len as usize, expected_payload);
+                    frame_count += 1;
+                    record_sampled_arrival(&mut arrivals, frame_count, sample_every);
+                    pos += total;
+                    if !stop.keep_going(frame_count, bench_start) {
+                        leftover.drain(..pos);
+                        break 'outer;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("[tokio-unbuffered] parse_header err after {frame_count}: {e}");
+                    leftover.drain(..pos);
+                    break 'outer;
+                }
+            }
+        }
+        leftover.drain(..pos);
+
+        if !stop.keep_going(frame_count, bench_start) {
+            break;
+        }
+        if let Err(e) = tls
+            .read_plaintext(s, |chunk| leftover.extend_from_slice(chunk))
+            .await
+        {
+            eprintln!("[tokio-unbuffered] read error after {frame_count}: {e}");
+            break;
+        }
+    }
+
+    (arrivals, frame_count)
+}
+
+#[cfg(target_os = "linux")]
 async fn tokio_ktls_ws_upgrade_after_install(
     s: &mut tokio::net::TcpStream,
     host: &str,
