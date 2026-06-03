@@ -169,6 +169,7 @@ mod linux_impl {
         inter_arrival: hdrhistogram::Histogram<u64>,
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_raw(
         addr: SocketAddr,
         stop: StopMode,

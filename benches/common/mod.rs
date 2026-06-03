@@ -1333,6 +1333,7 @@ pub async fn tokio_tls_ws_client_connect(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 pub async fn tokio_recv_tls_ws_binary_frames(
     s: &mut tokio::net::TcpStream,
     tls: &mut rustls::ClientConnection,
@@ -1392,6 +1393,7 @@ pub async fn tokio_recv_tls_ws_binary_frames(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 pub async fn tokio_recv_tls_ws_data_events(
     s: &mut tokio::net::TcpStream,
     tls: &mut rustls::ClientConnection,
@@ -1723,6 +1725,7 @@ pub async fn tokio_unbuffered_tls_ws_upgrade_client(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 pub async fn tokio_recv_unbuffered_tls_ws_binary_frames(
     s: &mut tokio::net::TcpStream,
     tls: &mut TokioUnbufferedTls,
