@@ -73,7 +73,8 @@ mod linux_impl {
     use talaris::connection::{ConnectionConfig, State};
     use talaris::ws::DataEvent as WsDataEvent;
     use tokio_tungstenite::tungstenite::protocol::Message;
-    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
     use super::common;
     use super::common::PinGuard;
@@ -101,6 +102,7 @@ mod linux_impl {
         spin_iters: usize,
         talaris_pump: TalarisPumpMode,
         tune: common::TalarisTuneConfig,
+        staging: common::BenchStagingConfig,
     }
 
     #[derive(Debug)]
@@ -318,6 +320,7 @@ mod linux_impl {
             let talaris_pump =
                 TalarisPumpMode::from_arg(&common::arg_or("--talaris-pump", "spin".to_owned()));
             let tune = common::TalarisTuneConfig::from_args(8192, 256);
+            let staging = common::BenchStagingConfig::from_args();
             let host: String = common::arg_or("--host", DEFAULT_HOST.to_owned());
             let symbols_csv: String = common::arg_or("--symbols", DEFAULT_SYMBOLS.to_owned());
             let depth_speed: String = common::arg_or("--depth-speed", "100ms".to_owned());
@@ -344,6 +347,7 @@ mod linux_impl {
                 spin_iters,
                 talaris_pump,
                 tune,
+                staging,
             }
         }
 
@@ -561,8 +565,18 @@ mod linux_impl {
     ) -> BenchResult<Outcome> {
         let public_url = cfg.public_url();
         let market_url = cfg.market_url();
-        let (mut public_ws, _) = connect_async(public_url.as_str()).await?;
-        let (mut market_ws, _) = connect_async(market_url.as_str()).await?;
+        let (mut public_ws, _) = connect_async_with_config(
+            public_url.as_str(),
+            Some(tungstenite_config(cfg.staging)),
+            false,
+        )
+        .await?;
+        let (mut market_ws, _) = connect_async_with_config(
+            market_url.as_str(),
+            Some(tungstenite_config(cfg.staging)),
+            false,
+        )
+        .await?;
         eprintln!("[tokio-tungstenite] connected public+market WSS");
 
         let warmup = run_tokio_for(
@@ -611,6 +625,13 @@ mod linux_impl {
             }
         }
         Ok(stats)
+    }
+
+    fn tungstenite_config(staging: common::BenchStagingConfig) -> WebSocketConfig {
+        WebSocketConfig::default()
+            .read_buffer_size(staging.tungstenite_read_buffer_capacity)
+            .write_buffer_size(staging.tungstenite_write_buffer_capacity)
+            .max_write_buffer_size(staging.tungstenite_max_write_buffer_capacity)
     }
 
     fn handle_tokio_message(
@@ -764,6 +785,7 @@ mod linux_impl {
         eprintln!(" talaris pump: {}", cfg.talaris_pump.label());
         eprintln!(" spin_iters  : {}", cfg.spin_iters);
         cfg.tune.print_stderr(" ");
+        cfg.staging.print_stderr(" ");
         eprintln!();
     }
 

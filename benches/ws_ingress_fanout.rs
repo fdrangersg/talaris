@@ -107,6 +107,7 @@ mod linux_impl {
         let tokio_cpu: usize = common::arg_or("--tokio-cpu", 2);
         let sample_every: u64 = common::arg_or("--sample-every", 0);
         let tune = common::TalarisTuneConfig::from_args(4096, 256);
+        let staging = common::BenchStagingConfig::from_args();
         let n_list: String = common::arg_or("--n-list", "1,4,16,64".to_string());
         let ns: Vec<u32> = n_list
             .split(',')
@@ -124,9 +125,11 @@ mod linux_impl {
         eprintln!(" tokio     : worker→CPU {tokio_cpu}");
         eprintln!(" samples   : every {sample_every} frame(s), 0 disables diagnostic jitter hist");
         tune.print_stderr(" ");
+        staging.print_stderr(" ");
         eprintln!();
 
-        let frames_per_chunk = common::frames_per_chunk(payload);
+        let frames_per_chunk =
+            common::frames_per_chunk_for_bytes(payload, staging.server_chunk_bytes);
         let chunk_buf = Arc::new(common::pre_encode_ws_binary_chunk(
             payload,
             frames_per_chunk,
@@ -160,7 +163,7 @@ mod linux_impl {
 
             eprintln!("[N={n}] variant 2/2: tokio");
             let tokio = with_fresh_server(server_cpu, n, chunk_buf.clone(), |addr| {
-                run_tokio(addr, n, stop, payload, tokio_cpu, sample_every)
+                run_tokio(addr, n, stop, payload, tokio_cpu, sample_every, staging)
             });
 
             rows.push(Row { n, talaris, tokio });
@@ -326,6 +329,7 @@ mod linux_impl {
         payload: usize,
         user_cpu: usize,
         sample_every: u64,
+        staging: common::BenchStagingConfig,
     ) -> Outcome {
         let _guard = PinGuard::pin("tokio", user_cpu);
 
@@ -367,6 +371,7 @@ mod linux_impl {
                         payload,
                         sample_every,
                         bench_start,
+                        staging,
                     )
                     .await;
                     let _ = s.shutdown().await;

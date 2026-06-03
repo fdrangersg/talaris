@@ -73,10 +73,12 @@ mod linux_impl {
         let tokio_cpu: usize = common::arg_or("--tokio-cpu", 2);
         let sample_every: u64 = common::arg_or("--sample-every", 0);
         let tune = common::TalarisTuneConfig::from_args(8192, 256);
+        let staging = common::BenchStagingConfig::from_args();
 
         let json_payload = common::json_quote_payload(target_payload);
         let payload = json_payload.len();
-        let frames_per_chunk = common::frames_per_chunk(payload);
+        let frames_per_chunk =
+            common::frames_per_chunk_for_bytes(payload, staging.server_chunk_bytes);
         let chunk_buf = Arc::new(common::pre_encode_ws_text_chunk(
             &json_payload,
             frames_per_chunk,
@@ -94,6 +96,7 @@ mod linux_impl {
         eprintln!(" tokio     : worker->CPU {tokio_cpu}");
         eprintln!(" samples   : every {sample_every} frame(s), 0 disables diagnostic jitter hist");
         tune.print_stderr(" ");
+        staging.print_stderr(" ");
         eprintln!(
             "[bench] pre-encoded text chunk: {} frames x {}B = {} KiB total",
             frames_per_chunk,
@@ -136,13 +139,13 @@ mod linux_impl {
 
         eprintln!("--- variant 3/4: tokio Text, no JSON decode ---");
         let tokio_text = with_fresh_server(server_cpu, chunk_buf.clone(), |addr| {
-            run_tokio(addr, stop, payload, tokio_cpu, sample_every, false)
+            run_tokio(addr, stop, payload, tokio_cpu, sample_every, false, staging)
         });
         eprintln!();
 
         eprintln!("--- variant 4/4: tokio Text + serde_json::Value decode ---");
         let tokio_json = with_fresh_server(server_cpu, chunk_buf, |addr| {
-            run_tokio(addr, stop, payload, tokio_cpu, sample_every, true)
+            run_tokio(addr, stop, payload, tokio_cpu, sample_every, true, staging)
         });
 
         println!();
@@ -298,6 +301,7 @@ mod linux_impl {
         user_cpu: usize,
         sample_every: u64,
         decode_json: bool,
+        staging: common::BenchStagingConfig,
     ) -> Outcome {
         let label = if decode_json {
             "tokio-json"
@@ -330,6 +334,7 @@ mod linux_impl {
                 sample_every,
                 bench_start,
                 decode_json,
+                staging,
             )
             .await;
             let elapsed = bench_start.elapsed();
@@ -361,6 +366,7 @@ mod linux_impl {
         sample_every: u64,
         bench_start: Instant,
         decode_json: bool,
+        staging: common::BenchStagingConfig,
     ) -> (Vec<Instant>, u64, u64) {
         use talaris::ws::OpCode;
         use talaris::ws::frame::parse_header;
@@ -369,9 +375,9 @@ mod linux_impl {
         let mut arrivals = common::sampled_arrivals(stop, sample_every);
         let mut frame_count = 0_u64;
         let mut checksum = 0_u64;
-        let mut recv_buf = vec![0_u8; 256 * 1024];
+        let mut recv_buf = vec![0_u8; staging.tokio_read_buffer_capacity];
         let mut leftover = initial_leftover;
-        leftover.reserve(64 * 1024);
+        leftover.reserve(staging.leftover_capacity);
 
         'outer: loop {
             let mut pos = 0_usize;

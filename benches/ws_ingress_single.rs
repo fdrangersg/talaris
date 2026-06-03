@@ -116,6 +116,7 @@ mod linux_impl {
         let spin_iters: usize = common::arg_or("--spin-iters", 256);
         let sample_every: u64 = common::arg_or("--sample-every", 0);
         let tune = common::TalarisTuneConfig::from_args(4096, 256);
+        let staging = common::BenchStagingConfig::from_args();
 
         eprintln!("=========================================================");
         eprintln!(" ws_ingress_single — 1 conn server push → client drain");
@@ -128,12 +129,14 @@ mod linux_impl {
         eprintln!(" spin_iters: {spin_iters}");
         eprintln!(" samples   : every {sample_every} frame(s), 0 disables diagnostic jitter hist");
         tune.print_stderr(" ");
+        staging.print_stderr(" ");
         eprintln!(" execution : 串行，inline on main thread，每 variant 之间 unpin");
         eprintln!();
 
         // 预编码 chunk_buf：server 写循环就一遍遍 write_all 这块。Arc 让两次
         // variant 共享同一个内容（fresh server thread 各拿一份 clone）。
-        let frames_per_chunk = common::frames_per_chunk(payload);
+        let frames_per_chunk =
+            common::frames_per_chunk_for_bytes(payload, staging.server_chunk_bytes);
         let chunk_buf = Arc::new(common::pre_encode_ws_binary_chunk(
             payload,
             frames_per_chunk,
@@ -195,7 +198,7 @@ mod linux_impl {
         // ── variant 4/4: tokio ───────────────────────────────────────────
         eprintln!("─── variant 4/4: tokio (epoll + current_thread + pin) ───");
         let tokio = with_fresh_stream_server(server_cpu, chunk_buf, |addr| {
-            run_tokio(addr, stop, payload, tokio_cpu, sample_every)
+            run_tokio(addr, stop, payload, tokio_cpu, sample_every, staging)
         });
 
         println!();
@@ -472,6 +475,7 @@ mod linux_impl {
         payload: usize,
         user_cpu: usize,
         sample_every: u64,
+        staging: common::BenchStagingConfig,
     ) -> Outcome {
         let _guard = PinGuard::pin("tokio", user_cpu);
         eprintln!("[tokio] worker→CPU {user_cpu}");
@@ -499,6 +503,7 @@ mod linux_impl {
                 payload,
                 sample_every,
                 bench_start,
+                staging,
             )
             .await;
             let elapsed = bench_start.elapsed();
@@ -529,15 +534,16 @@ mod linux_impl {
         expected_payload: usize,
         sample_every: u64,
         bench_start: Instant,
+        staging: common::BenchStagingConfig,
     ) -> (Vec<Instant>, u64) {
         use talaris::ws::frame::parse_header;
         use tokio::io::AsyncReadExt;
 
         let mut arrivals = common::sampled_arrivals(stop, sample_every);
         let mut frame_count = 0_u64;
-        let mut recv_buf = vec![0_u8; 256 * 1024];
+        let mut recv_buf = vec![0_u8; staging.tokio_read_buffer_capacity];
         let mut leftover = initial_leftover;
-        leftover.reserve(64 * 1024);
+        leftover.reserve(staging.leftover_capacity);
 
         'outer: loop {
             let mut pos = 0_usize;

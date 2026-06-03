@@ -74,6 +74,7 @@ mod linux_impl {
         let spin_iters: usize = common::arg_or("--spin-iters", 256);
         let sample_every: u64 = common::arg_or("--sample-every", 0);
         let tune = common::TalarisTuneConfig::from_args(8192, 256);
+        let staging = common::BenchStagingConfig::from_args();
         let ingress_stats: bool = common::arg_or("--ingress-stats", false);
 
         eprintln!("=========================================================");
@@ -89,10 +90,12 @@ mod linux_impl {
         eprintln!(" spin_iters: {spin_iters}");
         eprintln!(" samples   : every {sample_every} frame(s), 0 disables diagnostic jitter hist");
         tune.print_stderr(" ");
+        staging.print_stderr(" ");
         eprintln!(" ingress_stats: {ingress_stats}");
         eprintln!();
 
-        let frames_per_chunk = common::frames_per_chunk(payload);
+        let frames_per_chunk =
+            common::frames_per_chunk_for_bytes(payload, staging.server_chunk_bytes);
         let chunk_buf = Arc::new(common::pre_encode_ws_binary_chunk(
             payload,
             frames_per_chunk,
@@ -141,13 +144,13 @@ mod linux_impl {
 
         eprintln!("--- variant 3/6: tokio + rustls + WsClient ---");
         let tokio_ws = with_fresh_tls_server(server_cpu, chunk_buf.clone(), |addr| {
-            run_tokio_ws_client(addr, stop, payload, tokio_cpu, sample_every)
+            run_tokio_ws_client(addr, stop, payload, tokio_cpu, sample_every, tune, staging)
         });
         eprintln!();
 
         eprintln!("--- variant 4/6: tokio + rustls + bare parse_header lower bound ---");
         let tokio_bare = with_fresh_tls_server(server_cpu, chunk_buf.clone(), |addr| {
-            run_tokio_bare(addr, stop, payload, tokio_cpu, sample_every)
+            run_tokio_bare(addr, stop, payload, tokio_cpu, sample_every, staging)
         });
         eprintln!();
 
@@ -155,13 +158,13 @@ mod linux_impl {
             "--- variant 5/6: tokio + rustls unbuffered + bare parse_header ceiling probe ---"
         );
         let tokio_unbuffered = with_fresh_tls_server(server_cpu, chunk_buf.clone(), |addr| {
-            run_tokio_unbuffered_bare(addr, stop, payload, tokio_cpu, sample_every)
+            run_tokio_unbuffered_bare(addr, stop, payload, tokio_cpu, sample_every, staging)
         });
         eprintln!();
 
         eprintln!("--- variant 6/6: tokio + kTLS + bare parse_header ceiling probe ---");
         let tokio_ktls = with_fresh_tls_server(server_cpu, chunk_buf, |addr| {
-            run_tokio_ktls_bare(addr, stop, payload, tokio_cpu, sample_every)
+            run_tokio_ktls_bare(addr, stop, payload, tokio_cpu, sample_every, staging)
         });
 
         println!();
@@ -337,6 +340,8 @@ mod linux_impl {
         payload: usize,
         user_cpu: usize,
         sample_every: u64,
+        tune: common::TalarisTuneConfig,
+        staging: common::BenchStagingConfig,
     ) -> Outcome {
         let _guard = PinGuard::pin("tokio-tls-ws", user_cpu);
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -350,9 +355,16 @@ mod linux_impl {
             let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
             stream.set_nodelay(true).expect("nodelay");
             let mut tls = common::local_tls_client_connection();
-            let ws = common::tokio_tls_ws_client_connect(&mut stream, &mut tls, "localhost", "/")
-                .await
-                .expect("TLS + WsClient upgrade");
+            let ws = common::tokio_tls_ws_client_connect(
+                &mut stream,
+                &mut tls,
+                "localhost",
+                "/",
+                tune.ws_config("localhost", "/"),
+                staging,
+            )
+            .await
+            .expect("TLS + WsClient upgrade");
 
             let cpu_timer = common::ThreadCpuTimer::start();
             let bench_start = Instant::now();
@@ -364,6 +376,7 @@ mod linux_impl {
                 payload,
                 sample_every,
                 bench_start,
+                staging,
             )
             .await;
             let elapsed = bench_start.elapsed();
@@ -392,6 +405,7 @@ mod linux_impl {
         payload: usize,
         user_cpu: usize,
         sample_every: u64,
+        staging: common::BenchStagingConfig,
     ) -> Outcome {
         let _guard = PinGuard::pin("tokio-tls-bare", user_cpu);
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -405,10 +419,15 @@ mod linux_impl {
             let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
             stream.set_nodelay(true).expect("nodelay");
             let mut tls = common::local_tls_client_connection();
-            let leftover =
-                common::tokio_tls_ws_upgrade_client(&mut stream, &mut tls, "localhost", "/")
-                    .await
-                    .expect("TLS + WS upgrade");
+            let leftover = common::tokio_tls_ws_upgrade_client(
+                &mut stream,
+                &mut tls,
+                "localhost",
+                "/",
+                staging,
+            )
+            .await
+            .expect("TLS + WS upgrade");
 
             let cpu_timer = common::ThreadCpuTimer::start();
             let bench_start = Instant::now();
@@ -420,6 +439,7 @@ mod linux_impl {
                 payload,
                 sample_every,
                 bench_start,
+                staging,
             )
             .await;
             let elapsed = bench_start.elapsed();
@@ -448,6 +468,7 @@ mod linux_impl {
         payload: usize,
         user_cpu: usize,
         sample_every: u64,
+        staging: common::BenchStagingConfig,
     ) -> Outcome {
         let _guard = PinGuard::pin("tokio-ktls-bare", user_cpu);
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -461,9 +482,10 @@ mod linux_impl {
             let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
             stream.set_nodelay(true).expect("nodelay");
             let tls = common::local_ktls_client_connection();
-            let leftover = common::tokio_ktls_ws_upgrade_client(&mut stream, tls, "localhost", "/")
-                .await
-                .expect("TLS handshake + kTLS install + WS upgrade");
+            let leftover =
+                common::tokio_ktls_ws_upgrade_client(&mut stream, tls, "localhost", "/", staging)
+                    .await
+                    .expect("TLS handshake + kTLS install + WS upgrade");
 
             let cpu_timer = common::ThreadCpuTimer::start();
             let bench_start = Instant::now();
@@ -474,6 +496,7 @@ mod linux_impl {
                 payload,
                 sample_every,
                 bench_start,
+                staging,
             )
             .await;
             let elapsed = bench_start.elapsed();
@@ -502,6 +525,7 @@ mod linux_impl {
         payload: usize,
         user_cpu: usize,
         sample_every: u64,
+        staging: common::BenchStagingConfig,
     ) -> Outcome {
         let _guard = PinGuard::pin("tokio-tls-unbuffered-bare", user_cpu);
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -514,10 +538,14 @@ mod linux_impl {
 
             let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
             stream.set_nodelay(true).expect("nodelay");
-            let (mut tls, leftover) =
-                common::tokio_unbuffered_tls_ws_upgrade_client(&mut stream, "localhost", "/")
-                    .await
-                    .expect("unbuffered TLS + WS upgrade");
+            let (mut tls, leftover) = common::tokio_unbuffered_tls_ws_upgrade_client(
+                &mut stream,
+                "localhost",
+                "/",
+                staging,
+            )
+            .await
+            .expect("unbuffered TLS + WS upgrade");
 
             let cpu_timer = common::ThreadCpuTimer::start();
             let bench_start = Instant::now();
@@ -529,6 +557,7 @@ mod linux_impl {
                 payload,
                 sample_every,
                 bench_start,
+                staging,
             )
             .await;
             let elapsed = bench_start.elapsed();

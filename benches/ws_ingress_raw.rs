@@ -84,6 +84,7 @@ mod linux_impl {
         let sq_poll_cpu: u32 = common::arg_or("--sq-poll-cpu", 5);
         let buf_size: u32 = common::arg_or("--buf-size", 4096);
         let buf_entries: u16 = common::arg_or("--buf-entries", 256);
+        let staging = common::BenchStagingConfig::from_args();
 
         if !buf_entries.is_power_of_two() || buf_entries == 0 {
             eprintln!("[bench] --buf-entries must be a non-zero power of 2; got {buf_entries}");
@@ -105,9 +106,11 @@ mod linux_impl {
         );
         eprintln!(" server-cpu: {server_cpu}");
         eprintln!(" user      : CPU {user_cpu}, SQ_POLL→CPU {sq_poll_cpu}");
+        staging.print_stderr(" ");
         eprintln!();
 
-        let frames_per_chunk = common::frames_per_chunk(payload);
+        let frames_per_chunk =
+            common::frames_per_chunk_for_bytes(payload, staging.server_chunk_bytes);
         let chunk_buf = Arc::new(common::pre_encode_ws_binary_chunk(
             payload,
             frames_per_chunk,
@@ -130,6 +133,7 @@ mod linux_impl {
             sq_poll_cpu,
             buf_size,
             buf_entries,
+            staging,
         );
         server.join().expect("server panic");
 
@@ -173,6 +177,7 @@ mod linux_impl {
         sq_poll_cpu: u32,
         buf_size: u32,
         buf_entries: u16,
+        staging: common::BenchStagingConfig,
     ) -> Outcome {
         let _guard = PinGuard::pin("raw", user_cpu);
         eprintln!("[raw] user→CPU {user_cpu}, SQ_POLL kthread→CPU {sq_poll_cpu}");
@@ -283,8 +288,10 @@ mod linux_impl {
         let mut arrivals: Vec<Instant> = Vec::with_capacity(stop.cap_hint());
         let mut frame_count = 0_u64;
         let mut leftover = leftover_bytes;
-        leftover.reserve(64 * 1024);
+        leftover.reserve(staging.leftover_capacity);
         let mut multishot_armed = true;
+        let mut chunks: Vec<(u16, usize)> =
+            Vec::with_capacity(staging.raw_completion_batch_capacity);
 
         let bench_start = Instant::now();
 
@@ -337,7 +344,7 @@ mod linux_impl {
 
             // 把所有 ready CQE 一口气吃干净
             let mut rearm_needed = false;
-            let mut chunks: Vec<(u16, usize)> = Vec::with_capacity(32);
+            chunks.clear();
             proactor.drain_completions(|c| {
                 let Ok(res) = c.to_result() else {
                     // -ENOBUFS：multishot 在 buffer ring 空时退出，has_more=false，

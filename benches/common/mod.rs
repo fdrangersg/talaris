@@ -30,6 +30,172 @@ use talaris::connection::ConnectionConfig;
 use talaris::proactor::ProactorConfig;
 use talaris::{PoolConfig, ws};
 
+pub const DEFAULT_SERVER_CHUNK_BYTES: usize = 64 * 1024;
+pub const DEFAULT_TOKIO_READ_BUFFER_CAPACITY: usize = 256 * 1024;
+pub const DEFAULT_LEFTOVER_CAPACITY: usize = 64 * 1024;
+pub const DEFAULT_TOKIO_TLS_NETWORK_BUFFER_CAPACITY: usize = 256 * 1024;
+pub const DEFAULT_TOKIO_TLS_PLAINTEXT_CAPACITY: usize = 64 * 1024;
+pub const DEFAULT_TOKIO_UNBUFFERED_TLS_INCOMING_CAPACITY: usize = 256 * 1024;
+pub const DEFAULT_TOKIO_UNBUFFERED_TLS_OUTGOING_CAPACITY: usize = 128 * 1024;
+pub const DEFAULT_TOKIO_UNBUFFERED_TLS_LEFTOVER_CAPACITY: usize = 256 * 1024;
+pub const DEFAULT_TOKIO_UNBUFFERED_TLS_HANDSHAKE_SLACK: usize = 128 * 1024;
+pub const DEFAULT_RAW_COMPLETION_BATCH_CAPACITY: usize = 32;
+pub const DEFAULT_TUNGSTENITE_READ_BUFFER_CAPACITY: usize = 128 * 1024;
+pub const DEFAULT_TUNGSTENITE_WRITE_BUFFER_CAPACITY: usize = 128 * 1024;
+pub const DEFAULT_TUNGSTENITE_MAX_WRITE_BUFFER_CAPACITY: usize = usize::MAX;
+
+// ─── Bench-side staging knobs ─────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+pub struct BenchStagingConfig {
+    pub server_chunk_bytes: usize,
+    pub tokio_read_buffer_capacity: usize,
+    pub leftover_capacity: usize,
+    pub tokio_tls_network_buffer_capacity: usize,
+    pub tokio_tls_plaintext_capacity: usize,
+    pub tokio_unbuffered_tls_incoming_capacity: usize,
+    pub tokio_unbuffered_tls_outgoing_capacity: usize,
+    pub tokio_unbuffered_tls_leftover_capacity: usize,
+    pub tokio_unbuffered_tls_handshake_slack: usize,
+    pub raw_completion_batch_capacity: usize,
+    pub tungstenite_read_buffer_capacity: usize,
+    pub tungstenite_write_buffer_capacity: usize,
+    pub tungstenite_max_write_buffer_capacity: usize,
+}
+
+impl BenchStagingConfig {
+    pub fn from_args() -> Self {
+        let cfg = Self {
+            server_chunk_bytes: arg_or("--server-chunk-bytes", DEFAULT_SERVER_CHUNK_BYTES),
+            tokio_read_buffer_capacity: arg_or(
+                "--tokio-read-buf-cap",
+                DEFAULT_TOKIO_READ_BUFFER_CAPACITY,
+            ),
+            leftover_capacity: arg_or("--leftover-cap", DEFAULT_LEFTOVER_CAPACITY),
+            tokio_tls_network_buffer_capacity: arg_or(
+                "--tokio-tls-network-buf-cap",
+                DEFAULT_TOKIO_TLS_NETWORK_BUFFER_CAPACITY,
+            ),
+            tokio_tls_plaintext_capacity: arg_or(
+                "--tokio-tls-plaintext-cap",
+                DEFAULT_TOKIO_TLS_PLAINTEXT_CAPACITY,
+            ),
+            tokio_unbuffered_tls_incoming_capacity: arg_or(
+                "--tokio-unbuffered-in-cap",
+                DEFAULT_TOKIO_UNBUFFERED_TLS_INCOMING_CAPACITY,
+            ),
+            tokio_unbuffered_tls_outgoing_capacity: arg_or(
+                "--tokio-unbuffered-out-cap",
+                DEFAULT_TOKIO_UNBUFFERED_TLS_OUTGOING_CAPACITY,
+            ),
+            tokio_unbuffered_tls_leftover_capacity: arg_or(
+                "--tokio-unbuffered-leftover-cap",
+                DEFAULT_TOKIO_UNBUFFERED_TLS_LEFTOVER_CAPACITY,
+            ),
+            tokio_unbuffered_tls_handshake_slack: arg_or(
+                "--tokio-unbuffered-handshake-slack",
+                DEFAULT_TOKIO_UNBUFFERED_TLS_HANDSHAKE_SLACK,
+            ),
+            raw_completion_batch_capacity: arg_or(
+                "--raw-completion-batch-cap",
+                DEFAULT_RAW_COMPLETION_BATCH_CAPACITY,
+            ),
+            tungstenite_read_buffer_capacity: arg_or(
+                "--tungstenite-read-buffer",
+                DEFAULT_TUNGSTENITE_READ_BUFFER_CAPACITY,
+            ),
+            tungstenite_write_buffer_capacity: arg_or(
+                "--tungstenite-write-buffer",
+                DEFAULT_TUNGSTENITE_WRITE_BUFFER_CAPACITY,
+            ),
+            tungstenite_max_write_buffer_capacity: arg_or(
+                "--tungstenite-max-write-buffer",
+                DEFAULT_TUNGSTENITE_MAX_WRITE_BUFFER_CAPACITY,
+            ),
+        };
+        cfg.validate();
+        cfg
+    }
+
+    pub fn validate(&self) {
+        assert!(
+            self.server_chunk_bytes > 0,
+            "--server-chunk-bytes must be > 0"
+        );
+        assert!(
+            self.tokio_read_buffer_capacity > 0,
+            "--tokio-read-buf-cap must be > 0"
+        );
+        assert!(self.leftover_capacity > 0, "--leftover-cap must be > 0");
+        assert!(
+            self.tokio_tls_network_buffer_capacity > 0,
+            "--tokio-tls-network-buf-cap must be > 0"
+        );
+        assert!(
+            self.tokio_tls_plaintext_capacity > 0,
+            "--tokio-tls-plaintext-cap must be > 0"
+        );
+        assert!(
+            self.tokio_unbuffered_tls_incoming_capacity > 0,
+            "--tokio-unbuffered-in-cap must be > 0"
+        );
+        assert!(
+            self.tokio_unbuffered_tls_outgoing_capacity > 0,
+            "--tokio-unbuffered-out-cap must be > 0"
+        );
+        assert!(
+            self.tokio_unbuffered_tls_leftover_capacity > 0,
+            "--tokio-unbuffered-leftover-cap must be > 0"
+        );
+        assert!(
+            self.tokio_unbuffered_tls_handshake_slack > 0,
+            "--tokio-unbuffered-handshake-slack must be > 0"
+        );
+        assert!(
+            self.raw_completion_batch_capacity > 0,
+            "--raw-completion-batch-cap must be > 0"
+        );
+        assert!(
+            self.tungstenite_read_buffer_capacity > 0,
+            "--tungstenite-read-buffer must be > 0"
+        );
+        assert!(
+            self.tungstenite_write_buffer_capacity > 0,
+            "--tungstenite-write-buffer must be > 0"
+        );
+        assert!(
+            self.tungstenite_max_write_buffer_capacity > self.tungstenite_write_buffer_capacity,
+            "--tungstenite-max-write-buffer must be greater than --tungstenite-write-buffer"
+        );
+    }
+
+    pub fn print_stderr(self, indent: &str) {
+        eprintln!(
+            "{indent}bench stage: server_chunk={}B, leftover={}B, raw_completion_batch={}",
+            self.server_chunk_bytes, self.leftover_capacity, self.raw_completion_batch_capacity
+        );
+        eprintln!(
+            "{indent}tokio stage: read_buf={}B, tls_network={}B, tls_plaintext={}B",
+            self.tokio_read_buffer_capacity,
+            self.tokio_tls_network_buffer_capacity,
+            self.tokio_tls_plaintext_capacity
+        );
+        eprintln!(
+            "{indent}unbuf tls : incoming={}B, outgoing={}B, leftover={}B, handshake_slack={}B",
+            self.tokio_unbuffered_tls_incoming_capacity,
+            self.tokio_unbuffered_tls_outgoing_capacity,
+            self.tokio_unbuffered_tls_leftover_capacity,
+            self.tokio_unbuffered_tls_handshake_slack
+        );
+        eprintln!(
+            "{indent}tungstenite: read={}B, write={}B, max_write={}",
+            self.tungstenite_read_buffer_capacity,
+            self.tungstenite_write_buffer_capacity,
+            format_usize_capacity(self.tungstenite_max_write_buffer_capacity)
+        );
+    }
+}
+
 // ─── Talaris low-level tuning knobs ───────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
@@ -109,6 +275,26 @@ impl TalarisTuneConfig {
         cfg
     }
 
+    pub fn ws_config(self, host: impl Into<String>, path: impl Into<String>) -> ws::WsConfig {
+        let mut cfg = ws::WsConfig::new(host, path);
+        if self.ws_max_message_size != 0 {
+            cfg.max_message_size = self.ws_max_message_size;
+        }
+        if self.ws_max_frame_payload != 0 {
+            cfg.max_frame_payload = self.ws_max_frame_payload;
+        }
+        if self.ws_recv_buffer_capacity != 0 {
+            cfg.initial_recv_buffer_capacity = Some(self.ws_recv_buffer_capacity);
+        }
+        if self.ws_message_buffer_capacity != 0 {
+            cfg.initial_message_buffer_capacity = Some(self.ws_message_buffer_capacity);
+        }
+        if self.ws_tx_buffer_capacity != 0 {
+            cfg.initial_tx_buffer_capacity = Some(self.ws_tx_buffer_capacity);
+        }
+        cfg
+    }
+
     pub const fn pool_config(self, mut proactor: ProactorConfig) -> PoolConfig {
         if self.proactor_entries != 0 {
             proactor.entries = self.proactor_entries;
@@ -156,14 +342,13 @@ impl TalarisTuneConfig {
             override_or_default_u64(self.ws_max_frame_payload, ws::DEFAULT_MAX_FRAME_PAYLOAD),
             ws::MASK_POOL_BYTES
         );
-        let ws_default_io = ws::DEFAULT_MAX_MESSAGE_SIZE + ws::MAX_HEADER_LEN;
+        let effective_max_message_size =
+            nonzero_or(self.ws_max_message_size, ws::DEFAULT_MAX_MESSAGE_SIZE);
+        let ws_default_io = effective_max_message_size.saturating_add(ws::MAX_HEADER_LEN);
         eprintln!(
             "{indent}ws bufs    : recv={}, msg={}, tx={}",
             override_or_default(self.ws_recv_buffer_capacity, ws_default_io),
-            override_or_default(
-                self.ws_message_buffer_capacity,
-                ws::DEFAULT_MAX_MESSAGE_SIZE
-            ),
+            override_or_default(self.ws_message_buffer_capacity, effective_max_message_size),
             override_or_default(self.ws_tx_buffer_capacity, ws_default_io)
         );
     }
@@ -196,6 +381,14 @@ fn override_or_default_u32(value: u32, default: u32) -> String {
 fn override_or_default_u64(value: u64, default: u64) -> String {
     if value == 0 {
         format!("default({default})")
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_usize_capacity(value: usize) -> String {
+    if value == usize::MAX {
+        "usize::MAX".to_owned()
     } else {
         value.to_string()
     }
@@ -570,9 +763,13 @@ pub fn decode_json_value(payload: &str) -> u64 {
 /// 给 server 推荐的 chunk size：~64 KiB（一次 write_all 大致填满 TCP send buffer
 /// 但不溢出，使 server 端 syscall 次数最少）。换算到对应 payload 帧数。
 pub fn frames_per_chunk(payload_size: usize) -> usize {
-    const TARGET: usize = 64 * 1024;
     let per_frame = payload_size + if payload_size <= 125 { 2 } else { 4 };
-    (TARGET / per_frame).max(1)
+    (DEFAULT_SERVER_CHUNK_BYTES / per_frame).max(1)
+}
+
+pub fn frames_per_chunk_for_bytes(payload_size: usize, target_bytes: usize) -> usize {
+    let per_frame = payload_size + if payload_size <= 125 { 2 } else { 4 };
+    (target_bytes / per_frame).max(1)
 }
 
 // ─── Loopback TLS fixture ──────────────────────────────────────────────
@@ -855,6 +1052,7 @@ pub async fn tokio_recv_ws_binary_frames(
     expected_payload: usize,
     sample_every: u64,
     bench_start: Instant,
+    staging: BenchStagingConfig,
 ) -> (Vec<Instant>, u64) {
     use talaris::ws::frame::parse_header;
     use tokio::io::AsyncReadExt;
@@ -862,9 +1060,9 @@ pub async fn tokio_recv_ws_binary_frames(
     let mut arrivals = sampled_arrivals(stop, sample_every);
     let mut frame_count = 0_u64;
 
-    let mut recv_buf = vec![0_u8; 256 * 1024];
+    let mut recv_buf = vec![0_u8; staging.tokio_read_buffer_capacity];
     let mut leftover: Vec<u8> = initial_leftover;
-    leftover.reserve(64 * 1024);
+    leftover.reserve(staging.leftover_capacity);
 
     // 在进 await 之前先把 initial_leftover 里能解的帧全干掉，免得后面一个空
     // read 就把这部分扔了。
@@ -936,13 +1134,14 @@ pub async fn tokio_recv_ktls_ws_binary_frames_sampled(
     expected_payload: usize,
     sample_every: u64,
     bench_start: Instant,
+    staging: BenchStagingConfig,
 ) -> (Vec<Instant>, u64) {
     use talaris::ws::frame::parse_header;
     let mut arrivals = sampled_arrivals(stop, sample_every);
     let mut frame_count = 0_u64;
-    let mut recv_buf = vec![0_u8; 256 * 1024];
+    let mut recv_buf = vec![0_u8; staging.tokio_tls_network_buffer_capacity];
     let mut leftover = initial_leftover;
-    leftover.reserve(64 * 1024);
+    leftover.reserve(staging.leftover_capacity);
 
     'outer: loop {
         let mut pos = 0_usize;
@@ -1027,9 +1226,10 @@ pub async fn tokio_ktls_ws_upgrade_client(
     mut tls: rustls::ClientConnection,
     host: &str,
     path: &str,
+    staging: BenchStagingConfig,
 ) -> std::io::Result<Vec<u8>> {
-    let mut network_buf = vec![0_u8; 256 * 1024];
-    let mut plaintext = Vec::<u8>::new();
+    let mut network_buf = vec![0_u8; staging.tokio_tls_network_buffer_capacity];
+    let mut plaintext = Vec::<u8>::with_capacity(staging.tokio_tls_plaintext_capacity);
     while tls.is_handshaking() {
         flush_tokio_tls(s, &mut tls).await?;
         read_tokio_tls(s, &mut tls, &mut network_buf, &mut plaintext).await?;
@@ -1048,7 +1248,7 @@ pub async fn tokio_ktls_ws_upgrade_client(
         .dangerous_extract_secrets()
         .map_err(std::io::Error::other)?;
     install_ktls(s, version, secrets)?;
-    tokio_ktls_ws_upgrade_after_install(s, host, path).await
+    tokio_ktls_ws_upgrade_after_install(s, host, path, staging).await
 }
 
 #[cfg(target_os = "linux")]
@@ -1057,11 +1257,12 @@ pub async fn tokio_tls_ws_upgrade_client(
     tls: &mut rustls::ClientConnection,
     host: &str,
     path: &str,
+    staging: BenchStagingConfig,
 ) -> std::io::Result<Vec<u8>> {
     use std::io::Write as _;
 
-    let mut network_buf = vec![0_u8; 256 * 1024];
-    let mut plaintext = Vec::<u8>::new();
+    let mut network_buf = vec![0_u8; staging.tokio_tls_network_buffer_capacity];
+    let mut plaintext = Vec::<u8>::with_capacity(staging.tokio_tls_plaintext_capacity);
     while tls.is_handshaking() {
         flush_tokio_tls(s, tls).await?;
         read_tokio_tls(s, tls, &mut network_buf, &mut plaintext).await?;
@@ -1095,9 +1296,11 @@ pub async fn tokio_tls_ws_client_connect(
     tls: &mut rustls::ClientConnection,
     host: &str,
     path: &str,
+    ws_config: talaris::ws::WsConfig,
+    staging: BenchStagingConfig,
 ) -> std::io::Result<talaris::ws::WsClient> {
-    let mut network_buf = vec![0_u8; 256 * 1024];
-    let mut plaintext = Vec::<u8>::new();
+    let mut network_buf = vec![0_u8; staging.tokio_tls_network_buffer_capacity];
+    let mut plaintext = Vec::<u8>::with_capacity(staging.tokio_tls_plaintext_capacity);
     while tls.is_handshaking() {
         flush_tokio_tls(s, tls).await?;
         read_tokio_tls(s, tls, &mut network_buf, &mut plaintext).await?;
@@ -1108,8 +1311,9 @@ pub async fn tokio_tls_ws_client_connect(
         ));
     }
 
-    let mut ws = talaris::ws::WsClient::new_client(talaris::ws::WsConfig::new(host, path))
-        .map_err(std::io::Error::other)?;
+    debug_assert_eq!(ws_config.host, host);
+    debug_assert_eq!(ws_config.path, path);
+    let mut ws = talaris::ws::WsClient::new_client(ws_config).map_err(std::io::Error::other)?;
     ws.begin_handshake().map_err(std::io::Error::other)?;
     flush_tokio_ws_tx(s, tls, &mut ws).await?;
 
@@ -1137,14 +1341,15 @@ pub async fn tokio_recv_tls_ws_binary_frames(
     expected_payload: usize,
     sample_every: u64,
     bench_start: Instant,
+    staging: BenchStagingConfig,
 ) -> (Vec<Instant>, u64) {
     use talaris::ws::frame::parse_header;
 
     let mut arrivals = sampled_arrivals(stop, sample_every);
     let mut frame_count = 0_u64;
-    let mut network_buf = vec![0_u8; 256 * 1024];
+    let mut network_buf = vec![0_u8; staging.tokio_tls_network_buffer_capacity];
     let mut plaintext = initial_leftover;
-    plaintext.reserve(64 * 1024);
+    plaintext.reserve(staging.tokio_tls_plaintext_capacity);
 
     'outer: loop {
         let mut pos = 0_usize;
@@ -1195,11 +1400,12 @@ pub async fn tokio_recv_tls_ws_data_events(
     expected_payload: usize,
     sample_every: u64,
     bench_start: Instant,
+    staging: BenchStagingConfig,
 ) -> (Vec<Instant>, u64) {
     let mut arrivals = sampled_arrivals(stop, sample_every);
     let mut frame_count = 0_u64;
-    let mut network_buf = vec![0_u8; 256 * 1024];
-    let mut plaintext = Vec::with_capacity(64 * 1024);
+    let mut network_buf = vec![0_u8; staging.tokio_tls_network_buffer_capacity];
+    let mut plaintext = Vec::with_capacity(staging.tokio_tls_plaintext_capacity);
 
     loop {
         if let Err(e) = ws.drain_data_events(|event| {
@@ -1316,11 +1522,12 @@ pub struct TokioUnbufferedTls {
     incoming: Vec<u8>,
     incoming_head: usize,
     outgoing: Vec<u8>,
+    handshake_slack: usize,
 }
 
 #[cfg(target_os = "linux")]
 impl TokioUnbufferedTls {
-    fn new() -> Self {
+    fn new(staging: BenchStagingConfig) -> Self {
         let server_name = rustls::pki_types::ServerName::try_from("localhost")
             .expect("localhost is valid server name")
             .to_owned();
@@ -1329,9 +1536,10 @@ impl TokioUnbufferedTls {
                 .expect("localhost unbuffered tls client");
         Self {
             conn,
-            incoming: Vec::with_capacity(256 * 1024),
+            incoming: Vec::with_capacity(staging.tokio_unbuffered_tls_incoming_capacity),
             incoming_head: 0,
-            outgoing: Vec::with_capacity(128 * 1024),
+            outgoing: Vec::with_capacity(staging.tokio_unbuffered_tls_outgoing_capacity),
+            handshake_slack: staging.tokio_unbuffered_tls_handshake_slack,
         }
     }
 
@@ -1404,9 +1612,8 @@ impl TokioUnbufferedTls {
                     None
                 }
                 ConnectionState::EncodeTlsData(mut data) => {
-                    const HANDSHAKE_SLACK: usize = 128 * 1024;
                     let start = self.outgoing.len();
-                    self.outgoing.resize(start + HANDSHAKE_SLACK, 0);
+                    self.outgoing.resize(start + self.handshake_slack, 0);
                     let n = data
                         .encode(&mut self.outgoing[start..])
                         .map_err(std::io::Error::other)?;
@@ -1487,8 +1694,9 @@ pub async fn tokio_unbuffered_tls_ws_upgrade_client(
     s: &mut tokio::net::TcpStream,
     host: &str,
     path: &str,
+    staging: BenchStagingConfig,
 ) -> std::io::Result<(TokioUnbufferedTls, Vec<u8>)> {
-    let mut tls = TokioUnbufferedTls::new();
+    let mut tls = TokioUnbufferedTls::new(staging);
     tls.handshake(s).await?;
 
     let key = talaris::ws::handshake::generate_key()
@@ -1503,7 +1711,7 @@ pub async fn tokio_unbuffered_tls_ws_upgrade_client(
     );
     tls.write_plaintext(s, req.as_bytes()).await?;
 
-    let mut plaintext = Vec::<u8>::new();
+    let mut plaintext = Vec::<u8>::with_capacity(staging.tokio_tls_plaintext_capacity);
     loop {
         tls.read_plaintext(s, |chunk| plaintext.extend_from_slice(chunk))
             .await?;
@@ -1523,13 +1731,14 @@ pub async fn tokio_recv_unbuffered_tls_ws_binary_frames(
     expected_payload: usize,
     sample_every: u64,
     bench_start: Instant,
+    staging: BenchStagingConfig,
 ) -> (Vec<Instant>, u64) {
     use talaris::ws::frame::parse_header;
 
     let mut arrivals = sampled_arrivals(stop, sample_every);
     let mut frame_count = 0_u64;
     let mut leftover = initial_leftover;
-    leftover.reserve(256 * 1024);
+    leftover.reserve(staging.tokio_unbuffered_tls_leftover_capacity);
 
     'outer: loop {
         let mut pos = 0_usize;
@@ -1579,6 +1788,7 @@ async fn tokio_ktls_ws_upgrade_after_install(
     s: &mut tokio::net::TcpStream,
     host: &str,
     path: &str,
+    staging: BenchStagingConfig,
 ) -> std::io::Result<Vec<u8>> {
     use tokio::io::AsyncWriteExt as _;
 
@@ -1595,7 +1805,7 @@ async fn tokio_ktls_ws_upgrade_after_install(
     s.write_all(req.as_bytes()).await?;
 
     let mut resp = Vec::<u8>::new();
-    let mut buf = [0_u8; 4096];
+    let mut buf = vec![0_u8; staging.tokio_tls_network_buffer_capacity];
     loop {
         let n = tokio_ktls_read_application_data(s, &mut buf).await?;
         if n == 0 {
