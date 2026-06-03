@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 use talaris::connection::ConnectionConfig;
-use talaris::proactor::ProactorConfig;
+use talaris::proactor::{ProactorConfig, ProactorSetupFlags};
 use talaris::{PoolConfig, ws};
 
 pub const DEFAULT_SERVER_CHUNK_BYTES: usize = 64 * 1024;
@@ -200,7 +200,9 @@ impl BenchStagingConfig {
 
 #[derive(Debug, Clone, Copy)]
 pub struct TalarisTuneConfig {
-    pub proactor_entries: u32,
+    pub proactor_sq_entries: u32,
+    pub proactor_cq_entries: u32,
+    pub proactor_setup_flags: ProactorSetupFlags,
     pub buf_size: u32,
     pub buf_entries: u16,
     pub pool_conn_capacity: usize,
@@ -216,8 +218,12 @@ pub struct TalarisTuneConfig {
 
 impl TalarisTuneConfig {
     pub fn from_args(default_buf_size: u32, default_buf_entries: u16) -> Self {
+        let legacy_proactor_entries: u32 = arg_or("--proactor-entries", 0);
+        let taskrun_mode: String = arg_or("--taskrun", "default".to_owned());
         let cfg = Self {
-            proactor_entries: arg_or("--proactor-entries", 0),
+            proactor_sq_entries: arg_or("--sq-entries", legacy_proactor_entries),
+            proactor_cq_entries: arg_or("--cq-entries", 0),
+            proactor_setup_flags: parse_taskrun_flags(&taskrun_mode),
             buf_size: arg_or("--buf-size", default_buf_size),
             buf_entries: arg_or("--buf-entries", default_buf_entries),
             pool_conn_capacity: arg_or("--pool-conn-cap", 0),
@@ -241,15 +247,33 @@ impl TalarisTuneConfig {
             "--buf-entries must be a non-zero power of two"
         );
         assert!(
-            self.proactor_entries == 0 || self.proactor_entries.is_power_of_two(),
-            "--proactor-entries must be 0 or a power of two"
+            self.proactor_sq_entries == 0 || self.proactor_sq_entries.is_power_of_two(),
+            "--sq-entries/--proactor-entries must be 0 or a power of two"
+        );
+        let effective_sq = nonzero_or_u32(
+            self.proactor_sq_entries,
+            ProactorConfig::default().sq_entries,
+        );
+        assert!(
+            self.proactor_cq_entries == 0 || self.proactor_cq_entries.is_power_of_two(),
+            "--cq-entries must be 0 or a power of two"
+        );
+        assert!(
+            self.proactor_cq_entries == 0 || self.proactor_cq_entries > effective_sq,
+            "--cq-entries must be greater than the effective SQ entries"
         );
     }
 
     pub fn apply_connection(self, mut cfg: ConnectionConfig) -> ConnectionConfig {
         cfg = cfg.with_buf_ring(self.buf_size, self.buf_entries);
-        if self.proactor_entries != 0 {
-            cfg = cfg.with_proactor_entries(self.proactor_entries);
+        if self.proactor_sq_entries != 0 {
+            cfg = cfg.with_sq_entries(self.proactor_sq_entries);
+        }
+        if self.proactor_cq_entries != 0 {
+            cfg = cfg.with_cq_entries(self.proactor_cq_entries);
+        }
+        if !self.proactor_setup_flags.is_empty() {
+            cfg = cfg.with_proactor_setup_flags(self.proactor_setup_flags);
         }
         if self.send_buffer_capacity != 0 {
             cfg = cfg.with_send_buffer_capacity(self.send_buffer_capacity);
@@ -296,8 +320,14 @@ impl TalarisTuneConfig {
     }
 
     pub const fn pool_config(self, mut proactor: ProactorConfig) -> PoolConfig {
-        if self.proactor_entries != 0 {
-            proactor.entries = self.proactor_entries;
+        if self.proactor_sq_entries != 0 {
+            proactor.sq_entries = self.proactor_sq_entries;
+        }
+        if self.proactor_cq_entries != 0 {
+            proactor.cq_entries = Some(self.proactor_cq_entries);
+        }
+        if !self.proactor_setup_flags.is_empty() {
+            proactor.setup_flags = self.proactor_setup_flags;
         }
         let mut cfg = PoolConfig::new(proactor);
         if self.pool_conn_capacity != 0 {
@@ -311,8 +341,16 @@ impl TalarisTuneConfig {
 
     pub fn print_stderr(self, indent: &str) {
         eprintln!(
-            "{indent}proactor   : entries={}",
-            override_or_default_u32(self.proactor_entries, ProactorConfig::default().entries)
+            "{indent}proactor   : sq_entries={}, cq_entries={}, taskrun={}",
+            override_or_default_u32(
+                self.proactor_sq_entries,
+                ProactorConfig::default().sq_entries
+            ),
+            override_or_default_u32(
+                self.proactor_cq_entries,
+                ProactorConfig::default().sq_entries * 2
+            ),
+            format_setup_flags(self.proactor_setup_flags),
         );
         eprintln!(
             "{indent}buf_ring   : {} x {}B = {} KiB pool/conn",
@@ -354,7 +392,58 @@ impl TalarisTuneConfig {
     }
 }
 
+fn parse_taskrun_flags(mode: &str) -> ProactorSetupFlags {
+    match mode {
+        "default" | "none" | "off" => ProactorSetupFlags::NONE,
+        "coop" => ProactorSetupFlags::COOP_TASKRUN,
+        "coop-flag" => ProactorSetupFlags::COOP_TASKRUN | ProactorSetupFlags::TASKRUN_FLAG,
+        "single" | "single-issuer" => ProactorSetupFlags::SINGLE_ISSUER,
+        "defer" | "defer-single" => {
+            ProactorSetupFlags::SINGLE_ISSUER | ProactorSetupFlags::DEFER_TASKRUN
+        }
+        "defer-flag" | "defer-single-flag" => {
+            ProactorSetupFlags::SINGLE_ISSUER
+                | ProactorSetupFlags::DEFER_TASKRUN
+                | ProactorSetupFlags::TASKRUN_FLAG
+        }
+        other => panic!(
+            "--taskrun must be one of default, coop, coop-flag, single, defer, defer-flag; got {other}"
+        ),
+    }
+}
+
+fn format_setup_flags(flags: ProactorSetupFlags) -> &'static str {
+    match flags.bits() {
+        0 => "default",
+        bits if bits == ProactorSetupFlags::COOP_TASKRUN.bits() => "coop",
+        bits if bits
+            == (ProactorSetupFlags::COOP_TASKRUN | ProactorSetupFlags::TASKRUN_FLAG).bits() =>
+        {
+            "coop-flag"
+        }
+        bits if bits == ProactorSetupFlags::SINGLE_ISSUER.bits() => "single",
+        bits if bits
+            == (ProactorSetupFlags::SINGLE_ISSUER | ProactorSetupFlags::DEFER_TASKRUN).bits() =>
+        {
+            "defer"
+        }
+        bits if bits
+            == (ProactorSetupFlags::SINGLE_ISSUER
+                | ProactorSetupFlags::DEFER_TASKRUN
+                | ProactorSetupFlags::TASKRUN_FLAG)
+                .bits() =>
+        {
+            "defer-flag"
+        }
+        _ => "custom",
+    }
+}
+
 const fn nonzero_or(value: usize, default: usize) -> usize {
+    if value == 0 { default } else { value }
+}
+
+const fn nonzero_or_u32(value: u32, default: u32) -> u32 {
     if value == 0 { default } else { value }
 }
 

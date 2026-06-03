@@ -184,9 +184,9 @@ mod linux_impl {
         eprintln!("[raw] user→CPU {user_cpu}, SQ_POLL kthread→CPU {sq_poll_cpu}");
 
         let cfg = ProactorConfig {
-            entries: 256,
             sq_poll_idle_ms: Some(10_000),
             sq_poll_cpu: Some(sq_poll_cpu),
+            ..ProactorConfig::default()
         };
         let mut proactor = Proactor::new(cfg).expect("proactor");
 

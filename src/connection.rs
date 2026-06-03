@@ -13,7 +13,7 @@ use std::{io, sync::Arc};
 
 use thiserror::Error;
 
-use crate::proactor::{BufferRingError, ProactorConfig, ProactorError};
+use crate::proactor::{BufferRingError, ProactorConfig, ProactorError, ProactorSetupFlags};
 use crate::tls::TlsError;
 use crate::ws::{WsConfig, WsError};
 
@@ -194,10 +194,36 @@ impl ConnectionConfig {
         self
     }
 
-    /// 覆盖 io_uring SQ entries。必须是 2 的幂；最终校验由 io_uring init 完成。
+    /// 覆盖 io_uring SQ entries。必须是非零 2 的幂；最终校验由 [`Proactor::new`](crate::proactor::Proactor::new) 完成。
     #[must_use]
     pub const fn with_proactor_entries(mut self, entries: u32) -> Self {
-        self.proactor.entries = entries;
+        self.proactor.sq_entries = entries;
+        self
+    }
+
+    /// 覆盖 io_uring SQ entries。语义同 [`Self::with_proactor_entries`]，
+    /// 名字更明确；保留旧方法是为了兼容 bench 和早期调用点。
+    #[must_use]
+    pub const fn with_sq_entries(mut self, entries: u32) -> Self {
+        self.proactor.sq_entries = entries;
+        self
+    }
+
+    /// 覆盖 io_uring CQ entries。`None` 时使用 kernel 默认（通常为 SQ 的 2 倍）。
+    ///
+    /// multishot recv 会在一次 SQE 生命周期内产生大量 CQE。行情 burst 场景建议
+    /// 从 `max(2 * sq_entries, buf_ring_entries)` 起步做 A/B。
+    #[must_use]
+    pub const fn with_cq_entries(mut self, entries: u32) -> Self {
+        self.proactor.cq_entries = Some(entries);
+        self
+    }
+
+    /// 覆盖高级 io_uring setup flags。默认关闭；这些 flag 对 event loop 结构有
+    /// 约束，建议只在明确 benchmark 假设下开启。
+    #[must_use]
+    pub const fn with_proactor_setup_flags(mut self, flags: ProactorSetupFlags) -> Self {
+        self.proactor.setup_flags = flags;
         self
     }
 

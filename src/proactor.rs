@@ -22,9 +22,9 @@
 //!
 //! ## Scope
 //!
-//! 当前实现覆盖 TCP connect / send / close、provided buffer ring、
-//! multishot recv、`SQ_POLL`、CPU affinity 和 `IOSQE_IO_LINK`，并作为
-//! `Pool` 的底层 IO 引擎。该模块也作为 toolkit API 暴露，方便用户绕开
+//! 当前实现覆盖 TCP connect / send / close、SQ/CQ sizing、taskrun setup flags、
+//! provided buffer ring、multishot recv、`SQ_POLL`、CPU affinity 和 `IOSQE_IO_LINK`，
+//! 并作为 `Pool` 的底层 IO 引擎。该模块也作为 toolkit API 暴露，方便用户绕开
 //! `Pool` 直接做 transport / framing benchmark 或 venue-specific staging。
 //!
 //! ## 平台
@@ -55,12 +55,12 @@ pub use op::{Completion, OpKind, SqeFlags, UserData};
 #[cfg(target_os = "linux")]
 pub use socket::{Domain, SockAddr, TcpSocket};
 #[cfg(target_os = "linux")]
-pub use uring::{Proactor, ProactorConfig, ProactorError};
+pub use uring::{Proactor, ProactorConfig, ProactorError, ProactorSetupFlags};
 
 #[cfg(not(target_os = "linux"))]
 pub use stub::{
     AffinityError, BufferRing, BufferRingError, Completion, Domain, OpKind, Proactor,
-    ProactorConfig, ProactorError, SockAddr, SqeFlags, TcpSocket, UserData,
+    ProactorConfig, ProactorError, ProactorSetupFlags, SockAddr, SqeFlags, TcpSocket, UserData,
 };
 
 #[cfg(not(target_os = "linux"))]

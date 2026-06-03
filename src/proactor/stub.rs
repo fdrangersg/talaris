@@ -236,18 +236,115 @@ impl TcpSocket {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProactorConfig {
-    pub entries: u32,
+    pub sq_entries: u32,
+    pub cq_entries: Option<u32>,
     pub sq_poll_idle_ms: Option<u32>,
     pub sq_poll_cpu: Option<u32>,
+    pub setup_flags: ProactorSetupFlags,
 }
 
 impl Default for ProactorConfig {
     fn default() -> Self {
         Self {
-            entries: 256,
+            sq_entries: 256,
+            cq_entries: None,
             sq_poll_idle_ms: None,
             sq_poll_cpu: None,
+            setup_flags: ProactorSetupFlags::NONE,
         }
+    }
+}
+
+impl ProactorConfig {
+    #[inline]
+    #[must_use]
+    pub const fn with_sq_entries(mut self, entries: u32) -> Self {
+        self.sq_entries = entries;
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_cq_entries(mut self, entries: u32) -> Self {
+        self.cq_entries = Some(entries);
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_setup_flags(mut self, flags: ProactorSetupFlags) -> Self {
+        self.setup_flags = flags;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Default)]
+pub struct ProactorSetupFlags(u32);
+
+impl ProactorSetupFlags {
+    pub const NONE: Self = Self(0);
+    pub const COOP_TASKRUN: Self = Self(1 << 0);
+    pub const TASKRUN_FLAG: Self = Self(1 << 1);
+    pub const SINGLE_ISSUER: Self = Self(1 << 2);
+    pub const DEFER_TASKRUN: Self = Self(1 << 3);
+
+    #[inline]
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self::NONE
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn contains(self, flag: Self) -> bool {
+        (self.0 & flag.0) == flag.0
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for ProactorSetupFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut list = f.debug_list();
+        if self.contains(Self::COOP_TASKRUN) {
+            list.entry(&"COOP_TASKRUN");
+        }
+        if self.contains(Self::TASKRUN_FLAG) {
+            list.entry(&"TASKRUN_FLAG");
+        }
+        if self.contains(Self::SINGLE_ISSUER) {
+            list.entry(&"SINGLE_ISSUER");
+        }
+        if self.contains(Self::DEFER_TASKRUN) {
+            list.entry(&"DEFER_TASKRUN");
+        }
+        list.finish()
+    }
+}
+
+impl std::ops::BitOr for ProactorSetupFlags {
+    type Output = Self;
+
+    #[inline]
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for ProactorSetupFlags {
+    #[inline]
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
     }
 }
 
@@ -255,6 +352,8 @@ impl Default for ProactorConfig {
 pub enum ProactorError {
     #[error("io_uring init failed: {0}")]
     Init(#[source] io::Error),
+    #[error("invalid proactor config: {0}")]
+    InvalidConfig(&'static str),
     #[error("submission queue full")]
     SqFull,
     #[error("io_uring submit failed: {0}")]

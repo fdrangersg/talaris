@@ -1,8 +1,9 @@
 //! io_uring Proactor 本体
 //!
-//! F1 范围：包 `IoUring` 暴露 connect / recv / send / close 四个 submit + 一个
-//! `submit_and_wait` + 一个 `drain_completions`。没有 SQ_POLL / multishot /
-//! fixed buffer / `IOSQE_IO_LINK` —— 留给 F3。
+//! 本层是 thin wrapper：负责 ring setup、SQE 提交、CQE drain、provided buffer
+//! ring 注册和少量 HFT 场景需要显式控制的 setup flags。高层 `Pool` 使用这里的
+//! multishot recv + provided buffer ring；low-level toolkit 用户也可以直接用
+//! `Proactor` 自己拼 transport / framing benchmark。
 //!
 //! ## Buffer 生命周期（unsafe 接口的核心约束）
 //!
@@ -32,12 +33,95 @@ use thiserror::Error;
 use super::op::{Completion, SqeFlags, UserData};
 use super::socket::SockAddr;
 
+/// io_uring setup flags 的稳定子集。
+///
+/// 这里只暴露对单线程行情 receive loop 有实际调参意义的 taskrun flags。
+/// 默认不启用；这些 flag 对 event-loop 结构有约束，应显式 A/B 后再打开。
+#[derive(Clone, Copy, Eq, PartialEq, Default)]
+pub struct ProactorSetupFlags(u32);
+
+impl ProactorSetupFlags {
+    pub const NONE: Self = Self(0);
+    /// `IORING_SETUP_COOP_TASKRUN`。
+    pub const COOP_TASKRUN: Self = Self(1 << 0);
+    /// `IORING_SETUP_TASKRUN_FLAG`，需配合 `COOP_TASKRUN` 或 `DEFER_TASKRUN` 使用。
+    pub const TASKRUN_FLAG: Self = Self(1 << 1);
+    /// `IORING_SETUP_SINGLE_ISSUER`。
+    pub const SINGLE_ISSUER: Self = Self(1 << 2);
+    /// `IORING_SETUP_DEFER_TASKRUN`，kernel 要求同时设置 `SINGLE_ISSUER`。
+    pub const DEFER_TASKRUN: Self = Self(1 << 3);
+
+    #[inline]
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self::NONE
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn contains(self, flag: Self) -> bool {
+        (self.0 & flag.0) == flag.0
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for ProactorSetupFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut list = f.debug_list();
+        if self.contains(Self::COOP_TASKRUN) {
+            list.entry(&"COOP_TASKRUN");
+        }
+        if self.contains(Self::TASKRUN_FLAG) {
+            list.entry(&"TASKRUN_FLAG");
+        }
+        if self.contains(Self::SINGLE_ISSUER) {
+            list.entry(&"SINGLE_ISSUER");
+        }
+        if self.contains(Self::DEFER_TASKRUN) {
+            list.entry(&"DEFER_TASKRUN");
+        }
+        list.finish()
+    }
+}
+
+impl std::ops::BitOr for ProactorSetupFlags {
+    type Output = Self;
+
+    #[inline]
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for ProactorSetupFlags {
+    #[inline]
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
 /// Proactor 构造参数。
 #[derive(Debug, Clone, Copy)]
 pub struct ProactorConfig {
-    /// SQ 容量（也是 CQ 默认容量的 1/2 上下，由 io_uring 决定）。
-    /// 必须是 2 的幂。F1 默认 256（足够单连接连续 batch）。
-    pub entries: u32,
+    /// SQ 容量。必须是非零 2 的幂。默认 256。
+    pub sq_entries: u32,
+    /// CQ 容量覆盖。`None` 使用 kernel 默认（通常是 SQ 的 2 倍）。
+    ///
+    /// 对 multishot recv + provided buffer ring 的行情接收，burst 期间 CQE
+    /// 可能比 SQE 多得多；建议从 `max(2 * sq_entries, buf_ring_entries)`
+    /// 或更高开始 A/B。
+    pub cq_entries: Option<u32>,
     /// `Some(idle_ms)` 启用 `IORING_SETUP_SQPOLL`：kernel 起一条 SQ poll 线程持
     /// 续扫 SubmissionQueue tail，submit 路径不走 `io_uring_enter` 系统调用。
     /// 线程空转超过 `idle_ms` 毫秒后进入 sleep，下次 submit 时 user space
@@ -51,15 +135,42 @@ pub struct ProactorConfig {
     /// `Some(cpu)` 把 SQ_POLL kernel 线程钉在指定 CPU。仅在
     /// [`sq_poll_idle_ms`](Self::sq_poll_idle_ms) 启用时生效。
     pub sq_poll_cpu: Option<u32>,
+    /// 高级 setup flags。默认关闭。详见 [`ProactorSetupFlags`]。
+    pub setup_flags: ProactorSetupFlags,
 }
 
 impl Default for ProactorConfig {
     fn default() -> Self {
         Self {
-            entries: 256,
+            sq_entries: 256,
+            cq_entries: None,
             sq_poll_idle_ms: None,
             sq_poll_cpu: None,
+            setup_flags: ProactorSetupFlags::NONE,
         }
+    }
+}
+
+impl ProactorConfig {
+    #[inline]
+    #[must_use]
+    pub const fn with_sq_entries(mut self, entries: u32) -> Self {
+        self.sq_entries = entries;
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_cq_entries(mut self, entries: u32) -> Self {
+        self.cq_entries = Some(entries);
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_setup_flags(mut self, flags: ProactorSetupFlags) -> Self {
+        self.setup_flags = flags;
+        self
     }
 }
 
@@ -67,6 +178,8 @@ impl Default for ProactorConfig {
 pub enum ProactorError {
     #[error("io_uring init failed: {0}")]
     Init(#[source] io::Error),
+    #[error("invalid proactor config: {0}")]
+    InvalidConfig(&'static str),
     /// SQ 满。caller 应先 `submit_and_wait` 把现有 SQE 推进去再重试。
     #[error("submission queue full")]
     SqFull,
@@ -92,16 +205,24 @@ impl std::fmt::Debug for Proactor {
 }
 
 impl Proactor {
-    /// 构造一个 proactor。按 [`ProactorConfig`] 决定是否启用 SQ_POLL。
+    /// 构造一个 proactor。按 [`ProactorConfig`] 决定 ring size、SQ_POLL 和
+    /// taskrun setup flags。
     pub fn new(config: ProactorConfig) -> Result<Self, ProactorError> {
+        validate_config(config)?;
         let mut builder = IoUring::builder();
+        if let Some(cq_entries) = config.cq_entries {
+            builder.setup_cqsize(cq_entries);
+        }
         if let Some(idle_ms) = config.sq_poll_idle_ms {
             builder.setup_sqpoll(idle_ms);
             if let Some(cpu) = config.sq_poll_cpu {
                 builder.setup_sqpoll_cpu(cpu);
             }
         }
-        let ring = builder.build(config.entries).map_err(ProactorError::Init)?;
+        apply_setup_flags(&mut builder, config.setup_flags);
+        let ring = builder
+            .build(config.sq_entries)
+            .map_err(ProactorError::Init)?;
         Ok(Self { ring })
     }
 
@@ -376,6 +497,66 @@ impl Proactor {
             });
         }
         count
+    }
+}
+
+fn validate_config(config: ProactorConfig) -> Result<(), ProactorError> {
+    if config.sq_entries == 0 || !config.sq_entries.is_power_of_two() {
+        return Err(ProactorError::InvalidConfig(
+            "sq_entries must be a non-zero power of two",
+        ));
+    }
+    if let Some(cq_entries) = config.cq_entries {
+        if cq_entries <= config.sq_entries {
+            return Err(ProactorError::InvalidConfig(
+                "cq_entries must be greater than sq_entries",
+            ));
+        }
+        if !cq_entries.is_power_of_two() {
+            return Err(ProactorError::InvalidConfig(
+                "cq_entries must be a power of two",
+            ));
+        }
+    }
+
+    let flags = config.setup_flags;
+    if flags.contains(ProactorSetupFlags::DEFER_TASKRUN)
+        && !flags.contains(ProactorSetupFlags::SINGLE_ISSUER)
+    {
+        return Err(ProactorError::InvalidConfig(
+            "DEFER_TASKRUN requires SINGLE_ISSUER",
+        ));
+    }
+    if flags.contains(ProactorSetupFlags::TASKRUN_FLAG)
+        && !(flags.contains(ProactorSetupFlags::COOP_TASKRUN)
+            || flags.contains(ProactorSetupFlags::DEFER_TASKRUN))
+    {
+        return Err(ProactorError::InvalidConfig(
+            "TASKRUN_FLAG requires COOP_TASKRUN or DEFER_TASKRUN",
+        ));
+    }
+    if flags.contains(ProactorSetupFlags::COOP_TASKRUN)
+        && flags.contains(ProactorSetupFlags::DEFER_TASKRUN)
+    {
+        return Err(ProactorError::InvalidConfig(
+            "COOP_TASKRUN and DEFER_TASKRUN are separate taskrun modes",
+        ));
+    }
+    Ok(())
+}
+
+fn apply_setup_flags(builder: &mut io_uring::Builder, flags: ProactorSetupFlags) {
+    if flags.contains(ProactorSetupFlags::COOP_TASKRUN) {
+        builder.setup_coop_taskrun();
+    }
+    if flags.contains(ProactorSetupFlags::TASKRUN_FLAG) {
+        builder.setup_taskrun_flag();
+    }
+    if flags.contains(ProactorSetupFlags::SINGLE_ISSUER) {
+        builder.setup_single_issuer();
+    }
+    if flags.contains(ProactorSetupFlags::DEFER_TASKRUN) {
+        builder.setup_defer_taskrun();
     }
 }
 
