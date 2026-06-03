@@ -6,13 +6,14 @@ license       = "GPL-3.0-or-later"
 authors       = ["fdranger <fdrangerhere@gmail.com>"]
 rust-version  = "1.95"
 publish       = true
-description   = "Low-latency and predictable-latency, zero-jitter HFT data-pipeline transport: io_uring proactor + self-implemented WS/TLS/HTTP."
-repository    = "https://github.com/fdrangersg/talaria"
-homepage      = "https://github.com/fdrangersg/talaria"
+description   = "Low-latency HFT transport toolkit for Linux: io_uring proactor plus WebSocket/TLS/HTTP building blocks."
+repository    = "https://github.com/fdrangersg/talaris"
+homepage      = "https://github.com/fdrangersg/talaris"
 documentation = "https://docs.rs/talaris"
 readme        = "README.md"
 keywords      = ["websocket", "io-uring", "tls", "network", "hft"]
 categories    = ["network-programming", "asynchronous"]
+exclude       = ["reports/**"]
 # 关掉 benches/ 的 auto-discover —— 共享 helper 住 benches/common/mod.rs 不是 target；
 # bench target 全部走下面的 [[bench]] 列表显式声明，方便配 `harness = false`。
 autobenches   = false

@@ -1,7 +1,7 @@
-//! io_uring proactor —— Stage F 骨架
+//! io_uring proactor —— low-level transport primitive
 //!
 //! 单 OS thread 驱动 [`super::ws::WsClient`] / [`super::tls::TlsAdapter`] /
-//! [`super::http`] 的字节口。详见仓库 `docs/plan.md` "Hot Path Anatomy"。
+//! [`super::http`] 的字节口。
 //!
 //! ## 为什么叫 Proactor（不是 Reactor）
 //!
@@ -20,15 +20,12 @@
 //! 态——既反映 io_uring + multishot recv + provided buffers + SQ_POLL 的完整
 //! Proactor 形态，也避免读 hot path 代码的人误以为是 readiness 模型。
 //!
-//! ## 分阶段
+//! ## Scope
 //!
-//! - **F1（当前）**：最小可用骨架。不开 `SQ_POLL` / multishot / fixed buffer /
-//!   `IOSQE_IO_LINK` / pin core。专注验证 SQE/CQE 语义跑通——能 connect、recv、
-//!   send、close 一条 TCP socket，user_data 编解码正确。
-//! - F2：把 socket + `TlsAdapter` + `WsClient` 三件套用 proactor 驱动起来。
-//! - F3：加 `SQ_POLL`、multishot recv、`IORING_REGISTER_BUFFERS`、
-//!   `IOSQE_IO_LINK` 链 send+recv、pin core。每条都要 benchmark 背书。
-//! - F4：`benchmarks/proactor/` loopback echo bench，目标 SQE→CQE P99 < 1µs。
+//! 当前实现覆盖 TCP connect / send / close、provided buffer ring、
+//! multishot recv、`SQ_POLL`、CPU affinity 和 `IOSQE_IO_LINK`，并作为
+//! `Pool` 的底层 IO 引擎。该模块也作为 toolkit API 暴露，方便用户绕开
+//! `Pool` 直接做 transport / framing benchmark 或 venue-specific staging。
 //!
 //! ## 平台
 //!
