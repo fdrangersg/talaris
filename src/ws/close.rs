@@ -114,7 +114,10 @@ mod tests {
 
     #[test]
     fn one_byte_is_protocol_error() {
-        assert_eq!(parse_close_payload(&[0x03]).unwrap_err(), CloseError::OneByte);
+        assert_eq!(
+            parse_close_payload(&[0x03]).unwrap_err(),
+            CloseError::OneByte
+        );
     }
 
     #[test]

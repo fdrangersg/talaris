@@ -17,13 +17,13 @@
 //!
 //! Tokio 生态长期把 io_uring 抽象层也叫 `Reactor`（tokio-uring / glommio 等），
 //! 是 mio-based reactor 命名的历史延续，并非概念对的；我们这里用 `Proactor` 表
-//! 态——既反映 io_uring + multishot recv + provided buffers + SQ_POLL 的完整
+//! 态——既反映 io_uring + multishot recv + provided buffers 的完整
 //! Proactor 形态，也避免读 hot path 代码的人误以为是 readiness 模型。
 //!
 //! ## Scope
 //!
 //! 当前实现覆盖 TCP connect / send / close、SQ/CQ sizing、taskrun setup flags、
-//! provided buffer ring、multishot recv、`SQ_POLL`、CPU affinity 和 `IOSQE_IO_LINK`，
+//! provided buffer ring、multishot recv、CPU affinity 和 `IOSQE_IO_LINK`，
 //! 并作为 `Pool` 的底层 IO 引擎。该模块也作为 toolkit API 暴露，方便用户绕开
 //! `Pool` 直接做 transport / framing benchmark 或 venue-specific staging。
 //!

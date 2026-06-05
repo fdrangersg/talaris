@@ -1,9 +1,7 @@
 //! CPU affinity helper —— 把当前线程钉到指定 CPU
 //!
 //! 在 hot path 启动 [`super::Proactor`] 之前调一次，让 kernel scheduler 不再
-//! 把这条线程迁出。配合 SQ_POLL 用最佳：
-//! - User 线程钉一个 CPU（cache 稳定、TLB warm、no migration cost）
-//! - SQ_POLL kernel 线程钉另一个 CPU（不和 user 线程抢同一个 core）
+//! 把这条线程迁出，保持 cache / TLB / branch predictor 状态稳定。
 //!
 //! 生产部署还要做的（运维层，本 crate 不管）：
 //! - kernel cmdline `isolcpus=N` 把 CPU 隔出来不给普通 task

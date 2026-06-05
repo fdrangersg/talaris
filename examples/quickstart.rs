@@ -13,14 +13,14 @@
 //! 展示 3 件事：
 //!   1. 怎样把 talaris 加进 Cargo.toml 并 `use` 起来；
 //!   2. 怎样组装 [`talaris::Pool`] / [`talaris::connection::ConnectionConfig`]，
-//!      把 SQ_POLL 开起来；
-//!   3. 怎样把 user 线程钉到指定 CPU，让 io_uring kthread 跑在 sibling 上。
+//!      跑通一条 plain WebSocket 连接；
+//!   3. 怎样把 user 线程钉到指定 CPU，降低 scheduler migration 抖动。
 //!
 //! 运行：
 //!   ```bash
-//!   # 假设 CPU 1 / 5 是同一物理核的 SMT pair，且都被 isolcpus 隔离
+//!   # 假设 CPU 1 被 isolcpus 隔离
 //!   taskset -c 0-7 cargo run --release --example quickstart -- \
-//!       --user-cpu 1 --sq-poll-cpu 5
+//!       --user-cpu 1
 //!   ```
 //!
 //! 为了让例子离线、零依赖地跑通，这里在同进程内起一个最小 plain-WS echo
@@ -48,10 +48,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use talaris::ws::Event as WsEvent;
     use talaris::{Pool, PoolConfig};
 
-    // ── 0. 解析两个 CPU 编号 ─────────────────────────────────────────
-    // 极简 CLI：`--user-cpu N --sq-poll-cpu M`。失败时回退到 (1, 5)。
-    let (user_cpu, sq_poll_cpu) = parse_cpu_args();
-    eprintln!("[quickstart] user thread → CPU {user_cpu}, SQ_POLL kthread → CPU {sq_poll_cpu}");
+    // ── 0. 解析 user CPU 编号 ────────────────────────────────────────
+    // 极简 CLI：`--user-cpu N`。失败时回退到 1。
+    let user_cpu = parse_cpu_args();
+    eprintln!("[quickstart] user thread → CPU {user_cpu}");
     eprintln!(
         "[quickstart] 提示：进程父 affinity 必须覆盖目标 CPU，建议外面套 \
          `taskset -c 0-N`"
@@ -68,20 +68,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 2. 把 user 线程钉死在 user_cpu ───────────────────────────────
     // io_uring 的 user 端代码（Pool::pump、CQE drain）跑在这条线程上。在 hot
-    // loop 启动前 pin 一次，避开 scheduler migration 抖动；SQ_POLL kthread 由
-    // ConnectionConfig::with_sq_poll(.., Some(cpu)) 在 io_uring init 时钉。
+    // loop 启动前 pin 一次，避开 scheduler migration 抖动。
     pin_current_thread_to(user_cpu)?;
 
     // ── 3. 组装 ConnectionConfig ─────────────────────────────────────
     // 本地 echo 没 TLS，所以 with_tls(false)。生产对接交易所改回 true、port=443。
-    // SQ_POLL idle 10 秒 —— kthread 在 hot path 上 spin，超过 10 秒没新 SQE 才
-    // 进 sleep；下次 submit 自动 wakeup。
-    let cfg = ConnectionConfig::new("localhost", addr.port(), "/echo")
-        .with_tls(false)
-        .with_sq_poll(10_000, Some(sq_poll_cpu as u32));
+    let cfg = ConnectionConfig::new("localhost", addr.port(), "/echo").with_tls(false);
 
     // ── 4. 起 Pool 并阻塞 connect ───────────────────────────────────
-    // PoolConfig 透传 proactor 配置（entries / SQ_POLL）—— 直接复用 cfg 里的。
+    // PoolConfig 透传 proactor 配置（entries / CQ sizing / taskrun flags）。
     let mut pool = Pool::new(PoolConfig::new(cfg.proactor))?;
     let handle = pool.connect_blocking_to(cfg, addr)?;
     assert_eq!(pool.state(handle), Some(State::Open));
@@ -122,28 +117,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(target_os = "linux")]
-fn parse_cpu_args() -> (usize, usize) {
-    // 极简 --user-cpu / --sq-poll-cpu 解析。缺省 (1, 5) —— ripple-testnet-tokyo
-    // 上 CPU 1/5 是同一物理核的两条 SMT，且都在 isolcpus 隔离列表里。
+fn parse_cpu_args() -> usize {
+    // 极简 --user-cpu 解析。缺省 1。
     let mut user_cpu = 1_usize;
-    let mut sq_poll_cpu = 5_usize;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        match a.as_str() {
-            "--user-cpu" => {
-                if let Some(v) = args.next().and_then(|s| s.parse().ok()) {
-                    user_cpu = v;
-                }
+        if a.as_str() == "--user-cpu" {
+            if let Some(v) = args.next().and_then(|s| s.parse().ok()) {
+                user_cpu = v;
             }
-            "--sq-poll-cpu" => {
-                if let Some(v) = args.next().and_then(|s| s.parse().ok()) {
-                    sq_poll_cpu = v;
-                }
-            }
-            _ => {}
         }
     }
-    (user_cpu, sq_poll_cpu)
+    user_cpu
 }
 
 // ───────────────────────────────────────────────────────────────────────

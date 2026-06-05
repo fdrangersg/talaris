@@ -122,19 +122,6 @@ pub struct ProactorConfig {
     /// 可能比 SQE 多得多；建议从 `max(2 * sq_entries, buf_ring_entries)`
     /// 或更高开始 A/B。
     pub cq_entries: Option<u32>,
-    /// `Some(idle_ms)` 启用 `IORING_SETUP_SQPOLL`：kernel 起一条 SQ poll 线程持
-    /// 续扫 SubmissionQueue tail，submit 路径不走 `io_uring_enter` 系统调用。
-    /// 线程空转超过 `idle_ms` 毫秒后进入 sleep，下次 submit 时 user space
-    /// `io_uring_enter` 加 `IORING_ENTER_SQ_WAKEUP` 唤醒。
-    ///
-    /// 注意：
-    /// - 需要 `CAP_SYS_NICE`（5.11+ unprivileged 也可，看 kernel sysctl）
-    /// - kernel 线程独占 1 个 CPU 配额（idle 期间也轻量 spin）
-    /// - 与 [`sq_poll_cpu`](Self::sq_poll_cpu) 配合可固定 kernel 线程 CPU
-    pub sq_poll_idle_ms: Option<u32>,
-    /// `Some(cpu)` 把 SQ_POLL kernel 线程钉在指定 CPU。仅在
-    /// [`sq_poll_idle_ms`](Self::sq_poll_idle_ms) 启用时生效。
-    pub sq_poll_cpu: Option<u32>,
     /// 高级 setup flags。默认关闭。详见 [`ProactorSetupFlags`]。
     pub setup_flags: ProactorSetupFlags,
 }
@@ -144,8 +131,6 @@ impl Default for ProactorConfig {
         Self {
             sq_entries: 256,
             cq_entries: None,
-            sq_poll_idle_ms: None,
-            sq_poll_cpu: None,
             setup_flags: ProactorSetupFlags::NONE,
         }
     }
@@ -205,19 +190,12 @@ impl std::fmt::Debug for Proactor {
 }
 
 impl Proactor {
-    /// 构造一个 proactor。按 [`ProactorConfig`] 决定 ring size、SQ_POLL 和
-    /// taskrun setup flags。
+    /// 构造一个 proactor。按 [`ProactorConfig`] 决定 ring size 和 taskrun setup flags。
     pub fn new(config: ProactorConfig) -> Result<Self, ProactorError> {
         validate_config(config)?;
         let mut builder = IoUring::builder();
         if let Some(cq_entries) = config.cq_entries {
             builder.setup_cqsize(cq_entries);
-        }
-        if let Some(idle_ms) = config.sq_poll_idle_ms {
-            builder.setup_sqpoll(idle_ms);
-            if let Some(cpu) = config.sq_poll_cpu {
-                builder.setup_sqpoll_cpu(cpu);
-            }
         }
         apply_setup_flags(&mut builder, config.setup_flags);
         let ring = builder
@@ -439,10 +417,6 @@ impl Proactor {
 
     /// 把所有 pending SQE submit 给 kernel，并阻塞等至少 `wait_nr` 个 CQE。
     /// 返回实际 submit 的 SQE 数。`wait_nr = 0` 时不阻塞。
-    ///
-    /// **SQ_POLL 注意**：这条路径无论 wait_nr 是多少都会进 `io_uring_enter`
-    /// 系统调用，等于抹掉 SQ_POLL 的好处。如果 caller 想要 SQ_POLL 实际生效，
-    /// 用 [`submit`](Self::submit) + [`wait_for_cqe`](Self::wait_for_cqe) 拆开。
     pub fn submit_and_wait(&mut self, wait_nr: usize) -> Result<usize, ProactorError> {
         self.ring
             .submit_and_wait(wait_nr)
@@ -450,12 +424,6 @@ impl Proactor {
     }
 
     /// 仅 submit（不等 CQE）。返回 kernel 实际收到的 SQE 数。
-    ///
-    /// SQ_POLL 模式下：若 kthread 还在 spin，整个调用是 cacheline-store + 内存
-    /// 屏障（无 syscall）；只有 kthread 已经 idle、且 SQE 自然时 `SQ_NEED_WAKEUP`
-    /// flag 让本调用 enter syscall 唤醒它。
-    ///
-    /// 非 SQ_POLL 模式：等价于 `submit_and_wait(0)`。
     pub fn submit(&mut self) -> Result<usize, ProactorError> {
         self.ring
             .submitter()
@@ -467,9 +435,6 @@ impl Proactor {
     ///
     /// **非阻塞**：`wait_nr == 0` 永远不阻塞。
     /// **阻塞**：`wait_nr ≥ 1` 阻塞直到至少 N 个 CQE ready。
-    ///
-    /// SQ_POLL 模式下，wait 路径仍然要进 `io_uring_enter` 加
-    /// `IORING_ENTER_GETEVENTS` —— kernel 不会在 userspace 醒来时主动通知。
     pub fn wait_for_cqe(&mut self, wait_nr: usize) -> Result<usize, ProactorError> {
         if wait_nr == 0 {
             return Ok(0);

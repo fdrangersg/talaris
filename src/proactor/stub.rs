@@ -238,8 +238,6 @@ impl TcpSocket {
 pub struct ProactorConfig {
     pub sq_entries: u32,
     pub cq_entries: Option<u32>,
-    pub sq_poll_idle_ms: Option<u32>,
-    pub sq_poll_cpu: Option<u32>,
     pub setup_flags: ProactorSetupFlags,
 }
 
@@ -248,8 +246,6 @@ impl Default for ProactorConfig {
         Self {
             sq_entries: 256,
             cq_entries: None,
-            sq_poll_idle_ms: None,
-            sq_poll_cpu: None,
             setup_flags: ProactorSetupFlags::NONE,
         }
     }

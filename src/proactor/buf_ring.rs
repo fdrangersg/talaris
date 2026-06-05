@@ -143,10 +143,12 @@ impl BufferRing {
         let raw = unsafe { alloc_zeroed(ring_layout) };
         // PAGE_SIZE (4096) ≫ align_of::<BufRingEntry>() (8)，layout 已保证对齐。
         #[allow(clippy::cast_ptr_alignment)]
-        let ring_mem = NonNull::new(raw.cast::<BufRingEntry>()).ok_or(BufferRingError::AllocFailed)?;
+        let ring_mem =
+            NonNull::new(raw.cast::<BufRingEntry>()).ok_or(BufferRingError::AllocFailed)?;
 
-        let buf_storage: ManuallyDrop<Box<[u8]>> =
-            ManuallyDrop::new(vec![0_u8; usize::from(entries) * buf_size as usize].into_boxed_slice());
+        let buf_storage: ManuallyDrop<Box<[u8]>> = ManuallyDrop::new(
+            vec![0_u8; usize::from(entries) * buf_size as usize].into_boxed_slice(),
+        );
         let buf_base = buf_storage.as_ptr() as u64;
 
         // 初始化所有 entries：第 i 个 entry 指向 buf_storage[i*buf_size..(i+1)*buf_size]，bid = i
@@ -209,7 +211,11 @@ impl BufferRing {
     /// 如果 `bid >= entries`（bug：CQE 返回了未知 bid）。
     #[must_use]
     pub fn buffer(&self, bid: u16) -> &[u8] {
-        assert!(bid < self.entries, "bid {bid} out of range {}", self.entries);
+        assert!(
+            bid < self.entries,
+            "bid {bid} out of range {}",
+            self.entries
+        );
         let offset = usize::from(bid) * self.buf_size as usize;
         // SAFETY: bid < entries; buf_storage 长度 = entries * buf_size
         unsafe {
@@ -323,7 +329,9 @@ impl Drop for BufferRing {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::proactor::{Domain, OpKind, ProactorConfig, SockAddr, SqeFlags, TcpSocket, UserData};
+    use crate::proactor::{
+        Domain, OpKind, ProactorConfig, SockAddr, SqeFlags, TcpSocket, UserData,
+    };
     use std::io::Write;
     use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
     use std::thread;
@@ -356,7 +364,12 @@ mod tests {
         // SAFETY: sock_addr 跟函数同寿命
         unsafe {
             proactor
-                .submit_connect(fd, &sock_addr, UserData::new(OpKind::Connect, 0), SqeFlags::NONE)
+                .submit_connect(
+                    fd,
+                    &sock_addr,
+                    UserData::new(OpKind::Connect, 0),
+                    SqeFlags::NONE,
+                )
                 .unwrap();
         }
         proactor.submit_and_wait(1).unwrap();

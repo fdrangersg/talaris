@@ -380,9 +380,8 @@ impl Pool {
 
     /// Busy-poll 版本的 [`pump_data`](Self::pump_data)。
     ///
-    /// 配合 SQ_POLL 时，submit 路径通常也是 userspace store；本方法本身只轮询
-    /// mmap 出来的 CQ ring，不调用 [`Proactor::wait_for_cqe`]。代价是 caller 所在
-    /// 线程会在没有 CQE 时持续占 CPU。
+    /// 本方法只轮询 mmap 出来的 CQ ring，不调用 [`Proactor::wait_for_cqe`]。
+    /// 代价是 caller 所在线程会在没有 CQE 时持续占 CPU。
     ///
     /// 返回值表示这一轮是否处理到了任何 CQE 或 WS event。
     pub fn pump_data_spin<F>(&mut self, spin_iters: usize, sink: F) -> Result<bool, ConnectionError>
@@ -526,10 +525,9 @@ impl Pool {
             }
         }
 
-        // proactor submit + wait 拆开：SQ_POLL 模式下 submit() 多数是
-        // cacheline-store（不进 syscall），让 SQ_POLL 真发挥；wait_for_cqe(0) 是
-        // 纯 noop，wait_nr ≥ 1 才阻塞。失败 fatal —— io_uring 状态损坏没法 per-conn
-        // 隔离。
+        // submit pending send / rearm SQE, then wait only when requested.
+        // wait_for_cqe(0) 是纯 noop，wait_nr ≥ 1 才阻塞。失败 fatal ——
+        // io_uring 状态损坏没法 per-conn 隔离。
         proactor.submit()?;
         proactor.wait_for_cqe(wait_nr)?;
 

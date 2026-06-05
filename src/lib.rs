@@ -7,7 +7,7 @@
 //! - [`ws`]         RFC 6455 client core（handshake / frame / mask / parser / fragmentation / control / close）
 //! - [`tls`]        rustls 字节驱动 adapter（ALPN http/1.1 requested + verified）
 //! - [`http`]       最小 HTTP/1.1 codec（WS upgrade request/response；无 REST client）
-//! - [`proactor`]   io_uring 原语：connect/recv/send/close、SQ/CQ sizing、SQ_POLL、taskrun flags、pin、provided BufferRing、multishot recv；暴露 IO_LINK flag
+//! - [`proactor`]   io_uring 原语：connect/recv/send/close、SQ/CQ sizing、taskrun flags、pin、provided BufferRing、multishot recv；暴露 IO_LINK flag
 //! - [`pool`]       单线程 multi-conn driver：1 个 proactor 驱动 N 条 WS；`pump_data` 只把 Text/Binary data 交给业务，control frame 仍走完整 WS 状态机
 //! - [`connection`] 公共配置 / 状态 / 错误类型
 //!

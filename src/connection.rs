@@ -114,7 +114,8 @@ pub struct ConnectionConfig {
     /// 的默认配置；私有 CA、session cache 或 crypto provider 调优可注入配置。
     pub tls_config: Option<Arc<rustls::ClientConfig>>,
     /// 构造 [`PoolConfig`](crate::PoolConfig) 时传给 [`Proactor::new`](crate::proactor::Proactor::new)。
-    /// HFT 部署可测试 SQ_POLL + CPU pinning；把 SQ_POLL kthread 放在 client 线程的 SMT sibling 是一个候选拓扑，不是无条件最优（[`with_sq_poll`](Self::with_sq_poll)）。
+    /// HFT 部署主要调 SQ/CQ 容量和 taskrun flags；线程 pinning 由
+    /// [`crate::proactor::pin_current_thread_to`] 单独控制。
     pub proactor: ProactorConfig,
     /// 本 conn 的路由 token。由 [`Pool`](crate::Pool) 在 `connect_blocking` 内分配；
     /// caller 直接构造时留默认 0 即可。低 28 位有效。
@@ -179,15 +180,7 @@ impl ConnectionConfig {
         self
     }
 
-    /// 启用 SQ_POLL + 可选钉 kthread CPU。详见 [`ProactorConfig`] doc。
-    #[must_use]
-    pub const fn with_sq_poll(mut self, idle_ms: u32, cpu: Option<u32>) -> Self {
-        self.proactor.sq_poll_idle_ms = Some(idle_ms);
-        self.proactor.sq_poll_cpu = cpu;
-        self
-    }
-
-    /// 覆盖 proactor 完整配置。适合统一注入 entries / SQ_POLL / CPU pinning。
+    /// 覆盖 proactor 完整配置。适合统一注入 entries / CQ sizing / taskrun flags。
     #[must_use]
     pub const fn with_proactor(mut self, proactor: ProactorConfig) -> Self {
         self.proactor = proactor;
