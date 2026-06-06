@@ -69,6 +69,9 @@ pub struct WsConfig {
     pub initial_tx_buffer_capacity: Option<usize>,
     /// 收到 Ping 时自动回 Pong（默认 true）
     pub auto_pong: bool,
+    /// Hot-path opt-in: trust server text payloads are valid UTF-8 and skip
+    /// per-frame validation before constructing `&str`.
+    assume_text_utf8: bool,
 }
 
 impl WsConfig {
@@ -85,6 +88,7 @@ impl WsConfig {
             initial_message_buffer_capacity: None,
             initial_tx_buffer_capacity: None,
             auto_pong: true,
+            assume_text_utf8: false,
         }
     }
 
@@ -136,6 +140,20 @@ impl WsConfig {
         self.auto_pong = on;
         self
     }
+
+    /// Skip UTF-8 validation for incoming Text messages.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee every server Text payload is valid UTF-8 for
+    /// the whole connection lifetime. If the peer sends invalid UTF-8 while
+    /// this option is enabled, constructing `&str` with unchecked conversion is
+    /// undefined behavior.
+    #[must_use]
+    pub const unsafe fn with_assume_text_utf8_unchecked(mut self, on: bool) -> Self {
+        self.assume_text_utf8 = on;
+        self
+    }
 }
 
 /// 当前连接状态
@@ -156,7 +174,7 @@ pub enum ConnState {
 pub enum Event<'a> {
     /// handshake 完，可以发数据了
     HandshakeComplete,
-    /// 完整 text 消息（UTF-8 已校验）
+    /// 完整 text 消息（UTF-8 已校验，或由 unsafe config 显式承诺）
     Text(&'a str),
     /// 完整 binary 消息
     Binary(&'a [u8]),
@@ -171,7 +189,7 @@ pub enum Event<'a> {
 /// 只包含业务 data message 的轻量事件。
 #[derive(Debug)]
 pub enum DataEvent<'a> {
-    /// 完整 text 消息（UTF-8 已校验）
+    /// 完整 text 消息（UTF-8 已校验，或由 unsafe config 显式承诺）
     Text(&'a str),
     /// 完整 binary 消息
     Binary(&'a [u8]),
@@ -445,7 +463,7 @@ impl WsClient {
         let payload = &self.recv_buf.as_slice()[header_len..payload_end];
         let kind = match header.opcode {
             OpCode::Text => {
-                if std::str::from_utf8(payload).is_err() {
+                if !self.config.assume_text_utf8 && std::str::from_utf8(payload).is_err() {
                     self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
                     return Err(WsError::Utf8Invalid);
                 }
@@ -634,7 +652,12 @@ impl WsClient {
             let payload = &bytes[header_len..frame_len];
             match header.opcode {
                 OpCode::Text => {
-                    let text = if let Ok(text) = std::str::from_utf8(payload) {
+                    let text = if self.config.assume_text_utf8 {
+                        // SAFETY: Enabled only through `unsafe`
+                        // `WsConfig::with_assume_text_utf8_unchecked`, whose
+                        // caller promises all server text payloads are UTF-8.
+                        unsafe { std::str::from_utf8_unchecked(payload) }
+                    } else if let Ok(text) = std::str::from_utf8(payload) {
                         text
                     } else {
                         self.recv_buf.consume(consumed);
@@ -737,10 +760,17 @@ impl WsClient {
             let payload = &bytes[header_len..frame_len];
             match header.opcode {
                 OpCode::Text => {
-                    let text = std::str::from_utf8(payload).map_err(|_| {
-                        self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
-                        WsError::Utf8Invalid
-                    })?;
+                    let text = if self.config.assume_text_utf8 {
+                        // SAFETY: Enabled only through `unsafe`
+                        // `WsConfig::with_assume_text_utf8_unchecked`, whose
+                        // caller promises all server text payloads are UTF-8.
+                        unsafe { std::str::from_utf8_unchecked(payload) }
+                    } else {
+                        std::str::from_utf8(payload).map_err(|_| {
+                            self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
+                            WsError::Utf8Invalid
+                        })?
+                    };
                     sink(DataEvent::Text(text));
                 }
                 OpCode::Binary => sink(DataEvent::Binary(payload)),
@@ -1041,7 +1071,7 @@ impl WsClient {
 
         match msg_opcode {
             OpCode::Text => {
-                if std::str::from_utf8(&self.msg_buf).is_err() {
+                if !self.config.assume_text_utf8 && std::str::from_utf8(&self.msg_buf).is_err() {
                     self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
                     return Err(WsError::Utf8Invalid);
                 }
@@ -1135,16 +1165,30 @@ impl WsClient {
         match kind {
             EmitKind::HandshakeComplete => Event::HandshakeComplete,
             EmitKind::Text => {
-                // utf-8 已在 on_frame_end 校验
-                let s = std::str::from_utf8(&self.msg_buf).unwrap_or("");
+                let s = if self.config.assume_text_utf8 {
+                    // SAFETY: Enabled only through `unsafe`
+                    // `WsConfig::with_assume_text_utf8_unchecked`, whose caller
+                    // promises all server text payloads are UTF-8.
+                    unsafe { std::str::from_utf8_unchecked(&self.msg_buf) }
+                } else {
+                    // utf-8 已在 on_frame_end 校验
+                    std::str::from_utf8(&self.msg_buf).unwrap_or("")
+                };
                 Event::Text(s)
             }
             EmitKind::Binary => Event::Binary(&self.msg_buf),
             EmitKind::BorrowedText => {
                 let payload = self.borrowed_payload();
-                // utf-8 已在 try_emit_borrowed_data 校验
-                let s = std::str::from_utf8(payload)
-                    .unwrap_or_else(|_| unreachable!("borrowed text must retain valid utf-8"));
+                let s = if self.config.assume_text_utf8 {
+                    // SAFETY: Enabled only through `unsafe`
+                    // `WsConfig::with_assume_text_utf8_unchecked`, whose caller
+                    // promises all server text payloads are UTF-8.
+                    unsafe { std::str::from_utf8_unchecked(payload) }
+                } else {
+                    // utf-8 已在 try_emit_borrowed_data 校验
+                    std::str::from_utf8(payload)
+                        .unwrap_or_else(|_| unreachable!("borrowed text must retain valid utf-8"))
+                };
                 Event::Text(s)
             }
             EmitKind::BorrowedBinary => Event::Binary(self.borrowed_payload()),

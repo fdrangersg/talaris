@@ -137,6 +137,7 @@ mod linux {
         sq_entries: u32,
         cq_entries: u32,
         read_timeout_ms: u64,
+        assume_text_utf8: bool,
     }
 
     impl BenchConfig {
@@ -154,6 +155,7 @@ mod linux {
                 sq_entries: common::arg_or("--sq-entries", DEFAULT_SQ_ENTRIES),
                 cq_entries: common::arg_or("--cq-entries", DEFAULT_CQ_ENTRIES),
                 read_timeout_ms: common::arg_or("--read-timeout-ms", DEFAULT_READ_TIMEOUT_MS),
+                assume_text_utf8: common::flag_present("--assume-text-utf8"),
             }
         }
 
@@ -170,7 +172,7 @@ mod linux {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(
                 f,
-                "live_ws_latency transport={} seconds={} endpoint=wss://{}:{}{} user_cpu={:?} buf={}x{} sq_entries={} cq_entries={} read_timeout_ms={}",
+                "live_ws_latency transport={} seconds={} endpoint=wss://{}:{}{} user_cpu={:?} buf={}x{} sq_entries={} cq_entries={} read_timeout_ms={} assume_text_utf8={}",
                 self.transport,
                 self.seconds,
                 self.host,
@@ -181,7 +183,8 @@ mod linux {
                 self.buf_size,
                 self.sq_entries,
                 self.cq_entries,
-                self.read_timeout_ms
+                self.read_timeout_ms,
+                self.assume_text_utf8
             )
         }
     }
@@ -498,16 +501,21 @@ mod linux {
         proactor.submit()?;
 
         let mut tls = TlsAdapter::new_client(&config.host)?;
-        let mut ws = WsClient::new_client(
-            WsConfig::new(config.host.clone(), config.path.clone())
-                .with_max_message_size(DEFAULT_MAX_MESSAGE_SIZE)
-                .with_max_frame_payload(DEFAULT_MAX_FRAME_PAYLOAD)
-                .with_initial_buffer_capacities(
-                    DEFAULT_WS_RECV_CAPACITY,
-                    DEFAULT_WS_MESSAGE_CAPACITY,
-                    DEFAULT_WS_TX_CAPACITY,
-                ),
-        )?;
+        let mut ws_config = WsConfig::new(config.host.clone(), config.path.clone())
+            .with_max_message_size(DEFAULT_MAX_MESSAGE_SIZE)
+            .with_max_frame_payload(DEFAULT_MAX_FRAME_PAYLOAD)
+            .with_initial_buffer_capacities(
+                DEFAULT_WS_RECV_CAPACITY,
+                DEFAULT_WS_MESSAGE_CAPACITY,
+                DEFAULT_WS_TX_CAPACITY,
+            );
+        if config.assume_text_utf8 {
+            // SAFETY: Binance public stream JSON text frames are UTF-8. This
+            // benchmark flag measures the cost of avoiding duplicate UTF-8
+            // validation before the downstream JSON decoder reads the payload.
+            ws_config = unsafe { ws_config.with_assume_text_utf8_unchecked(true) };
+        }
+        let mut ws = WsClient::new_client(ws_config)?;
         let mut ciphertext = Vec::with_capacity(DEFAULT_WS_RECV_CAPACITY);
         tls.egress_plaintext(&[], &mut ciphertext)?;
         send_all_fd(fd, &ciphertext)?;
@@ -921,7 +929,7 @@ mod linux {
             "Usage: cargo bench --bench live_ws_latency -- \
              [--transport talaris|tungstenite|both] [--seconds N] \
              [--host fstream.binance.com] [--port 443] [--path /public/stream] \
-             [--subscribe JSON] [--user-cpu N]"
+             [--subscribe JSON] [--user-cpu N] [--assume-text-utf8]"
         );
         println!(
             "Latency marks are monotonic *_ns. transport_recv_ns is user-space recv completion/read return, not NIC hardware timestamp."
