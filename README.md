@@ -446,82 +446,42 @@ Tested on Linux 6.x with io_uring features: `SETUP_CQSIZE`, `SETUP_COOP_TASKRUN`
 
 ## Benchmark suite
 
-`benches/` 下面是分层 baseline，每层只比下一层多一个组件，方便归因延迟来源：
+`benches/` 下面是分层 baseline。它借鉴 tungstenite 的小 target 方式，但不照搬
+Criterion sampling：talaris 的 hot path 是长生命周期 io_uring `recv_multishot`
+和 CQE drain，不适合把一次 `pump_data` 包进短采样 iteration。
+
+这些 bench 只在 Linux 上运行；非 Linux 只打印 `skipped`，用于保持本地
+`cargo check --benches` 可用。
 
 | bench | 测什么 |
 |---|---|
-| `ws_framing` | 纯 CPU 帧编解码（mask / encode_header / parse_header / compute_accept） |
-| `ws_ingress_raw` | 绕开 Pool + WsClient, 直接 Proactor + BufferRing 收 Binary 帧 |
-| `ws_ingress_single` | Pool.pump vs Pool.pump_data vs tokio (单 conn, 稳态满速) |
-| `ws_ingress_fanout` | N ∈ {1,4,16,64} 条 conn 同时收 (talaris Pool 路由 vs tokio N task) |
-| `ws_ingress_tls` | loopback WSS：talaris、fair tokio rustls + 同一 WsClient、tokio bare 下界、rustls unbuffered probe、软件 kTLS probe |
-| `binance_live` | Binance Spot 公共 WSS 实盘 TLS ingress：多 symbol 高频 Text JSON 行情 |
-| `binance_futures_live` | Binance USD-M perpetual 实盘行情：BBO / L2 depth / public trade 分频道报告样本量、CPU/frame 和 tail lag |
+| `framing` | 纯 inbound CPU：`parse_header`、`FrameParser`、`WsClient::drain_data_events` |
+| `buffer` | `WsClient::feed_recv` + `drain_data_events`，比较不同 chunk size / frame boundary |
+| `ingress` | loopback plain WS，`Pool::pump_data` 驱动 io_uring multishot recv + provided buffer ring |
+| `e2e` | loopback echo sanity，单 outstanding binary message；包含 outbound，不代表 hot path |
 
 跑法：
 ```bash
-taskset -c 0-7 cargo bench --bench ws_ingress_single -- \
-    --seconds 5 --payload 400 --buf-size 8192
+taskset -c 0-7 cargo bench --bench framing -- \
+    --frames 1000000 --payloads 64,256,1024
 
-taskset -c 0-7 cargo bench --bench ws_ingress_tls -- \
-    --frames 50000000 --payload 256 --sample-every 0 \
-    --server-cpu 4 --talaris-cpu 1 --tokio-cpu 2 \
-    --spin-iters 256 --buf-size 4096 --buf-entries 256 \
-    --sq-entries 256 --cq-entries 1024 --taskrun default
+taskset -c 0-7 cargo bench --bench buffer -- \
+    --frames 1000000 --payload 256 --chunk-sizes 128,512,4096,65536
 
-taskset -c 0-7 cargo bench --bench ws_ingress_tls -- \
-    --frames 10000000 --payload 256 --sample-every 0 \
-    --server-cpu 4 --talaris-cpu 1 --tokio-cpu 2 \
-    --spin-iters 256 --buf-size 4096 --buf-entries 256 \
-    --sq-entries 256 --cq-entries 1024 --taskrun defer-flag \
-    --ingress-stats true
+taskset -c 0-7 cargo bench --bench ingress -- \
+    --frames 10000000 --payload 64 \
+    --buf-size 4096 --buf-entries 256 \
+    --spin-iters 256 --sample-every 0 \
+    --user-cpu 1 --server-cpu 4
 
-taskset -c 0-7 cargo bench --bench binance_live -- \
-    --seconds 30 --warmup-seconds 5 --user-cpu 1
-
-taskset -c 0-7 cargo bench --bench binance_futures_live -- \
-    --seconds 60 --warmup-seconds 10 --symbols btcusdt,ethusdt \
-    --talaris-pump spin --talaris-cpu 1 --tokio-cpu 2 \
-    --buf-size 8192 --buf-entries 256 --sq-entries 256 --cq-entries 1024
+taskset -c 0-7 cargo bench --bench e2e -- \
+    --messages 10000 --payload 64 \
+    --buf-size 4096 --buf-entries 256 \
+    --user-cpu 1 --server-cpu 4
 ```
 
-`ws_ingress_tls` 的 `--sample-every 0` 用于测吞吐，避免逐帧 `Instant::now()` 污染结果；
-测相邻帧 delivery jitter 时改成 `--sample-every 1`。fair tokio 组复用同一个
-`WsClient`，用来隔离 IO/TLS 驱动开销；bare 组只是理论下界，不是功能等价实现。
-
-Linux 软件 kTLS 组只用于判断 ceiling，不是生产 transport 路径。kTLS RX 的 control
-record 必须经 `recvmsg` ancillary data 处理；完整生产实现还要处理 TLS 1.3 KeyUpdate
-和 session ticket。是否值得引入这条复杂路径，必须先在部署机器上跑 probe。
-
-### TLS ingress batching 实验结论
-
-东京测试机 Linux 6.17、256 B payload、`4 KiB × 256` buf ring 的 1000 万帧统计：
-普通 multishot recv 已达到约 `3.87 KiB/CQE`，`ENOBUFS` 通常接近 `0`。扩大到
-`16 KiB × 256` 后约 `13.1 KiB/CQE`，但 5000 万帧长跑没有稳定吞吐收益，说明 CQE
-路由不是当前 TLS hot path 的主要瓶颈。
-
-Linux 6.10+ `IORING_RECVSEND_BUNDLE` 也做过原型验证，但内核会无上限地合并当前
-可用 provided buffers。本机观察到平均约 `134-217 slots/CQE`，即
-`0.55-0.89 MiB/CQE`，吞吐和交付粒度都变差，因此没有保留生产开关。rustls
-unbuffered API 也保留为 benchmark-only probe；当前稳态不优于 buffered 路径。
-
-有界、record-aware staging 也已完成 A/B：最多只缓存一条未完成 TLS record，观测到
-高水位 `16,406 B`。但 `4 KiB` CQE 下 `158,748 / 158,753` 条 record 都需要 staging，
-等价于复制几乎 `100%` 的密文。即使把 ring 加深到 `1024` entries 消除 `ENOBUFS`，
-逐帧 jitter 对照仍从 `10.88 M frame/s, p99=3.09 us` 退化到
-`9.93 M frame/s, p99=3.59 us`，因此实现已删除。
-
-保留下来的是更窄的优化：`pump_data` 只在 rustls 确实产出 plaintext 后 drain
-WebSocket。一次 `1000 万帧` spin 诊断里，`650,865` 次 CQE 中有 `492,096` 次可跳过
-空 drain。此优化减少无效工作，但东京机 `5000 万帧`、统计关闭的长跑仍为
-`12.08 M frame/s`，低于 fair tokio 同 `WsClient` 的 `14.84 M frame/s`；当前树不能
-宣称吞吐已经超过 tokio。
-
-相关上游语义见
-[io-uring 6.10 bundle 说明](https://github.com/axboe/liburing/wiki/What%27s-new-with-io_uring-in-6.10)
-和 [rustls unbuffered state machine](https://github.com/rustls/rustls/blob/main/rustls/src/conn/unbuffered.rs)。
-
-实测数据见 `src/connection.rs::ConnectionConfig::with_buf_ring` 的 doc。
+`ingress --sample-every 0` 用于测吞吐，避免逐帧 `Instant::now()` 污染结果；
+需要观察相邻帧 delivery gap 时再设为正数，例如 `--sample-every 1`。
 
 ---
 
