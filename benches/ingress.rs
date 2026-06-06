@@ -84,8 +84,9 @@ mod linux {
         while frames < target_frames {
             let result = if spin_iters == 0 {
                 pool.pump_data(|_, ev| {
-                    count_event(
-                        ev,
+                    let payload = event_payload(ev);
+                    count_payload(
+                        payload,
                         &mut frames,
                         &mut bytes,
                         &mut checksum,
@@ -97,8 +98,9 @@ mod linux {
                 .map(|()| true)
             } else {
                 pool.pump_data_spin(spin_iters, |_, ev| {
-                    count_event(
-                        ev,
+                    let payload = event_payload(ev);
+                    count_payload(
+                        payload,
                         &mut frames,
                         &mut bytes,
                         &mut checksum,
@@ -139,8 +141,15 @@ mod linux {
         (64 * 1024 / approximate_frame_len).max(1)
     }
 
-    fn count_event(
-        ev: DataEvent<'_>,
+    fn event_payload(ev: DataEvent<'_>) -> &[u8] {
+        match ev {
+            DataEvent::Binary(payload) => payload,
+            DataEvent::Text(text) => text.as_bytes(),
+        }
+    }
+
+    fn count_payload(
+        payload: &[u8],
         frames: &mut u64,
         bytes: &mut u64,
         checksum: &mut u64,
@@ -148,10 +157,6 @@ mod linux {
         last_sample: &mut Option<Instant>,
         sample_every: u64,
     ) {
-        let payload = match ev {
-            DataEvent::Binary(payload) => payload,
-            DataEvent::Text(text) => text.as_bytes(),
-        };
         *frames += 1;
         *bytes += payload.len() as u64;
         if let Some(first) = payload.first() {
