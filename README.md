@@ -446,12 +446,19 @@ Tested on Linux 6.x with io_uring features: `SETUP_CQSIZE`, `SETUP_COOP_TASKRUN`
 
 ## Benchmark suite
 
-`benches/` 下面是分层 baseline。它借鉴 tungstenite 的小 target 方式，但不照搬
-Criterion sampling：talaris 的 hot path 是长生命周期 io_uring `recv_multishot`
-和 CQE drain，不适合把一次 `pump_data` 包进短采样 iteration。
+`benches/` 下面是 Linux-only 分层 baseline。它借鉴 tungstenite 的小 target
+方式，但不照搬 Criterion sampling：talaris 的 hot path 是长生命周期
+io_uring `recv_multishot` 和 CQE drain，不适合把一次 `pump_data` 包进短采样
+iteration。非 Linux 只打印 `skipped`，用于保持本地 `cargo check --benches`
+可用。
 
-这些 bench 只在 Linux 上运行；非 Linux 只打印 `skipped`，用于保持本地
-`cargo check --benches` 可用。
+测试环境：
+
+- Host: `ripple-testnet-tokyo`
+- Kernel: Linux `6.17.0-1012-aws`
+- Rust: `rustc 1.95.0`
+- CPU: 使用测试机 isolated CPU，bench 进程 `taskset -c 0-2`；`ingress` / `e2e`
+  pin user thread 到 CPU 1、server thread 到 CPU 2。
 
 | bench | 测什么 |
 |---|---|
@@ -461,31 +468,55 @@ Criterion sampling：talaris 的 hot path 是长生命周期 io_uring `recv_mult
 | `ingress` | loopback plain WS，`Pool::pump_data` 驱动 io_uring multishot recv + provided buffer ring |
 | `e2e` | loopback echo smoke / latency sanity，单 outstanding binary message；包含 outbound，不代表 hot path |
 
-跑法：
+跑法示例：
 ```bash
-taskset -c 0-7 cargo bench --bench framing -- \
+taskset -c 0-2 cargo bench --bench framing -- \
     --frames 1000000 --payloads 64,256,1024
 
-taskset -c 0-7 cargo bench --bench read -- \
+taskset -c 0-2 cargo bench --bench read -- \
     --messages 100000 --chunk-size 4096
 
-taskset -c 0-7 cargo bench --bench ws_chunking -- \
+taskset -c 0-2 cargo bench --bench ws_chunking -- \
     --frames 1000000 --payload 256 --chunk-sizes 128,512,4096,65536
 
-taskset -c 0-7 cargo bench --bench ingress -- \
+taskset -c 0-2 cargo bench --bench ingress -- \
     --frames 10000000 --payload 64 \
     --buf-size 4096 --buf-entries 256 \
     --spin-iters 256 --sample-every 0 \
-    --user-cpu 1 --server-cpu 4
+    --user-cpu 1 --server-cpu 2
 
-taskset -c 0-7 cargo bench --bench e2e -- \
+taskset -c 0-2 cargo bench --bench e2e -- \
     --messages 10000 --payload 64 \
     --buf-size 4096 --buf-entries 256 \
-    --user-cpu 1 --server-cpu 4
+    --user-cpu 1 --server-cpu 2
 ```
 
 `ingress --sample-every 0` 用于测吞吐，避免逐帧 `Instant::now()` 污染结果；
 需要观察相邻帧 delivery gap 时再设为正数，例如 `--sample-every 1`。
+
+### Tungstenite 对比
+
+同机对比不要直接拿本机 tungstenite Criterion 结果和测试机 talaris 结果横比。
+当前采用一个临时 strict compare harness：
+
+- 同一台 `ripple-testnet-tokyo`
+- 同一 `taskset -c 0-2`
+- 同一份 prebuilt wire
+- 同一 workload：`100k` mixed messages，`1/3` binary `u64`，`2/3` text
+  `{"id":i}`，sink 内 parse/sum
+- 同一 chunk size：`4096`
+- tungstenite 仓库不提交改动；临时 harness 通过 path dependency 调用
+  `~/tungstenite-rs`
+
+结果：
+
+| impl | time / 100k msg | ns/msg | msg/s |
+|---|---:|---:|---:|
+| `talaris` | `1.57-1.66 ms` | `15-16` | `60-63M` |
+| `tungstenite` | `7.63-7.94 ms` | `76-79` | `12.6-13.1M` |
+
+这个结论只覆盖我们关心的 client inbound decode/dispatch hot path；`e2e`、
+outbound、TLS、大 payload 等场景需要单独 benchmark，不能外推。
 
 ---
 
