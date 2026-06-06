@@ -164,7 +164,7 @@ pool.pump_data(|handle, data| match data {
 
 ```toml
 [dependencies]
-talaris = "0.1"
+talaris = "0.2"
 ```
 
 ### 可运行 quickstart: 本地 plain-WS echo

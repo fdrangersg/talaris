@@ -2,7 +2,7 @@
 //!
 //! io_uring proactor + 自实现 WS (RFC 6455) + TLS + HTTP/1.1 codec。
 //!
-//! ## 当前 v0.1 scope
+//! ## 当前 v0.2 scope
 //!
 //! - [`ws`]         RFC 6455 client core（handshake / frame / mask / parser / fragmentation / control / close）
 //! - [`tls`]        rustls 字节驱动 adapter（ALPN http/1.1 requested + verified）
@@ -17,7 +17,7 @@
 //! WebSocket client wrapper。`Pool` / `ConnectionConfig` 是推荐入口；`ws`、
 //! `proactor`、`http`、`tls` 模块也有意公开，供需要自己组合 framing /
 //! transport、做 benchmark A/B 或接入 venue-specific codec 的用户使用。
-//! v0.1 期间底层 API 会随实盘 benchmark 结果继续演进。
+//! v0.2 期间底层 API 会随实盘 benchmark 结果继续演进。
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::borrow_as_ptr)]
