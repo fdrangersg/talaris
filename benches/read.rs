@@ -58,7 +58,7 @@ mod linux {
         let counts = run_read(&mixed);
         assert_eq!(counts.sum, mixed.expected_sum);
         assert_eq!(counts.messages, mixed.messages);
-        print_row("read 100k mixed messages", counts, mixed.payload_bytes);
+        print_row("read 100k mixed messages", &counts, mixed.payload_bytes);
     }
 
     fn build_mixed_wire(messages: usize) -> MixedWire {
@@ -142,7 +142,7 @@ mod linux {
         id.parse().expect("id parses")
     }
 
-    fn print_row(name: &str, counts: Counts, payload_bytes: u64) {
+    fn print_row(name: &str, counts: &Counts, payload_bytes: u64) {
         println!(
             "{name:<34} {:>14} {:>11.3} {:>11.3} {:>11.0} {:>12.1} {:>9}",
             common::fmt_int(counts.messages),
