@@ -467,6 +467,7 @@ iteration。非 Linux 只打印 `skipped`，用于保持本地 `cargo check --be
 | `ws_chunking` | `WsClient::feed_recv` + `drain_data_events`，比较不同 chunk size / frame boundary；不是纯 buffer copy bench |
 | `ingress` | loopback plain WS，`Pool::pump_data` 驱动 io_uring multishot recv + provided buffer ring |
 | `e2e` | loopback echo smoke / latency sanity，单 outstanding binary message；包含 outbound，不代表 hot path |
+| `live_ws_latency` | live TLS WebSocket transport latency：`talaris` low-level driver vs `tungstenite`，统计 recv/read → TLS/WS → payload sink |
 
 跑法示例：
 ```bash
@@ -489,10 +490,22 @@ taskset -c 0-2 cargo bench --bench e2e -- \
     --messages 10000 --payload 64 \
     --buf-size 4096 --buf-entries 256 \
     --user-cpu 1 --server-cpu 2
+
+taskset -c 0-2 cargo bench --bench live_ws_latency -- \
+    --transport both --seconds 60 \
+    --host fstream.binance.com --path /public/stream \
+    --subscribe '{"id":1,"method":"SUBSCRIBE","params":["btcusdt@bookTicker"]}' \
+    --user-cpu 1
 ```
 
 `ingress --sample-every 0` 用于测吞吐，避免逐帧 `Instant::now()` 污染结果；
 需要观察相邻帧 delivery gap 时再设为正数，例如 `--sample-every 1`。
+
+`live_ws_latency` 是公网 live feed benchmark，默认订阅 Binance USD-M public
+`btcusdt@bookTicker`，但它只统计 transport/TLS/WS payload 可交付延迟，不解析
+交易所 JSON。`transport_recv_ns` 是用户态观察到 recv CQE / TCP read 返回的时间，
+不是 NIC 硬件 timestamp；同一 TCP/TLS chunk 内多条 WS message 会共享同一个
+transport timestamp。
 
 ### Tungstenite 对比
 

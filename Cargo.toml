@@ -42,6 +42,8 @@ io-uring = "0.7"
 [dev-dependencies]
 # bench 用：采样型延迟直方图。benchmark 只在 Linux 运行。
 hdrhistogram = "7"
+# live_ws_latency 对照用；TLS 仍由本 crate 直接使用 rustls 驱动。
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 
 # ─── profiles ───────────────────────────────────────────────────────────
 [profile.dev]
@@ -96,6 +98,10 @@ harness = false
 
 [[bench]]
 name    = "e2e"
+harness = false
+
+[[bench]]
+name    = "live_ws_latency"
 harness = false
 
 # ─── lints ──────────────────────────────────────────────────────────────
