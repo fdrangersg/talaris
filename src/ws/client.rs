@@ -593,11 +593,15 @@ impl WsClient {
                 return Ok((events, DirectDataResult::Drained));
             }
 
-            let (header, header_len) = match parse_header(bytes) {
-                Ok(Some(parsed)) => parsed,
-                Ok(None) => {
+            let header = match parse_server_data_header_fast(bytes) {
+                Ok(FastDataHeaderResult::Parsed(header)) => header,
+                Ok(FastDataHeaderResult::NeedMore) => {
                     self.recv_buf.consume(consumed);
                     return Ok((events, DirectDataResult::WaitForMore));
+                }
+                Ok(FastDataHeaderResult::Fallback) => {
+                    self.recv_buf.consume(consumed);
+                    return Ok((events, DirectDataResult::Fallback));
                 }
                 Err(e) => {
                     self.recv_buf.consume(consumed);
@@ -606,31 +610,13 @@ impl WsClient {
                 }
             };
 
-            if header.mask.is_some() {
-                self.recv_buf.consume(consumed);
-                self.queue_close(
-                    CloseCode::ProtocolError.as_u16(),
-                    "server sent masked frame",
-                );
-                return Err(WsError::Frame(FrameError::ServerSentMaskedFrame));
-            }
-            if !header.fin || !matches!(header.opcode, OpCode::Text | OpCode::Binary) {
-                self.recv_buf.consume(consumed);
-                return Ok((events, DirectDataResult::Fallback));
-            }
-            if header.payload_len > self.config.max_frame_payload {
+            if header.payload_len_u64 > self.config.max_frame_payload {
                 self.recv_buf.consume(consumed);
                 self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
                 return Err(WsError::MessageTooLarge);
             }
 
-            let payload_len = if let Ok(payload_len) = usize::try_from(header.payload_len) {
-                payload_len
-            } else {
-                self.recv_buf.consume(consumed);
-                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                return Err(WsError::MessageTooLarge);
-            };
+            let payload_len = header.payload_len;
             if payload_len > self.config.max_message_size {
                 self.recv_buf.consume(consumed);
                 self.queue_close(
@@ -639,7 +625,7 @@ impl WsClient {
                 );
                 return Err(WsError::MessageTooLarge);
             }
-            let Some(frame_len) = header_len.checked_add(payload_len) else {
+            let Some(frame_len) = header.header_len.checked_add(payload_len) else {
                 self.recv_buf.consume(consumed);
                 self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
                 return Err(WsError::MessageTooLarge);
@@ -649,7 +635,7 @@ impl WsClient {
                 return Ok((events, DirectDataResult::WaitForMore));
             }
 
-            let payload = &bytes[header_len..frame_len];
+            let payload = &bytes[header.header_len..frame_len];
             match header.opcode {
                 OpCode::Text => {
                     let text = if self.config.assume_text_utf8 {
@@ -700,13 +686,20 @@ impl WsClient {
                 return Ok((events, original_len, DirectDataResult::Drained));
             }
 
-            let (header, header_len) = match parse_header(bytes) {
-                Ok(Some(parsed)) => parsed,
-                Ok(None) => {
+            let header = match parse_server_data_header_fast(bytes) {
+                Ok(FastDataHeaderResult::Parsed(header)) => header,
+                Ok(FastDataHeaderResult::NeedMore) => {
                     return Ok((
                         events,
                         original_len - bytes.len(),
                         DirectDataResult::WaitForMore,
+                    ));
+                }
+                Ok(FastDataHeaderResult::Fallback) => {
+                    return Ok((
+                        events,
+                        original_len - bytes.len(),
+                        DirectDataResult::Fallback,
                     ));
                 }
                 Err(e) => {
@@ -715,29 +708,12 @@ impl WsClient {
                 }
             };
 
-            if header.mask.is_some() {
-                self.queue_close(
-                    CloseCode::ProtocolError.as_u16(),
-                    "server sent masked frame",
-                );
-                return Err(WsError::Frame(FrameError::ServerSentMaskedFrame));
-            }
-            if !header.fin || !matches!(header.opcode, OpCode::Text | OpCode::Binary) {
-                return Ok((
-                    events,
-                    original_len - bytes.len(),
-                    DirectDataResult::Fallback,
-                ));
-            }
-            if header.payload_len > self.config.max_frame_payload {
+            if header.payload_len_u64 > self.config.max_frame_payload {
                 self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
                 return Err(WsError::MessageTooLarge);
             }
 
-            let payload_len = usize::try_from(header.payload_len).map_err(|_| {
-                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                WsError::MessageTooLarge
-            })?;
+            let payload_len = header.payload_len;
             if payload_len > self.config.max_message_size {
                 self.queue_close(
                     CloseCode::MessageTooBig.as_u16(),
@@ -745,7 +721,7 @@ impl WsClient {
                 );
                 return Err(WsError::MessageTooLarge);
             }
-            let Some(frame_len) = header_len.checked_add(payload_len) else {
+            let Some(frame_len) = header.header_len.checked_add(payload_len) else {
                 self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
                 return Err(WsError::MessageTooLarge);
             };
@@ -757,7 +733,7 @@ impl WsClient {
                 ));
             }
 
-            let payload = &bytes[header_len..frame_len];
+            let payload = &bytes[header.header_len..frame_len];
             match header.opcode {
                 OpCode::Text => {
                     let text = if self.config.assume_text_utf8 {
@@ -1267,6 +1243,71 @@ enum DirectDataResult {
     Fallback,
 }
 
+#[derive(Debug)]
+struct FastDataHeader {
+    opcode: OpCode,
+    header_len: usize,
+    payload_len: usize,
+    payload_len_u64: u64,
+}
+
+#[derive(Debug)]
+enum FastDataHeaderResult {
+    Parsed(FastDataHeader),
+    NeedMore,
+    Fallback,
+}
+
+#[inline]
+fn parse_server_data_header_fast(buf: &[u8]) -> Result<FastDataHeaderResult, FrameError> {
+    if buf.len() < 2 {
+        return Ok(FastDataHeaderResult::NeedMore);
+    }
+
+    let b0 = buf[0];
+    let b1 = buf[1];
+    if (b0 & 0x70) != 0 {
+        return Err(FrameError::RsvBitsSet);
+    }
+    if (b1 & 0x80) != 0 {
+        return Err(FrameError::ServerSentMaskedFrame);
+    }
+    if (b0 & 0x80) == 0 {
+        return Ok(FastDataHeaderResult::Fallback);
+    }
+
+    let opcode = match b0 & 0x0F {
+        0x1 => OpCode::Text,
+        0x2 => OpCode::Binary,
+        0x0 | 0x8 | 0x9 | 0xA => return Ok(FastDataHeaderResult::Fallback),
+        other => return Err(FrameError::InvalidOpCode(other)),
+    };
+
+    let len7 = b1 & 0x7F;
+    let (header_len, payload_len, payload_len_u64) = match len7 {
+        0..=125 => (2_usize, usize::from(len7), u64::from(len7)),
+        126 => {
+            if buf.len() < 4 {
+                return Ok(FastDataHeaderResult::NeedMore);
+            }
+            let val = u16::from_be_bytes([buf[2], buf[3]]);
+            if val < 126 {
+                return Err(FrameError::NonMinimalPayloadLength);
+            }
+            (4_usize, usize::from(val), u64::from(val))
+        }
+        127 => return Ok(FastDataHeaderResult::Fallback),
+        _ => unreachable!("len7 is masked to 7 bits"),
+    };
+
+    Ok(FastDataHeaderResult::Parsed(FastDataHeader {
+        opcode,
+        header_len,
+        payload_len,
+        payload_len_u64,
+    }))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
@@ -1528,6 +1569,28 @@ mod tests {
             data,
             vec!["text:alpha".to_owned(), "binary:bravo".to_owned()]
         );
+        assert!(
+            c.recv_buf.is_empty(),
+            "complete direct frames should not copy"
+        );
+    }
+
+    #[test]
+    fn drain_data_events_from_ingress_dispatches_extended_16bit_text_frame() {
+        let mut c = mk_open_client();
+        let payload = vec![b'x'; 130];
+        let wire = server_text(&payload);
+
+        let mut text_len = 0_usize;
+        let events = c
+            .drain_data_events_from_ingress(&wire, |ev| match ev {
+                DataEvent::Text(s) => text_len = s.len(),
+                DataEvent::Binary(_) => panic!("unexpected binary"),
+            })
+            .unwrap();
+
+        assert_eq!(events, 1);
+        assert_eq!(text_len, payload.len());
         assert!(
             c.recv_buf.is_empty(),
             "complete direct frames should not copy"
