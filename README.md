@@ -456,16 +456,20 @@ Criterion sampling：talaris 的 hot path 是长生命周期 io_uring `recv_mult
 | bench | 测什么 |
 |---|---|
 | `framing` | 纯 inbound CPU：`parse_header`、`FrameParser`、`WsClient::drain_data_events` |
-| `buffer` | `WsClient::feed_recv` + `drain_data_events`，比较不同 chunk size / frame boundary |
+| `read` | 对齐 tungstenite `read 100k small messages (client)`：1/3 binary u64 + 2/3 text JSON，并在 sink 内 parse/sum |
+| `ws_chunking` | `WsClient::feed_recv` + `drain_data_events`，比较不同 chunk size / frame boundary；不是纯 buffer copy bench |
 | `ingress` | loopback plain WS，`Pool::pump_data` 驱动 io_uring multishot recv + provided buffer ring |
-| `e2e` | loopback echo sanity，单 outstanding binary message；包含 outbound，不代表 hot path |
+| `e2e` | loopback echo smoke / latency sanity，单 outstanding binary message；包含 outbound，不代表 hot path |
 
 跑法：
 ```bash
 taskset -c 0-7 cargo bench --bench framing -- \
     --frames 1000000 --payloads 64,256,1024
 
-taskset -c 0-7 cargo bench --bench buffer -- \
+taskset -c 0-7 cargo bench --bench read -- \
+    --messages 100000
+
+taskset -c 0-7 cargo bench --bench ws_chunking -- \
     --frames 1000000 --payload 256 --chunk-sizes 128,512,4096,65536
 
 taskset -c 0-7 cargo bench --bench ingress -- \

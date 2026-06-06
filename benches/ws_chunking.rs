@@ -11,7 +11,7 @@
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("buffer: skipped - talaris benches only run on Linux");
+    eprintln!("ws_chunking: skipped - talaris benches only run on Linux");
 }
 
 #[cfg(target_os = "linux")]
@@ -40,7 +40,7 @@ mod linux {
         let wire = common::encode_binary_frames(payload_len, frames);
 
         println!(
-            "buffer bench: WsClient feed_recv + drain_data_events, frames={}, payload={}B, wire={}B",
+            "ws_chunking bench: WsClient feed_recv + drain_data_events, frames={}, payload={}B, wire={}B",
             common::fmt_int(frames as u64),
             payload_len,
             common::fmt_int(wire.len() as u64)

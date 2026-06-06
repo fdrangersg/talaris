@@ -83,7 +83,11 @@ name    = "framing"
 harness = false
 
 [[bench]]
-name    = "buffer"
+name    = "read"
+harness = false
+
+[[bench]]
+name    = "ws_chunking"
 harness = false
 
 [[bench]]
