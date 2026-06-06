@@ -29,7 +29,7 @@ mod linux {
     use std::net::TcpListener;
     use std::time::Instant;
 
-    use talaris::connection::{ConnectionConfig, State};
+    use talaris::connection::{ConnectionConfig, ConnectionError, State};
     use talaris::ws::DataEvent;
     use talaris::{Pool, PoolConfig};
 
@@ -74,12 +74,12 @@ mod linux {
 
         let cpu = common::ThreadCpuTimer::start();
         let wall = Instant::now();
-        for _ in 0..messages {
+        for i in 0..messages {
             let sent_at = Instant::now();
             pool.send_binary(handle, &payload).expect("send binary");
             let mut got_echo = false;
             while !got_echo {
-                pool.pump_data(|_, ev| {
+                let result = pool.pump_data(|_, ev| {
                     let echoed = match ev {
                         DataEvent::Binary(payload) => payload,
                         DataEvent::Text(text) => text.as_bytes(),
@@ -90,8 +90,12 @@ mod linux {
                         checksum = checksum.wrapping_add(u64::from(*first));
                     }
                     got_echo = true;
-                })
-                .expect("pump data");
+                });
+                match result {
+                    Ok(()) => {}
+                    Err(ConnectionError::PeerClosed) if got_echo && i + 1 == messages => {}
+                    Err(e) => panic!("pump data: {e}"),
+                }
             }
             hist.record(common::duration_ns_u64(sent_at.elapsed()))
                 .expect("record rtt");
