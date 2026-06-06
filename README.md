@@ -507,6 +507,15 @@ taskset -c 0-2 cargo bench --bench live_ws_latency -- \
 不是 NIC 硬件 timestamp；同一 TCP/TLS chunk 内多条 WS message 会共享同一个
 transport timestamp。
 
+`live_ws_latency` 的主要拆分指标：
+
+- `recv_to_tls_plaintext_ns`：recv/read 观察点到 rustls 明文可见。
+- `plaintext_to_ws_payload_ns`：TLS 明文可见到完整 WS Text/Binary payload 可交付。
+- `payload_sink_ns`：payload 进入 bench sink 后的极小 checksum 工作。
+- `total_to_sink_ns`：recv/read 观察点到 sink 工作完成，不应解读为纯 parser 成本。
+- `messages_per_recv_cqe` / `messages_per_plaintext_chunk`：观察 live feed burst
+  是否把多条 WS message 批在同一个 recv CQE / TLS plaintext chunk 内。
+
 ### Tungstenite 对比
 
 同机对比不要直接拿本机 tungstenite Criterion 结果和测试机 talaris 结果横比。

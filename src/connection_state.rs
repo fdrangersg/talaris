@@ -21,7 +21,7 @@ use crate::proactor::{
     BufferRing, Completion, Domain, OpKind, Proactor, SockAddr, SqeFlags, TcpSocket, UserData,
 };
 use crate::tls::TlsAdapter;
-use crate::ws::{ConnState as WsConnState, WsClient, WsConfig};
+use crate::ws::{ConnState as WsConnState, DataEvent as WsDataEvent, WsClient, WsConfig};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum WsIngressState {
@@ -284,6 +284,37 @@ impl ConnectionState {
         }
     }
 
+    pub(crate) fn handle_completion_data<F>(
+        &mut self,
+        proactor: &mut Proactor,
+        c: Completion,
+        mut sink: F,
+    ) -> Result<usize, ConnectionError>
+    where
+        F: FnMut(WsDataEvent<'_>),
+    {
+        let kind = c
+            .user_data
+            .kind()
+            .ok_or_else(|| ConnectionError::UnknownOpKind(c.user_data.raw()))?;
+        match kind {
+            OpKind::Connect => {
+                self.on_connect_cqe(proactor, c)?;
+                Ok(0)
+            }
+            OpKind::Send => {
+                self.on_send_cqe(c)?;
+                Ok(0)
+            }
+            OpKind::Recv => self.on_recv_cqe_data(c, &mut sink),
+            OpKind::Close => {
+                self.state = State::Closed;
+                Ok(0)
+            }
+            OpKind::Nop => Ok(0),
+        }
+    }
+
     fn on_connect_cqe(
         &mut self,
         proactor: &mut Proactor,
@@ -433,6 +464,114 @@ impl ConnectionState {
         recv_result
     }
 
+    fn on_recv_cqe_data<F>(&mut self, c: Completion, sink: &mut F) -> Result<usize, ConnectionError>
+    where
+        F: FnMut(WsDataEvent<'_>),
+    {
+        if !c.has_more() {
+            self.multishot_armed = false;
+        }
+
+        let Some(bid) = c.buffer_id() else {
+            return match c.to_result() {
+                Ok(0) => {
+                    self.state = State::Closed;
+                    Err(ConnectionError::PeerClosed)
+                }
+                Ok(_) => Ok(0),
+                Err(e) if is_recv_buffer_ring_exhausted(&e) => {
+                    self.record_recv_ring_exhaustion();
+                    self.multishot_armed = false;
+                    tracing::warn!(
+                        conn_id = self.cfg.conn_id,
+                        bgid = self.buf_ring.as_ref().map_or(0, BufferRing::bgid),
+                        "recv multishot provided-buffer ring exhausted; will rearm next pump"
+                    );
+                    Ok(0)
+                }
+                Err(e) => Err(ConnectionError::RecvFailed(e)),
+            };
+        };
+
+        let n = c.to_result().map_err(ConnectionError::RecvFailed)?;
+
+        if n == 0 {
+            self.buf_ring
+                .as_mut()
+                .expect("buf_ring 应在 on_connect_cqe 注册")
+                .recycle(bid);
+            self.state = State::Closed;
+            return Err(ConnectionError::PeerClosed);
+        }
+
+        self.record_recv_data(n);
+        let bytes_ptr = self
+            .buf_ring
+            .as_ref()
+            .expect("buf_ring")
+            .buffer(bid)
+            .as_ptr();
+        // SAFETY: Same invariant as on_recv_cqe: the buffer is not recycled until
+        // recv_result is built, and Proactor is single-thread owned.
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(bytes_ptr, n) };
+
+        let recv_result = if let Some(tls) = &mut self.tls {
+            let ws = &mut self.ws;
+            let mut fed_plaintext = false;
+            let mut drained_events = 0_usize;
+            let mut ws_error = None;
+            tls.ingest_ciphertext(bytes, &mut self.tls_pending_out, |plaintext| {
+                ws.feed_recv(plaintext);
+                fed_plaintext = true;
+                match ws.drain_data_events(|ev| {
+                    drained_events = drained_events.saturating_add(1);
+                    sink(ev);
+                }) {
+                    Ok(_) => {}
+                    Err(e) if ws_error.is_none() => {
+                        ws_error = Some(e);
+                    }
+                    Err(_) => {}
+                }
+            })?;
+            if !tls.is_handshaking()
+                && matches!(self.state, State::TlsHandshake)
+                && !self.ws_handshake_begun
+            {
+                tls.verify_alpn()?;
+                self.state = State::WsHandshake;
+                self.ws.begin_handshake()?;
+                self.ws_handshake_begun = true;
+            }
+            if tls.received_close_notify() && !matches!(self.state, State::Closed | State::Closing)
+            {
+                self.state = State::Closing;
+            }
+            self.record_ws_data_drain_attempt(fed_plaintext);
+            match ws_error {
+                Some(e) => Err(ConnectionError::Ws(e)),
+                None => Ok(drained_events),
+            }
+        } else {
+            self.ws.feed_recv(bytes);
+            let mut drained_events = 0_usize;
+            let result = self
+                .ws
+                .drain_data_events(|ev| {
+                    drained_events = drained_events.saturating_add(1);
+                    sink(ev);
+                })
+                .map(|_| drained_events)
+                .map_err(ConnectionError::Ws);
+            self.record_ws_data_drain_attempt(true);
+            result
+        };
+
+        self.buf_ring.as_mut().expect("buf_ring").recycle(bid);
+
+        recv_result
+    }
+
     #[inline]
     fn record_recv_data(&mut self, bytes: usize) {
         if !self.cfg.track_ingress_stats {
@@ -450,12 +589,8 @@ impl ConnectionState {
         }
     }
 
-    /// Consume the plaintext-ingress hint for the data-only hot path and record
-    /// whether its per-CQE WebSocket drain can do useful work.
     #[inline]
-    pub(crate) fn take_ws_ingress_dirty_for_data_drain(&mut self) -> bool {
-        let dirty =
-            std::mem::replace(&mut self.ws_ingress, WsIngressState::Clean) == WsIngressState::Dirty;
+    fn record_ws_data_drain_attempt(&mut self, dirty: bool) {
         if self.cfg.track_ingress_stats {
             if dirty {
                 self.ingress_stats.ws_data_drains =
@@ -465,7 +600,6 @@ impl ConnectionState {
                     self.ingress_stats.ws_data_drain_skips.saturating_add(1);
             }
         }
-        dirty
     }
 
     /// Generic pump drains the WebSocket state machine unconditionally after a

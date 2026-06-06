@@ -207,6 +207,7 @@ mod linux {
     struct FrameMarks {
         transport_recv_ns: u64,
         tls_decode_start_ns: u64,
+        tls_plaintext_ready_ns: u64,
         ws_payload_ready_ns: u64,
         sink_ready_ns: u64,
     }
@@ -220,6 +221,16 @@ mod linux {
         fn tls_ws_ns(self) -> u64 {
             self.ws_payload_ready_ns
                 .saturating_sub(self.tls_decode_start_ns)
+        }
+
+        fn recv_to_tls_plaintext_ns(self) -> u64 {
+            self.tls_plaintext_ready_ns
+                .saturating_sub(self.transport_recv_ns)
+        }
+
+        fn plaintext_to_ws_payload_ns(self) -> u64 {
+            self.ws_payload_ready_ns
+                .saturating_sub(self.tls_plaintext_ready_ns)
         }
 
         fn payload_sink_ns(self) -> u64 {
@@ -242,8 +253,12 @@ mod linux {
         checksum: u64,
         transport_tls_ws_ns: hdrhistogram::Histogram<u64>,
         tls_ws_ns: hdrhistogram::Histogram<u64>,
+        recv_to_tls_plaintext_ns: hdrhistogram::Histogram<u64>,
+        plaintext_to_ws_payload_ns: hdrhistogram::Histogram<u64>,
         payload_sink_ns: hdrhistogram::Histogram<u64>,
         total_to_sink_ns: hdrhistogram::Histogram<u64>,
+        messages_per_recv_cqe: BatchStats,
+        messages_per_plaintext_chunk: BatchStats,
     }
 
     impl BenchReport {
@@ -258,8 +273,12 @@ mod linux {
                 checksum: 0,
                 transport_tls_ws_ns: common::sampled_hist(),
                 tls_ws_ns: common::sampled_hist(),
+                recv_to_tls_plaintext_ns: common::sampled_hist(),
+                plaintext_to_ws_payload_ns: common::sampled_hist(),
                 payload_sink_ns: common::sampled_hist(),
                 total_to_sink_ns: common::sampled_hist(),
+                messages_per_recv_cqe: BatchStats::new(),
+                messages_per_plaintext_chunk: BatchStats::new(),
             }
         }
 
@@ -268,6 +287,7 @@ mod linux {
             payload: &str,
             transport_recv_ns: u64,
             tls_decode_start_ns: u64,
+            tls_plaintext_ready_ns: u64,
             ws_payload_ready_ns: u64,
             clock: &BenchClock,
         ) {
@@ -277,6 +297,7 @@ mod linux {
                 payload.as_bytes(),
                 transport_recv_ns,
                 tls_decode_start_ns,
+                tls_plaintext_ready_ns,
                 ws_payload_ready_ns,
                 clock,
             );
@@ -287,6 +308,7 @@ mod linux {
             payload: &[u8],
             transport_recv_ns: u64,
             tls_decode_start_ns: u64,
+            tls_plaintext_ready_ns: u64,
             ws_payload_ready_ns: u64,
             clock: &BenchClock,
         ) {
@@ -296,6 +318,7 @@ mod linux {
                 payload,
                 transport_recv_ns,
                 tls_decode_start_ns,
+                tls_plaintext_ready_ns,
                 ws_payload_ready_ns,
                 clock,
             );
@@ -306,6 +329,7 @@ mod linux {
             payload: &[u8],
             transport_recv_ns: u64,
             tls_decode_start_ns: u64,
+            tls_plaintext_ready_ns: u64,
             ws_payload_ready_ns: u64,
             clock: &BenchClock,
         ) {
@@ -315,11 +339,18 @@ mod linux {
             let marks = FrameMarks {
                 transport_recv_ns,
                 tls_decode_start_ns,
+                tls_plaintext_ready_ns,
                 ws_payload_ready_ns,
                 sink_ready_ns,
             };
             let _ = self.transport_tls_ws_ns.record(marks.transport_tls_ws_ns());
             let _ = self.tls_ws_ns.record(marks.tls_ws_ns());
+            let _ = self
+                .recv_to_tls_plaintext_ns
+                .record(marks.recv_to_tls_plaintext_ns());
+            let _ = self
+                .plaintext_to_ws_payload_ns
+                .record(marks.plaintext_to_ws_payload_ns());
             let _ = self.payload_sink_ns.record(marks.payload_sink_ns());
             let _ = self.total_to_sink_ns.record(marks.total_to_sink_ns());
         }
@@ -341,8 +372,82 @@ mod linux {
                 &self.transport_tls_ws_ns,
             );
             print_latency_hist(self.transport, "tls_ws_ns", &self.tls_ws_ns);
+            print_latency_hist(
+                self.transport,
+                "recv_to_tls_plaintext_ns",
+                &self.recv_to_tls_plaintext_ns,
+            );
+            print_latency_hist(
+                self.transport,
+                "plaintext_to_ws_payload_ns",
+                &self.plaintext_to_ws_payload_ns,
+            );
             print_latency_hist(self.transport, "payload_sink_ns", &self.payload_sink_ns);
             print_latency_hist(self.transport, "total_to_sink_ns", &self.total_to_sink_ns);
+            self.messages_per_recv_cqe
+                .print(self.transport, "messages_per_recv_cqe");
+            self.messages_per_plaintext_chunk
+                .print(self.transport, "messages_per_plaintext_chunk");
+        }
+    }
+
+    #[derive(Debug)]
+    struct BatchStats {
+        samples: u64,
+        zero_samples: u64,
+        sum: u64,
+        max: u64,
+        positive: hdrhistogram::Histogram<u64>,
+    }
+
+    impl BatchStats {
+        fn new() -> Self {
+            Self {
+                samples: 0,
+                zero_samples: 0,
+                sum: 0,
+                max: 0,
+                positive: hdrhistogram::Histogram::new_with_bounds(1, 1_000_000, 3)
+                    .expect("batch histogram"),
+            }
+        }
+
+        fn record(&mut self, value: u64) {
+            self.samples = self.samples.saturating_add(1);
+            self.sum = self.sum.saturating_add(value);
+            self.max = self.max.max(value);
+            if value == 0 {
+                self.zero_samples = self.zero_samples.saturating_add(1);
+            } else {
+                let _ = self.positive.record(value);
+            }
+        }
+
+        fn print(&self, transport: &str, name: &str) {
+            let avg = if self.samples == 0 {
+                0.0
+            } else {
+                self.sum as f64 / self.samples as f64
+            };
+            if self.positive.is_empty() {
+                println!(
+                    "live_ws_latency_batch transport={transport} metric={name} samples={} zero_samples={} avg={avg:.3} max={}",
+                    self.samples, self.zero_samples, self.max
+                );
+                return;
+            }
+            println!(
+                "live_ws_latency_batch transport={} metric={} samples={} zero_samples={} avg={:.3} p50={} p90={} p99={} max={}",
+                transport,
+                name,
+                self.samples,
+                self.zero_samples,
+                avg,
+                self.positive.value_at_quantile(0.50),
+                self.positive.value_at_quantile(0.90),
+                self.positive.value_at_quantile(0.99),
+                self.max
+            );
         }
     }
 
@@ -443,13 +548,49 @@ mod linux {
                     return Err("talaris peer closed".into());
                 }
 
+                let frames_before_cqe = report.frames;
                 let bytes = &ring.buffer(bid)[..n];
                 let tls_decode_start_ns = clock.now_ns();
                 let mut fed_plaintext = false;
                 tls.ingest_ciphertext(bytes, &mut ciphertext, |plaintext| {
+                    let tls_plaintext_ready_ns = clock.now_ns();
+                    let frames_before_chunk = report.frames;
                     ws.feed_recv(plaintext);
                     fed_plaintext = true;
+                    if subscribed {
+                        ws.drain_data_events(|ev| match ev {
+                            TalarisDataEvent::Text(payload) => {
+                                let ws_payload_ready_ns = clock.now_ns();
+                                report.record_text(
+                                    payload,
+                                    transport_recv_ns,
+                                    tls_decode_start_ns,
+                                    tls_plaintext_ready_ns,
+                                    ws_payload_ready_ns,
+                                    &clock,
+                                );
+                            }
+                            TalarisDataEvent::Binary(payload) => {
+                                let ws_payload_ready_ns = clock.now_ns();
+                                report.record_binary(
+                                    payload,
+                                    transport_recv_ns,
+                                    tls_decode_start_ns,
+                                    tls_plaintext_ready_ns,
+                                    ws_payload_ready_ns,
+                                    &clock,
+                                );
+                            }
+                        })
+                        .expect("talaris ws data drain");
+                    }
+                    report
+                        .messages_per_plaintext_chunk
+                        .record(report.frames.saturating_sub(frames_before_chunk));
                 })?;
+                report
+                    .messages_per_recv_cqe
+                    .record(report.frames.saturating_sub(frames_before_cqe));
                 ring.recycle(bid);
                 if !c.has_more() {
                     unsafe {
@@ -489,29 +630,6 @@ mod linux {
                     }
                     continue;
                 }
-
-                ws.drain_data_events(|ev| match ev {
-                    TalarisDataEvent::Text(payload) => {
-                        let ws_payload_ready_ns = clock.now_ns();
-                        report.record_text(
-                            payload,
-                            transport_recv_ns,
-                            tls_decode_start_ns,
-                            ws_payload_ready_ns,
-                            &clock,
-                        );
-                    }
-                    TalarisDataEvent::Binary(payload) => {
-                        let ws_payload_ready_ns = clock.now_ns();
-                        report.record_binary(
-                            payload,
-                            transport_recv_ns,
-                            tls_decode_start_ns,
-                            ws_payload_ready_ns,
-                            &clock,
-                        );
-                    }
-                })?;
                 flush_talaris_ws_tls(fd, &mut ws, &mut tls, &mut ciphertext)?;
             }
         }
@@ -534,6 +652,7 @@ mod linux {
 
         let clock = BenchClock::start();
         let raw_marks = Rc::new(Cell::new(RawReadMark::default()));
+        let frame_marks = Rc::new(Cell::new(FrameReadMark::default()));
         let metered_tcp = MeteredTcpStream {
             inner: tcp,
             clock: clock.clone(),
@@ -543,7 +662,12 @@ mod linux {
         let tls_config = rustls_client_config();
         let server_name = rustls::pki_types::ServerName::try_from(config.host.clone())?;
         let tls_conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name)?;
-        let tls_stream = rustls::StreamOwned::new(tls_conn, metered_tcp);
+        let tls_stream = MeteredTlsStream {
+            inner: rustls::StreamOwned::new(tls_conn, metered_tcp),
+            clock: clock.clone(),
+            raw_marks: raw_marks.clone(),
+            marks: frame_marks.clone(),
+        };
 
         let request = config.endpoint_url().into_client_request()?;
         let (mut ws, _response) = tungstenite_client(request, tls_stream)?;
@@ -557,24 +681,26 @@ mod linux {
             match ws.read() {
                 Ok(Message::Text(payload)) => {
                     let ws_payload_ready_ns = clock.now_ns();
-                    let raw_mark = raw_marks.get();
+                    let mark = frame_marks.get();
                     let payload: &str = payload.as_ref();
                     report.record_text(
                         payload,
-                        raw_mark.transport_recv_ns,
-                        raw_mark.tls_decode_start_ns,
+                        mark.transport_recv_ns,
+                        mark.tls_decode_start_ns,
+                        mark.tls_plaintext_ready_ns,
                         ws_payload_ready_ns,
                         &clock,
                     );
                 }
                 Ok(Message::Binary(payload)) => {
                     let ws_payload_ready_ns = clock.now_ns();
-                    let raw_mark = raw_marks.get();
+                    let mark = frame_marks.get();
                     let payload = payload.as_ref();
                     report.record_binary(
                         payload,
-                        raw_mark.transport_recv_ns,
-                        raw_mark.tls_decode_start_ns,
+                        mark.transport_recv_ns,
+                        mark.tls_decode_start_ns,
+                        mark.tls_plaintext_ready_ns,
                         ws_payload_ready_ns,
                         &clock,
                     );
@@ -606,6 +732,13 @@ mod linux {
         tls_decode_start_ns: u64,
     }
 
+    #[derive(Debug, Clone, Copy, Default)]
+    struct FrameReadMark {
+        transport_recv_ns: u64,
+        tls_decode_start_ns: u64,
+        tls_plaintext_ready_ns: u64,
+    }
+
     struct MeteredTcpStream {
         inner: TcpStream,
         clock: BenchClock,
@@ -633,6 +766,44 @@ mod linux {
     }
 
     impl Write for MeteredTcpStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    struct MeteredTlsStream {
+        inner: rustls::StreamOwned<rustls::ClientConnection, MeteredTcpStream>,
+        clock: BenchClock,
+        raw_marks: Rc<Cell<RawReadMark>>,
+        marks: Rc<Cell<FrameReadMark>>,
+    }
+
+    impl fmt::Debug for MeteredTlsStream {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("MeteredTlsStream").finish_non_exhaustive()
+        }
+    }
+
+    impl Read for MeteredTlsStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            if n > 0 {
+                let raw = self.raw_marks.get();
+                self.marks.set(FrameReadMark {
+                    transport_recv_ns: raw.transport_recv_ns,
+                    tls_decode_start_ns: raw.tls_decode_start_ns,
+                    tls_plaintext_ready_ns: self.clock.now_ns(),
+                });
+            }
+            Ok(n)
+        }
+    }
+
+    impl Write for MeteredTlsStream {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.inner.write(buf)
         }

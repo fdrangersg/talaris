@@ -428,11 +428,11 @@ impl Pool {
             let conn_id =
                 u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
             if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
-                match conn.handle_completion(proactor, c) {
-                    Ok(()) => {
-                        if conn.take_ws_ingress_dirty_for_data_drain() {
-                            drain_conn_data_events(conn, &mut sink, &mut first_err);
-                        }
+                let handle = ConnHandle(conn.conn_id());
+                match conn.handle_completion_data(proactor, c, |ev| sink(handle, ev)) {
+                    Ok(_) => {
+                        conn.sync_ws_open_state();
+                        conn.sync_ws_close_state();
                     }
                     Err(e) => fail_conn(conn, e, &mut first_err),
                 }
@@ -717,38 +717,17 @@ where
         let conn_id =
             u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
         if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
-            match conn.handle_completion(proactor, c) {
-                Ok(()) => {
-                    if conn.take_ws_ingress_dirty_for_data_drain() {
-                        drain_conn_data_events(conn, sink, first_err);
-                    }
+            let handle = ConnHandle(conn.conn_id());
+            match conn.handle_completion_data(proactor, c, |ev| sink(handle, ev)) {
+                Ok(_) => {
+                    conn.sync_ws_open_state();
+                    conn.sync_ws_close_state();
                 }
                 Err(e) => fail_conn(conn, e, first_err),
             }
         }
     }
     count
-}
-
-fn drain_conn_data_events<F>(
-    conn: &mut ConnectionState,
-    sink: &mut F,
-    first_err: &mut Option<ConnectionError>,
-) -> usize
-where
-    F: FnMut(ConnHandle, WsDataEvent<'_>),
-{
-    let handle = ConnHandle(conn.conn_id());
-    let events = match conn.ws.drain_data_events(|ev| sink(handle, ev)) {
-        Ok(events) => events,
-        Err(e) => {
-            fail_conn(conn, ConnectionError::Ws(e), first_err);
-            0
-        }
-    };
-    conn.sync_ws_open_state();
-    conn.sync_ws_close_state();
-    events
 }
 
 /// pump 内 per-conn 错误处理：保留第一条错误，把对应 conn 推到 Closed 以便
