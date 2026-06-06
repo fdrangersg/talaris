@@ -291,7 +291,7 @@ impl ConnectionState {
         mut sink: F,
     ) -> Result<usize, ConnectionError>
     where
-        F: FnMut(WsDataEvent<'_>),
+        F: for<'a> FnMut(WsDataEvent<'a>),
     {
         let kind = c
             .user_data
@@ -466,7 +466,7 @@ impl ConnectionState {
 
     fn on_recv_cqe_data<F>(&mut self, c: Completion, sink: &mut F) -> Result<usize, ConnectionError>
     where
-        F: FnMut(WsDataEvent<'_>),
+        F: for<'a> FnMut(WsDataEvent<'a>),
     {
         if !c.has_more() {
             self.multishot_armed = false;
@@ -521,9 +521,8 @@ impl ConnectionState {
             let mut drained_events = 0_usize;
             let mut ws_error = None;
             tls.ingest_ciphertext(bytes, &mut self.tls_pending_out, |plaintext| {
-                ws.feed_recv(plaintext);
                 fed_plaintext = true;
-                match ws.drain_data_events(|ev| {
+                match ws.drain_data_events_from_ingress(plaintext, |ev| {
                     drained_events = drained_events.saturating_add(1);
                     sink(ev);
                 }) {
@@ -553,11 +552,10 @@ impl ConnectionState {
                 None => Ok(drained_events),
             }
         } else {
-            self.ws.feed_recv(bytes);
             let mut drained_events = 0_usize;
             let result = self
                 .ws
-                .drain_data_events(|ev| {
+                .drain_data_events_from_ingress(bytes, |ev| {
                     drained_events = drained_events.saturating_add(1);
                     sink(ev);
                 })

@@ -503,6 +503,51 @@ impl WsClient {
         }
     }
 
+    /// Feed a newly-arrived plaintext chunk and drain data events.
+    ///
+    /// Hot path: when `bytes` contains complete, unfragmented Text/Binary
+    /// frames and the internal parser is idle, payloads are borrowed directly
+    /// from `bytes` and dispatched to `sink` without copying the plaintext into
+    /// `recv_buf`.
+    ///
+    /// Fallback: partial frames, control frames, fragmented messages, handshakes
+    /// or any existing buffered state copy only the remaining bytes into
+    /// `recv_buf`, then continue through the full WebSocket state machine.
+    pub fn drain_data_events_from_ingress<F>(
+        &mut self,
+        bytes: &[u8],
+        mut sink: F,
+    ) -> Result<usize, WsError>
+    where
+        F: for<'a> FnMut(DataEvent<'a>),
+    {
+        self.clear_after_emit();
+        if bytes.is_empty() {
+            return self.drain_data_events(sink);
+        }
+
+        if self.can_drain_ingress_directly() {
+            let (events, consumed, result) =
+                self.try_drain_ingress_data_events(bytes, &mut sink)?;
+            match result {
+                DirectDataResult::Drained => return Ok(events),
+                DirectDataResult::WaitForMore => {
+                    self.recv_buf.extend_from_slice(&bytes[consumed..]);
+                    return Ok(events);
+                }
+                DirectDataResult::Fallback => {
+                    self.recv_buf.extend_from_slice(&bytes[consumed..]);
+                    return self
+                        .drain_data_events(&mut sink)
+                        .map(|fallback_events| events + fallback_events);
+                }
+            }
+        }
+
+        self.feed_recv(bytes);
+        self.drain_data_events(sink)
+    }
+
     /// data-only 常见路径：完整单帧直接借 recv_buf payload 给 sink，回调返回后
     /// 立即 consume。control / fragmented frame 返回 Fallback，由 poll_event
     /// 完整状态机接手。
@@ -603,6 +648,106 @@ impl WsClient {
             }
             consumed += frame_len;
             events += 1;
+        }
+    }
+
+    #[inline]
+    fn can_drain_ingress_directly(&self) -> bool {
+        self.state == ConnState::Open
+            && self.parser.is_idle()
+            && self.msg_opcode.is_none()
+            && self.recv_buf.is_empty()
+            && self.borrowed_payload.is_none()
+    }
+
+    /// Direct data-only path over caller-owned ingress bytes. Returns
+    /// `(events, consumed, result)`.
+    fn try_drain_ingress_data_events<F>(
+        &mut self,
+        mut bytes: &[u8],
+        sink: &mut F,
+    ) -> Result<(usize, usize, DirectDataResult), WsError>
+    where
+        F: for<'a> FnMut(DataEvent<'a>),
+    {
+        let original_len = bytes.len();
+        let mut events = 0_usize;
+        loop {
+            if bytes.is_empty() {
+                return Ok((events, original_len, DirectDataResult::Drained));
+            }
+
+            let (header, header_len) = match parse_header(bytes) {
+                Ok(Some(parsed)) => parsed,
+                Ok(None) => {
+                    return Ok((
+                        events,
+                        original_len - bytes.len(),
+                        DirectDataResult::WaitForMore,
+                    ));
+                }
+                Err(e) => {
+                    self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
+                    return Err(WsError::Frame(e));
+                }
+            };
+
+            if header.mask.is_some() {
+                self.queue_close(
+                    CloseCode::ProtocolError.as_u16(),
+                    "server sent masked frame",
+                );
+                return Err(WsError::Frame(FrameError::ServerSentMaskedFrame));
+            }
+            if !header.fin || !matches!(header.opcode, OpCode::Text | OpCode::Binary) {
+                return Ok((
+                    events,
+                    original_len - bytes.len(),
+                    DirectDataResult::Fallback,
+                ));
+            }
+            if header.payload_len > self.config.max_frame_payload {
+                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                return Err(WsError::MessageTooLarge);
+            }
+
+            let payload_len = usize::try_from(header.payload_len).map_err(|_| {
+                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                WsError::MessageTooLarge
+            })?;
+            if payload_len > self.config.max_message_size {
+                self.queue_close(
+                    CloseCode::MessageTooBig.as_u16(),
+                    "message exceeds max_message_size",
+                );
+                return Err(WsError::MessageTooLarge);
+            }
+            let Some(frame_len) = header_len.checked_add(payload_len) else {
+                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                return Err(WsError::MessageTooLarge);
+            };
+            if bytes.len() < frame_len {
+                return Ok((
+                    events,
+                    original_len - bytes.len(),
+                    DirectDataResult::WaitForMore,
+                ));
+            }
+
+            let payload = &bytes[header_len..frame_len];
+            match header.opcode {
+                OpCode::Text => {
+                    let text = std::str::from_utf8(payload).map_err(|_| {
+                        self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
+                        WsError::Utf8Invalid
+                    })?;
+                    sink(DataEvent::Text(text));
+                }
+                OpCode::Binary => sink(DataEvent::Binary(payload)),
+                _ => unreachable!("guarded above"),
+            }
+            events += 1;
+            bytes = &bytes[frame_len..];
         }
     }
 
@@ -1146,6 +1291,19 @@ mod tests {
         s.into_bytes()
     }
 
+    fn mk_open_client() -> WsClient {
+        let mut c = mk_client();
+        c.begin_handshake().unwrap();
+        c.ack_tx(c.pending_tx().len());
+        c.feed_recv(&fake_101_response(&c.client_key));
+        match c.poll_event() {
+            Some(Ok(Event::HandshakeComplete)) => {}
+            other => panic!("expected HandshakeComplete, got {other:?}"),
+        }
+        assert_eq!(c.state(), ConnState::Open);
+        c
+    }
+
     #[test]
     fn handshake_then_text_then_close() {
         let mut c = mk_client();
@@ -1301,6 +1459,84 @@ mod tests {
         assert!(
             !c.pending_tx().is_empty(),
             "Ping should have queued an auto-pong"
+        );
+    }
+
+    #[test]
+    fn drain_data_events_from_ingress_dispatches_direct_data_frames() {
+        let mut c = mk_open_client();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&server_text(b"alpha"));
+        wire.extend_from_slice(&server_binary(b"bravo"));
+
+        let mut data = Vec::new();
+        let events = c
+            .drain_data_events_from_ingress(&wire, |ev| match ev {
+                DataEvent::Text(s) => data.push(format!("text:{s}")),
+                DataEvent::Binary(bytes) => {
+                    data.push(format!("binary:{}", std::str::from_utf8(bytes).unwrap()));
+                }
+            })
+            .unwrap();
+
+        assert_eq!(events, 2);
+        assert_eq!(
+            data,
+            vec!["text:alpha".to_owned(), "binary:bravo".to_owned()]
+        );
+        assert!(
+            c.recv_buf.is_empty(),
+            "complete direct frames should not copy"
+        );
+    }
+
+    #[test]
+    fn drain_data_events_from_ingress_buffers_partial_frame() {
+        let mut c = mk_open_client();
+        let wire = server_text(b"partial");
+        let split_at = wire.len() - 2;
+
+        let mut data = Vec::new();
+        let events = c
+            .drain_data_events_from_ingress(&wire[..split_at], |ev| match ev {
+                DataEvent::Text(s) => data.push(s.to_owned()),
+                DataEvent::Binary(_) => panic!("unexpected binary"),
+            })
+            .unwrap();
+        assert_eq!(events, 0);
+        assert!(!c.recv_buf.is_empty(), "partial frame must be buffered");
+
+        let events = c
+            .drain_data_events_from_ingress(&wire[split_at..], |ev| match ev {
+                DataEvent::Text(s) => data.push(s.to_owned()),
+                DataEvent::Binary(_) => panic!("unexpected binary"),
+            })
+            .unwrap();
+        assert_eq!(events, 1);
+        assert_eq!(data, vec!["partial".to_owned()]);
+    }
+
+    #[test]
+    fn drain_data_events_from_ingress_falls_back_for_control_frames() {
+        let mut c = mk_open_client();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&server_text(b"before"));
+        wire.extend_from_slice(&server_control(OpCode::Ping, b"hb"));
+        wire.extend_from_slice(&server_text(b"after"));
+
+        let mut data = Vec::new();
+        let events = c
+            .drain_data_events_from_ingress(&wire, |ev| match ev {
+                DataEvent::Text(s) => data.push(s.to_owned()),
+                DataEvent::Binary(_) => panic!("unexpected binary"),
+            })
+            .unwrap();
+
+        assert_eq!(events, 3);
+        assert_eq!(data, vec!["before".to_owned(), "after".to_owned()]);
+        assert!(
+            !c.pending_tx().is_empty(),
+            "Ping fallback should still queue auto-pong"
         );
     }
 

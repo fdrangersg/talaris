@@ -555,10 +555,9 @@ mod linux {
                 tls.ingest_ciphertext(bytes, &mut ciphertext, |plaintext| {
                     let tls_plaintext_ready_ns = clock.now_ns();
                     let frames_before_chunk = report.frames;
-                    ws.feed_recv(plaintext);
                     fed_plaintext = true;
                     if subscribed {
-                        ws.drain_data_events(|ev| match ev {
+                        ws.drain_data_events_from_ingress(plaintext, |ev| match ev {
                             TalarisDataEvent::Text(payload) => {
                                 let ws_payload_ready_ns = clock.now_ns();
                                 report.record_text(
@@ -583,6 +582,8 @@ mod linux {
                             }
                         })
                         .expect("talaris ws data drain");
+                    } else {
+                        ws.feed_recv(plaintext);
                     }
                     report
                         .messages_per_plaintext_chunk
