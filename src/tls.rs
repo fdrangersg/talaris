@@ -46,7 +46,7 @@ pub enum TlsCryptoProvider {
 
 impl Default for TlsCryptoProvider {
     fn default() -> Self {
-        Self::AwsLc
+        Self::Ring
     }
 }
 
@@ -96,8 +96,9 @@ impl TlsAdapter {
         Self::new_client_with_provider(server_name, TlsCryptoProvider::default())
     }
 
-    /// 使用指定 crypto provider 构造 client。默认生产路径仍建议用
-    /// [`TlsCryptoProvider::AwsLc`]；`Ring` 主要用于机器相关 A/B 压测。
+    /// 使用指定 crypto provider 构造 client。默认生产路径使用
+    /// [`TlsCryptoProvider::Ring`]，这是当前 Linux 行情订阅基准上延迟更低的
+    /// provider；`AwsLc` 保留给机器相关 A/B、FIPS 或 PQ 需求。
     pub fn new_client_with_provider(
         server_name: &str,
         provider: TlsCryptoProvider,
