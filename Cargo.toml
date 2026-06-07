@@ -27,7 +27,7 @@ thiserror    = "2"
 ring         = "0.17"   # SystemRandom for Sec-WebSocket-Key
 sha1         = "0.10"   # Sec-WebSocket-Accept
 base64       = "0.22"
-rustls       = "0.23"
+rustls       = { version = "0.23", features = ["ring"] }
 webpki-roots = "0.26"
 tracing      = "0.1"
 # libc 提供 errno 常量（ENOBUFS / ECONNRESET 等）。跨平台 dep —— macOS 上仍可

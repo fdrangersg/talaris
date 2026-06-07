@@ -45,7 +45,7 @@ mod linux {
         BufferRing, Domain, OpKind, Proactor, ProactorConfig, ProactorSetupFlags, SockAddr,
         SqeFlags, TcpSocket, UserData,
     };
-    use talaris::tls::TlsAdapter;
+    use talaris::tls::{TlsAdapter, TlsCryptoProvider};
     use talaris::ws::{DataEvent as TalarisDataEvent, Event as TalarisEvent, WsClient, WsConfig};
     use tungstenite::client::IntoClientRequest;
     use tungstenite::{Message, client as tungstenite_client};
@@ -138,6 +138,7 @@ mod linux {
         cq_entries: u32,
         read_timeout_ms: u64,
         assume_text_utf8: bool,
+        tls_provider: TlsCryptoProvider,
     }
 
     impl BenchConfig {
@@ -156,6 +157,7 @@ mod linux {
                 cq_entries: common::arg_or("--cq-entries", DEFAULT_CQ_ENTRIES),
                 read_timeout_ms: common::arg_or("--read-timeout-ms", DEFAULT_READ_TIMEOUT_MS),
                 assume_text_utf8: common::flag_present("--assume-text-utf8"),
+                tls_provider: common::arg_or("--tls-provider", TlsCryptoProvider::default()),
             }
         }
 
@@ -172,7 +174,7 @@ mod linux {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(
                 f,
-                "live_ws_latency transport={} seconds={} endpoint=wss://{}:{}{} user_cpu={:?} buf={}x{} sq_entries={} cq_entries={} read_timeout_ms={} assume_text_utf8={}",
+                "live_ws_latency transport={} seconds={} endpoint=wss://{}:{}{} user_cpu={:?} buf={}x{} sq_entries={} cq_entries={} read_timeout_ms={} assume_text_utf8={} tls_provider={}",
                 self.transport,
                 self.seconds,
                 self.host,
@@ -184,7 +186,8 @@ mod linux {
                 self.sq_entries,
                 self.cq_entries,
                 self.read_timeout_ms,
-                self.assume_text_utf8
+                self.assume_text_utf8,
+                self.tls_provider
             )
         }
     }
@@ -500,7 +503,7 @@ mod linux {
         }
         proactor.submit()?;
 
-        let mut tls = TlsAdapter::new_client(&config.host)?;
+        let mut tls = TlsAdapter::new_client_with_provider(&config.host, config.tls_provider)?;
         let mut ws_config = WsConfig::new(config.host.clone(), config.path.clone())
             .with_max_message_size(DEFAULT_MAX_MESSAGE_SIZE)
             .with_max_frame_payload(DEFAULT_MAX_FRAME_PAYLOAD)
@@ -668,7 +671,7 @@ mod linux {
             marks: raw_marks.clone(),
         };
 
-        let tls_config = rustls_client_config();
+        let tls_config = TlsAdapter::client_config(config.tls_provider)?;
         let server_name = rustls::pki_types::ServerName::try_from(config.host.clone())?;
         let tls_conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name)?;
         let tls_stream = MeteredTlsStream {
@@ -822,17 +825,6 @@ mod linux {
         }
     }
 
-    fn rustls_client_config() -> rustls::ClientConfig {
-        let root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        let mut config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        config
-    }
-
     fn flush_talaris_ws_tls(
         fd: i32,
         ws: &mut WsClient,
@@ -929,7 +921,8 @@ mod linux {
             "Usage: cargo bench --bench live_ws_latency -- \
              [--transport talaris|tungstenite|both] [--seconds N] \
              [--host fstream.binance.com] [--port 443] [--path /public/stream] \
-             [--subscribe JSON] [--user-cpu N] [--assume-text-utf8]"
+             [--subscribe JSON] [--user-cpu N] [--assume-text-utf8] \
+             [--tls-provider aws-lc|ring]"
         );
         println!(
             "Latency marks are monotonic *_ns. transport_recv_ns is user-space recv completion/read return, not NIC hardware timestamp."

@@ -38,6 +38,41 @@ pub enum TlsError {
     BadAlpn(Vec<u8>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TlsCryptoProvider {
+    AwsLc,
+    Ring,
+}
+
+impl Default for TlsCryptoProvider {
+    fn default() -> Self {
+        Self::AwsLc
+    }
+}
+
+impl std::fmt::Display for TlsCryptoProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AwsLc => f.write_str("aws-lc"),
+            Self::Ring => f.write_str("ring"),
+        }
+    }
+}
+
+impl std::str::FromStr for TlsCryptoProvider {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "aws-lc" | "aws_lc" | "aws-lc-rs" | "aws_lc_rs" => Ok(Self::AwsLc),
+            "ring" => Ok(Self::Ring),
+            _ => Err(format!(
+                "invalid tls provider {s:?}; expected aws-lc or ring"
+            )),
+        }
+    }
+}
+
 /// rustls client 包装
 pub struct TlsAdapter {
     conn: rustls::ClientConnection,
@@ -58,18 +93,22 @@ impl std::fmt::Debug for TlsAdapter {
 impl TlsAdapter {
     /// 构造 client。`server_name` 通常是连接的主机名（用于 SNI + 证书校验）。
     pub fn new_client(server_name: &str) -> Result<Self, TlsError> {
-        let root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        let mut config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        // 显式只接受 HTTP/1.1，避免 server 协商 HTTP/2 后 WS upgrade 不通。
-        // 仅"通告"还不够 —— handshake 完后必须再用 [`verify_alpn`] 校验 server
-        // 真的回了 http/1.1（或不回）；某些 misconfig server 会忽略 alpn 通告。
-        config.alpn_protocols = vec![REQUIRED_ALPN.to_vec()];
+        Self::new_client_with_provider(server_name, TlsCryptoProvider::default())
+    }
 
-        Self::new_client_with_config(server_name, Arc::new(config))
+    /// 使用指定 crypto provider 构造 client。默认生产路径仍建议用
+    /// [`TlsCryptoProvider::AwsLc`]；`Ring` 主要用于机器相关 A/B 压测。
+    pub fn new_client_with_provider(
+        server_name: &str,
+        provider: TlsCryptoProvider,
+    ) -> Result<Self, TlsError> {
+        Self::new_client_with_config(server_name, Arc::new(client_config(provider)?))
+    }
+
+    /// 构造 rustls client config。公开给 benchmark 或上层组合代码，保证
+    /// tungstenite 对照和 talaris 使用完全相同的 provider/root/alpn 配置。
+    pub fn client_config(provider: TlsCryptoProvider) -> Result<rustls::ClientConfig, TlsError> {
+        client_config(provider)
     }
 
     /// 用 caller 提供的 rustls 配置构造 client。私有 CA、session cache、crypto
@@ -227,6 +266,25 @@ impl TlsAdapter {
         }
         self.drain_ciphertext(dst_ciphertext)
     }
+}
+
+fn client_config(provider: TlsCryptoProvider) -> Result<rustls::ClientConfig, TlsError> {
+    let root_store = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let provider = match provider {
+        TlsCryptoProvider::AwsLc => rustls::crypto::aws_lc_rs::default_provider(),
+        TlsCryptoProvider::Ring => rustls::crypto::ring::default_provider(),
+    };
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    // 显式只接受 HTTP/1.1，避免 server 协商 HTTP/2 后 WS upgrade 不通。
+    // 仅"通告"还不够 —— handshake 完后必须再用 [`TlsAdapter::verify_alpn`]
+    // 校验 server 真的回了 http/1.1（或不回）。
+    config.alpn_protocols = vec![REQUIRED_ALPN.to_vec()];
+    Ok(config)
 }
 
 #[cfg(test)]
