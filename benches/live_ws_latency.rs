@@ -261,10 +261,15 @@ mod linux {
         tls_ws_ns: hdrhistogram::Histogram<u64>,
         recv_to_tls_plaintext_ns: hdrhistogram::Histogram<u64>,
         plaintext_to_ws_payload_ns: hdrhistogram::Histogram<u64>,
+        plaintext_to_ws_payload_first_in_chunk_ns: hdrhistogram::Histogram<u64>,
+        plaintext_to_ws_payload_rest_in_chunk_ns: hdrhistogram::Histogram<u64>,
         payload_sink_ns: hdrhistogram::Histogram<u64>,
         total_to_sink_ns: hdrhistogram::Histogram<u64>,
+        total_to_sink_first_in_chunk_ns: hdrhistogram::Histogram<u64>,
+        total_to_sink_rest_in_chunk_ns: hdrhistogram::Histogram<u64>,
         messages_per_recv_cqe: BatchStats,
         messages_per_plaintext_chunk: BatchStats,
+        position_in_plaintext_chunk: BatchStats,
     }
 
     impl BenchReport {
@@ -281,10 +286,15 @@ mod linux {
                 tls_ws_ns: common::sampled_hist(),
                 recv_to_tls_plaintext_ns: common::sampled_hist(),
                 plaintext_to_ws_payload_ns: common::sampled_hist(),
+                plaintext_to_ws_payload_first_in_chunk_ns: common::sampled_hist(),
+                plaintext_to_ws_payload_rest_in_chunk_ns: common::sampled_hist(),
                 payload_sink_ns: common::sampled_hist(),
                 total_to_sink_ns: common::sampled_hist(),
+                total_to_sink_first_in_chunk_ns: common::sampled_hist(),
+                total_to_sink_rest_in_chunk_ns: common::sampled_hist(),
                 messages_per_recv_cqe: BatchStats::new(),
                 messages_per_plaintext_chunk: BatchStats::new(),
+                position_in_plaintext_chunk: BatchStats::new(),
             }
         }
 
@@ -295,6 +305,7 @@ mod linux {
             tls_decode_start_ns: u64,
             tls_plaintext_ready_ns: u64,
             ws_payload_ready_ns: u64,
+            plaintext_chunk_message_index: Option<u64>,
             clock: &BenchClock,
         ) {
             self.frames = self.frames.saturating_add(1);
@@ -305,6 +316,7 @@ mod linux {
                 tls_decode_start_ns,
                 tls_plaintext_ready_ns,
                 ws_payload_ready_ns,
+                plaintext_chunk_message_index,
                 clock,
             );
         }
@@ -316,6 +328,7 @@ mod linux {
             tls_decode_start_ns: u64,
             tls_plaintext_ready_ns: u64,
             ws_payload_ready_ns: u64,
+            plaintext_chunk_message_index: Option<u64>,
             clock: &BenchClock,
         ) {
             self.frames = self.frames.saturating_add(1);
@@ -326,6 +339,7 @@ mod linux {
                 tls_decode_start_ns,
                 tls_plaintext_ready_ns,
                 ws_payload_ready_ns,
+                plaintext_chunk_message_index,
                 clock,
             );
         }
@@ -337,6 +351,7 @@ mod linux {
             tls_decode_start_ns: u64,
             tls_plaintext_ready_ns: u64,
             ws_payload_ready_ns: u64,
+            plaintext_chunk_message_index: Option<u64>,
             clock: &BenchClock,
         ) {
             self.payload_bytes = self.payload_bytes.saturating_add(payload.len() as u64);
@@ -359,6 +374,25 @@ mod linux {
                 .record(marks.plaintext_to_ws_payload_ns());
             let _ = self.payload_sink_ns.record(marks.payload_sink_ns());
             let _ = self.total_to_sink_ns.record(marks.total_to_sink_ns());
+            if let Some(index) = plaintext_chunk_message_index {
+                self.position_in_plaintext_chunk
+                    .record(index.saturating_add(1));
+                if index == 0 {
+                    let _ = self
+                        .plaintext_to_ws_payload_first_in_chunk_ns
+                        .record(marks.plaintext_to_ws_payload_ns());
+                    let _ = self
+                        .total_to_sink_first_in_chunk_ns
+                        .record(marks.total_to_sink_ns());
+                } else {
+                    let _ = self
+                        .plaintext_to_ws_payload_rest_in_chunk_ns
+                        .record(marks.plaintext_to_ws_payload_ns());
+                    let _ = self
+                        .total_to_sink_rest_in_chunk_ns
+                        .record(marks.total_to_sink_ns());
+                }
+            }
         }
 
         fn print(self) {
@@ -388,12 +422,34 @@ mod linux {
                 "plaintext_to_ws_payload_ns",
                 &self.plaintext_to_ws_payload_ns,
             );
+            print_latency_hist(
+                self.transport,
+                "plaintext_to_ws_payload_first_in_chunk_ns",
+                &self.plaintext_to_ws_payload_first_in_chunk_ns,
+            );
+            print_latency_hist(
+                self.transport,
+                "plaintext_to_ws_payload_rest_in_chunk_ns",
+                &self.plaintext_to_ws_payload_rest_in_chunk_ns,
+            );
             print_latency_hist(self.transport, "payload_sink_ns", &self.payload_sink_ns);
             print_latency_hist(self.transport, "total_to_sink_ns", &self.total_to_sink_ns);
+            print_latency_hist(
+                self.transport,
+                "total_to_sink_first_in_chunk_ns",
+                &self.total_to_sink_first_in_chunk_ns,
+            );
+            print_latency_hist(
+                self.transport,
+                "total_to_sink_rest_in_chunk_ns",
+                &self.total_to_sink_rest_in_chunk_ns,
+            );
             self.messages_per_recv_cqe
                 .print(self.transport, "messages_per_recv_cqe");
             self.messages_per_plaintext_chunk
                 .print(self.transport, "messages_per_plaintext_chunk");
+            self.position_in_plaintext_chunk
+                .print(self.transport, "position_in_plaintext_chunk");
         }
     }
 
@@ -571,23 +627,29 @@ mod linux {
                         ws.drain_data_events_from_ingress(plaintext, |ev| match ev {
                             TalarisDataEvent::Text(payload) => {
                                 let ws_payload_ready_ns = clock.now_ns();
+                                let chunk_message_index =
+                                    report.frames.saturating_sub(frames_before_chunk);
                                 report.record_text(
                                     payload,
                                     transport_recv_ns,
                                     tls_decode_start_ns,
                                     tls_plaintext_ready_ns,
                                     ws_payload_ready_ns,
+                                    Some(chunk_message_index),
                                     &clock,
                                 );
                             }
                             TalarisDataEvent::Binary(payload) => {
                                 let ws_payload_ready_ns = clock.now_ns();
+                                let chunk_message_index =
+                                    report.frames.saturating_sub(frames_before_chunk);
                                 report.record_binary(
                                     payload,
                                     transport_recv_ns,
                                     tls_decode_start_ns,
                                     tls_plaintext_ready_ns,
                                     ws_payload_ready_ns,
+                                    Some(chunk_message_index),
                                     &clock,
                                 );
                             }
@@ -701,6 +763,7 @@ mod linux {
                         mark.tls_decode_start_ns,
                         mark.tls_plaintext_ready_ns,
                         ws_payload_ready_ns,
+                        None,
                         &clock,
                     );
                 }
@@ -714,6 +777,7 @@ mod linux {
                         mark.tls_decode_start_ns,
                         mark.tls_plaintext_ready_ns,
                         ws_payload_ready_ns,
+                        None,
                         &clock,
                     );
                 }
