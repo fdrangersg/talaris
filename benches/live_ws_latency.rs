@@ -45,7 +45,7 @@ mod linux {
         BufferRing, Domain, OpKind, Proactor, ProactorConfig, ProactorSetupFlags, SockAddr,
         SqeFlags, TcpSocket, UserData,
     };
-    use talaris::tls::{TlsAdapter, TlsCryptoProvider};
+    use talaris::tls::{TlsAdapter, TlsCipherPreference, TlsCryptoProvider};
     use talaris::ws::{DataEvent as TalarisDataEvent, Event as TalarisEvent, WsClient, WsConfig};
     use tungstenite::client::IntoClientRequest;
     use tungstenite::{Message, client as tungstenite_client};
@@ -139,6 +139,7 @@ mod linux {
         read_timeout_ms: u64,
         assume_text_utf8: bool,
         tls_provider: TlsCryptoProvider,
+        tls_cipher_preference: TlsCipherPreference,
         record_every: u64,
     }
 
@@ -159,6 +160,10 @@ mod linux {
                 read_timeout_ms: common::arg_or("--read-timeout-ms", DEFAULT_READ_TIMEOUT_MS),
                 assume_text_utf8: common::flag_present("--assume-text-utf8"),
                 tls_provider: common::arg_or("--tls-provider", TlsCryptoProvider::default()),
+                tls_cipher_preference: common::arg_or(
+                    "--tls-cipher-preference",
+                    TlsCipherPreference::default(),
+                ),
                 record_every: common::arg_or("--record-every", 1_u64),
             }
         }
@@ -176,7 +181,7 @@ mod linux {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(
                 f,
-                "live_ws_latency transport={} seconds={} endpoint=wss://{}:{}{} user_cpu={:?} buf={}x{} sq_entries={} cq_entries={} read_timeout_ms={} assume_text_utf8={} tls_provider={} record_every={}",
+                "live_ws_latency transport={} seconds={} endpoint=wss://{}:{}{} user_cpu={:?} buf={}x{} sq_entries={} cq_entries={} read_timeout_ms={} assume_text_utf8={} tls_provider={} tls_cipher_preference={} record_every={}",
                 self.transport,
                 self.seconds,
                 self.host,
@@ -190,6 +195,7 @@ mod linux {
                 self.read_timeout_ms,
                 self.assume_text_utf8,
                 self.tls_provider,
+                self.tls_cipher_preference,
                 self.record_every
             )
         }
@@ -577,7 +583,13 @@ mod linux {
         }
         proactor.submit()?;
 
-        let mut tls = TlsAdapter::new_client_with_provider(&config.host, config.tls_provider)?;
+        let mut tls = TlsAdapter::new_client_with_config(
+            &config.host,
+            Arc::new(TlsAdapter::client_config_with_cipher_preference(
+                config.tls_provider,
+                config.tls_cipher_preference,
+            )?),
+        )?;
         let mut ws_config = WsConfig::new(config.host.clone(), config.path.clone())
             .with_max_message_size(DEFAULT_MAX_MESSAGE_SIZE)
             .with_max_frame_payload(DEFAULT_MAX_FRAME_PAYLOAD)
@@ -702,6 +714,9 @@ mod linux {
 
                 if !tls.is_handshaking() && !ws_handshake_started {
                     tls.verify_alpn()?;
+                    if let Some(suite) = tls.negotiated_cipher_suite() {
+                        eprintln!("[talaris-user] tls_cipher_suite={suite:?}");
+                    }
                     ws.begin_handshake()?;
                     flush_talaris_ws_tls(fd, &mut ws, &mut tls, &mut ciphertext)?;
                     ws_handshake_started = true;
@@ -751,7 +766,10 @@ mod linux {
             marks: raw_marks.clone(),
         };
 
-        let tls_config = TlsAdapter::client_config(config.tls_provider)?;
+        let tls_config = TlsAdapter::client_config_with_cipher_preference(
+            config.tls_provider,
+            config.tls_cipher_preference,
+        )?;
         let server_name = rustls::pki_types::ServerName::try_from(config.host.clone())?;
         let tls_conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name)?;
         let tls_stream = MeteredTlsStream {
@@ -1004,7 +1022,8 @@ mod linux {
              [--transport talaris|tungstenite|both] [--seconds N] \
              [--host fstream.binance.com] [--port 443] [--path /public/stream] \
              [--subscribe JSON] [--user-cpu N] [--assume-text-utf8] \
-             [--tls-provider aws-lc|ring] [--record-every N]"
+             [--tls-provider aws-lc|ring] [--tls-cipher-preference default|aes128|aes256|chacha] \
+             [--record-every N]"
         );
         println!(
             "Latency marks are monotonic *_ns. transport_recv_ns is user-space recv completion/read return, not NIC hardware timestamp."

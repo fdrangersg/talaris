@@ -44,6 +44,15 @@ pub enum TlsCryptoProvider {
     Ring,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TlsCipherPreference {
+    #[default]
+    ProviderDefault,
+    Aes128GcmFirst,
+    Aes256GcmFirst,
+    Chacha20First,
+}
+
 impl Default for TlsCryptoProvider {
     fn default() -> Self {
         Self::Ring
@@ -68,6 +77,33 @@ impl std::str::FromStr for TlsCryptoProvider {
             "ring" => Ok(Self::Ring),
             _ => Err(format!(
                 "invalid tls provider {s:?}; expected aws-lc or ring"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for TlsCipherPreference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProviderDefault => f.write_str("default"),
+            Self::Aes128GcmFirst => f.write_str("aes128"),
+            Self::Aes256GcmFirst => f.write_str("aes256"),
+            Self::Chacha20First => f.write_str("chacha"),
+        }
+    }
+}
+
+impl std::str::FromStr for TlsCipherPreference {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "default" => Ok(Self::ProviderDefault),
+            "aes128" | "aes-128" | "aes128-gcm" | "aes-128-gcm" => Ok(Self::Aes128GcmFirst),
+            "aes256" | "aes-256" | "aes256-gcm" | "aes-256-gcm" => Ok(Self::Aes256GcmFirst),
+            "chacha" | "chacha20" | "chacha20-poly1305" => Ok(Self::Chacha20First),
+            _ => Err(format!(
+                "invalid tls cipher preference {s:?}; expected default, aes128, aes256, or chacha"
             )),
         }
     }
@@ -103,13 +139,33 @@ impl TlsAdapter {
         server_name: &str,
         provider: TlsCryptoProvider,
     ) -> Result<Self, TlsError> {
-        Self::new_client_with_config(server_name, Arc::new(client_config(provider)?))
+        Self::new_client_with_config(
+            server_name,
+            Arc::new(client_config(
+                provider,
+                TlsCipherPreference::ProviderDefault,
+            )?),
+        )
     }
 
     /// 构造 rustls client config。公开给 benchmark 或上层组合代码，保证
     /// tungstenite 对照和 talaris 使用完全相同的 provider/root/alpn 配置。
     pub fn client_config(provider: TlsCryptoProvider) -> Result<rustls::ClientConfig, TlsError> {
-        client_config(provider)
+        client_config(provider, TlsCipherPreference::ProviderDefault)
+    }
+
+    pub fn client_config_with_cipher_preference(
+        provider: TlsCryptoProvider,
+        preference: TlsCipherPreference,
+    ) -> Result<rustls::ClientConfig, TlsError> {
+        client_config(provider, preference)
+    }
+
+    #[must_use]
+    pub fn negotiated_cipher_suite(&self) -> Option<rustls::CipherSuite> {
+        self.conn
+            .negotiated_cipher_suite()
+            .map(|suite| suite.suite())
     }
 
     /// 用 caller 提供的 rustls 配置构造 client。私有 CA、session cache、crypto
@@ -269,14 +325,18 @@ impl TlsAdapter {
     }
 }
 
-fn client_config(provider: TlsCryptoProvider) -> Result<rustls::ClientConfig, TlsError> {
+fn client_config(
+    provider: TlsCryptoProvider,
+    preference: TlsCipherPreference,
+) -> Result<rustls::ClientConfig, TlsError> {
     let root_store = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
-    let provider = match provider {
+    let mut provider = match provider {
         TlsCryptoProvider::AwsLc => rustls::crypto::aws_lc_rs::default_provider(),
         TlsCryptoProvider::Ring => rustls::crypto::ring::default_provider(),
     };
+    apply_cipher_preference(&mut provider, preference);
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()?
         .with_root_certificates(root_store)
@@ -286,6 +346,51 @@ fn client_config(provider: TlsCryptoProvider) -> Result<rustls::ClientConfig, Tl
     // 校验 server 真的回了 http/1.1（或不回）。
     config.alpn_protocols = vec![REQUIRED_ALPN.to_vec()];
     Ok(config)
+}
+
+fn apply_cipher_preference(
+    provider: &mut rustls::crypto::CryptoProvider,
+    preference: TlsCipherPreference,
+) {
+    let preferred = match preference {
+        TlsCipherPreference::ProviderDefault => return,
+        TlsCipherPreference::Aes128GcmFirst => &[
+            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+            rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+        ][..],
+        TlsCipherPreference::Aes256GcmFirst => &[
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+            rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+        ][..],
+        TlsCipherPreference::Chacha20First => &[
+            rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+        ][..],
+    };
+
+    let mut reordered = Vec::with_capacity(provider.cipher_suites.len());
+    for target in preferred {
+        if let Some(suite) = provider
+            .cipher_suites
+            .iter()
+            .copied()
+            .find(|suite| suite.suite() == *target)
+        {
+            reordered.push(suite);
+        }
+    }
+    for suite in provider.cipher_suites.iter().copied() {
+        if reordered
+            .iter()
+            .all(|existing| existing.suite() != suite.suite())
+        {
+            reordered.push(suite);
+        }
+    }
+    provider.cipher_suites = reordered;
 }
 
 #[cfg(test)]
