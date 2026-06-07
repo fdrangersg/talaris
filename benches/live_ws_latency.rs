@@ -139,6 +139,7 @@ mod linux {
         read_timeout_ms: u64,
         assume_text_utf8: bool,
         tls_provider: TlsCryptoProvider,
+        record_every: u64,
     }
 
     impl BenchConfig {
@@ -158,6 +159,7 @@ mod linux {
                 read_timeout_ms: common::arg_or("--read-timeout-ms", DEFAULT_READ_TIMEOUT_MS),
                 assume_text_utf8: common::flag_present("--assume-text-utf8"),
                 tls_provider: common::arg_or("--tls-provider", TlsCryptoProvider::default()),
+                record_every: common::arg_or("--record-every", 1_u64),
             }
         }
 
@@ -174,7 +176,7 @@ mod linux {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(
                 f,
-                "live_ws_latency transport={} seconds={} endpoint=wss://{}:{}{} user_cpu={:?} buf={}x{} sq_entries={} cq_entries={} read_timeout_ms={} assume_text_utf8={} tls_provider={}",
+                "live_ws_latency transport={} seconds={} endpoint=wss://{}:{}{} user_cpu={:?} buf={}x{} sq_entries={} cq_entries={} read_timeout_ms={} assume_text_utf8={} tls_provider={} record_every={}",
                 self.transport,
                 self.seconds,
                 self.host,
@@ -187,7 +189,8 @@ mod linux {
                 self.cq_entries,
                 self.read_timeout_ms,
                 self.assume_text_utf8,
-                self.tls_provider
+                self.tls_provider,
+                self.record_every
             )
         }
     }
@@ -257,6 +260,7 @@ mod linux {
         binary_frames: u64,
         payload_bytes: u64,
         checksum: u64,
+        record_every: u64,
         transport_tls_ws_ns: hdrhistogram::Histogram<u64>,
         tls_ws_ns: hdrhistogram::Histogram<u64>,
         recv_to_tls_plaintext_ns: hdrhistogram::Histogram<u64>,
@@ -273,7 +277,7 @@ mod linux {
     }
 
     impl BenchReport {
-        fn new(transport: &'static str) -> Self {
+        fn new(transport: &'static str, record_every: u64) -> Self {
             Self {
                 transport,
                 elapsed: Duration::ZERO,
@@ -282,6 +286,7 @@ mod linux {
                 binary_frames: 0,
                 payload_bytes: 0,
                 checksum: 0,
+                record_every: record_every.max(1),
                 transport_tls_ws_ns: common::sampled_hist(),
                 tls_ws_ns: common::sampled_hist(),
                 recv_to_tls_plaintext_ns: common::sampled_hist(),
@@ -310,6 +315,7 @@ mod linux {
         ) {
             self.frames = self.frames.saturating_add(1);
             self.text_frames = self.text_frames.saturating_add(1);
+            let should_record = self.should_record_sample();
             self.record_payload(
                 payload.as_bytes(),
                 transport_recv_ns,
@@ -317,6 +323,7 @@ mod linux {
                 tls_plaintext_ready_ns,
                 ws_payload_ready_ns,
                 plaintext_chunk_message_index,
+                should_record,
                 clock,
             );
         }
@@ -333,6 +340,7 @@ mod linux {
         ) {
             self.frames = self.frames.saturating_add(1);
             self.binary_frames = self.binary_frames.saturating_add(1);
+            let should_record = self.should_record_sample();
             self.record_payload(
                 payload,
                 transport_recv_ns,
@@ -340,6 +348,7 @@ mod linux {
                 tls_plaintext_ready_ns,
                 ws_payload_ready_ns,
                 plaintext_chunk_message_index,
+                should_record,
                 clock,
             );
         }
@@ -352,9 +361,13 @@ mod linux {
             tls_plaintext_ready_ns: u64,
             ws_payload_ready_ns: u64,
             plaintext_chunk_message_index: Option<u64>,
+            should_record: bool,
             clock: &BenchClock,
         ) {
             self.payload_bytes = self.payload_bytes.saturating_add(payload.len() as u64);
+            if !should_record {
+                return;
+            }
             self.checksum = mix_checksum(self.checksum, payload);
             let sink_ready_ns = clock.now_ns();
             let marks = FrameMarks {
@@ -395,16 +408,21 @@ mod linux {
             }
         }
 
+        fn should_record_sample(&self) -> bool {
+            self.record_every == 1 || self.frames.is_multiple_of(self.record_every)
+        }
+
         fn print(self) {
             println!(
-                "live_ws_latency_result transport={} elapsed_ms={} frames={} text_frames={} binary_frames={} payload_bytes={} checksum={}",
+                "live_ws_latency_result transport={} elapsed_ms={} frames={} text_frames={} binary_frames={} payload_bytes={} checksum={} record_every={}",
                 self.transport,
                 self.elapsed.as_millis(),
                 self.frames,
                 self.text_frames,
                 self.binary_frames,
                 self.payload_bytes,
-                self.checksum
+                self.checksum,
+                self.record_every
             );
             print_latency_hist(
                 self.transport,
@@ -583,7 +601,7 @@ mod linux {
         let clock = BenchClock::start();
         let started = Instant::now();
         let deadline = started + config.duration();
-        let mut report = BenchReport::new("talaris");
+        let mut report = BenchReport::new("talaris", config.record_every);
         let mut ws_handshake_started = false;
         let mut subscribed = false;
         let mut completions = Vec::with_capacity(64);
@@ -749,7 +767,7 @@ mod linux {
 
         let started = Instant::now();
         let deadline = started + config.duration();
-        let mut report = BenchReport::new("tungstenite");
+        let mut report = BenchReport::new("tungstenite", config.record_every);
 
         while Instant::now() < deadline {
             match ws.read() {
@@ -986,7 +1004,7 @@ mod linux {
              [--transport talaris|tungstenite|both] [--seconds N] \
              [--host fstream.binance.com] [--port 443] [--path /public/stream] \
              [--subscribe JSON] [--user-cpu N] [--assume-text-utf8] \
-             [--tls-provider aws-lc|ring]"
+             [--tls-provider aws-lc|ring] [--record-every N]"
         );
         println!(
             "Latency marks are monotonic *_ns. transport_recv_ns is user-space recv completion/read return, not NIC hardware timestamp."
