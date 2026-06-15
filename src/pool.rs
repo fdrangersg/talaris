@@ -569,14 +569,14 @@ impl Pool {
                 progressed = true;
                 for _ in 0..post_progress_spin_iters {
                     std::hint::spin_loop();
-                    let more = drain_conn_completions_data(
+                    let _ = drain_conn_completions_data(
                         conns,
                         proactor,
                         completions_buf,
                         &mut sink,
                         &mut first_err,
                     );
-                    if more == 0 || first_err.is_some() {
+                    if first_err.is_some() {
                         break;
                     }
                 }
