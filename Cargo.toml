@@ -95,6 +95,10 @@ harness = false
 name    = "live_pipeline"
 harness = false
 
+[[bench]]
+name    = "local_redundancy"
+harness = false
+
 # ─── lints ──────────────────────────────────────────────────────────────
 [lints.rust]
 unsafe_op_in_unsafe_fn        = "warn"

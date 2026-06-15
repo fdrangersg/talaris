@@ -403,7 +403,7 @@ fn run_stream_server(
     }
 }
 
-fn is_expected_disconnect(e: &io::Error) -> bool {
+pub fn is_expected_disconnect(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         io::ErrorKind::BrokenPipe
@@ -478,7 +478,7 @@ fn upgrade_response_for_request(request: &[u8]) -> io::Result<Vec<u8>> {
     .into_bytes())
 }
 
-fn server_upgrade(stream: &mut TcpStream) -> io::Result<()> {
+pub fn server_upgrade(stream: &mut TcpStream) -> io::Result<()> {
     let mut buf = [0_u8; 4096];
     let mut req = Vec::with_capacity(1024);
     loop {
