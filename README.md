@@ -536,99 +536,79 @@ Tested on Linux 6.x with io_uring features: `SETUP_CQSIZE`, `SETUP_COOP_TASKRUN`
 
 ## Benchmark suite
 
-`benches/` 下面是 Linux-only 分层 baseline。它借鉴 tungstenite 的小 target
-方式，但不照搬 Criterion sampling：talaris 的 hot path 是长生命周期
-io_uring `recv_multishot` 和 CQE drain，不适合把一次 `pump_data` 包进短采样
-iteration。非 Linux 只打印 `skipped`，用于保持本地 `cargo check --benches`
-可用。
+`benches/` 现在只保留两条 Linux-only pipeline bench。它们不使用 Criterion
+sampling：talaris 的 hot path 是长生命周期 io_uring `recv_multishot`、PBUF
+recycle、TLS/WS staging 和 CQE drain，不适合把一次 `pump_data` 包进短采样
+iteration。非 Linux 只构建并打印 `skipped`，用于保持本地
+`cargo check --benches` 可用。
 
 测试环境：
 
 - Host: `ripple-testnet-tokyo`
 - Kernel: Linux `6.17.0-1012-aws`
 - Rust: `rustc 1.95.0`
-- CPU: 使用测试机 isolated CPU，bench 进程 `taskset -c 0-2`；`ingress` / `e2e`
-  pin user thread 到 CPU 1、server thread 到 CPU 2。
+- CPU: bench 进程 `taskset -c 0-2`；local bench pin user thread 到 CPU 1、
+  server thread 到 CPU 2。
 
 | bench | 测什么 |
 |---|---|
-| `framing` | 纯 inbound CPU：`parse_header`、`FrameParser`、`WsClient::drain_data_events` |
-| `read` | 对齐 tungstenite `read 100k small messages (client)`：1/3 binary u64 + 2/3 text JSON，并在 sink 内 parse/sum |
-| `ws_chunking` | `WsClient::feed_recv` + `drain_data_events`，比较不同 chunk size / frame boundary；不是纯 buffer copy bench |
-| `ingress` | loopback plain WS，`Pool::pump_data` 驱动 io_uring multishot recv + provided buffer ring |
-| `e2e` | loopback echo smoke / latency sanity，单 outstanding binary message；包含 outbound，不代表 hot path |
-| `live_ws_latency` | live TLS WebSocket transport latency：`talaris` low-level driver vs `tungstenite`，统计 recv/read → TLS/WS → payload sink |
+| `local_pipeline` | loopback plain WS，真实 `Pool + io_uring + PBUF + WS pump`。用于比较 unmarked、marked、采样和 HdrHistogram 记录的 hot-path 成本 |
+| `live_pipeline` | live TLS WebSocket，使用生产 `Pool::pump_data_spin_marked` 和当前 observability / Prometheus 导出口径 |
 
 跑法示例：
 ```bash
-taskset -c 0-2 cargo bench --bench framing -- \
-    --frames 1000000 --payloads 64,256,1024
-
-taskset -c 0-2 cargo bench --bench read -- \
-    --messages 100000 --chunk-size 4096
-
-taskset -c 0-2 cargo bench --bench ws_chunking -- \
-    --frames 1000000 --payload 256 --chunk-sizes 128,512,4096,65536
-
-taskset -c 0-2 cargo bench --bench ingress -- \
-    --frames 10000000 --payload 64 \
-    --buf-size 4096 --buf-entries 256 \
-    --spin-iters 256 --sample-every 0 \
+taskset -c 0-2 cargo bench --bench local_pipeline -- \
+    --mode hist_100pct \
+    --seconds 30 \
+    --payload 256 \
+    --frames-per-write 16 \
+    --buf-size 4096 \
+    --buf-entries 256 \
+    --spin-iters 256 \
+    --metrics-interval-ms 1000 \
+    --prom-out /tmp/talaris-local.prom \
     --user-cpu 1 --server-cpu 2
 
-taskset -c 0-2 cargo bench --bench e2e -- \
-    --messages 10000 --payload 64 \
-    --buf-size 4096 --buf-entries 256 \
-    --user-cpu 1 --server-cpu 2
-
-taskset -c 0-2 cargo bench --bench live_ws_latency -- \
-    --transport both --seconds 60 \
-    --host fstream.binance.com --path /public/stream \
-    --subscribe '{"id":1,"method":"SUBSCRIBE","params":["btcusdt@bookTicker"]}' \
+taskset -c 0-2 cargo bench --bench live_pipeline -- \
+    --seconds 60 \
+    --host fstream.binance.com \
+    --port 443 \
+    --path /ws/btcusdt@bookTicker \
+    --sample-bps 10000 \
+    --metrics-interval-ms 1000 \
+    --prom-out /tmp/talaris-live.prom \
     --user-cpu 1
 ```
 
-`ingress --sample-every 0` 用于测吞吐，避免逐帧 `Instant::now()` 污染结果；
-需要观察相邻帧 delivery gap 时再设为正数，例如 `--sample-every 1`。
+`local_pipeline --mode` 当前支持：
 
-`live_ws_latency` 是公网 live feed benchmark，默认订阅 Binance USD-M public
-`btcusdt@bookTicker`，但它只统计 transport/TLS/WS payload 可交付延迟，不解析
-交易所 JSON。`transport_recv_ns` 是用户态观察到 recv CQE / TCP read 返回的时间，
-不是 NIC 硬件 timestamp；同一 TCP/TLS chunk 内多条 WS message 会共享同一个
-transport timestamp。
+- `baseline`：unmarked `pump_data_spin`，不构造 metadata。
+- `marked_0_nohist`：marked pump，采样率 0%，不写 histograms，用于观察
+  metadata 分发成本。
+- `marked_100_nohist`：marked pump，采样率 100%，不写 histograms，用于观察
+  timestamp 成本。
+- `hist_1pct` / `hist_10pct` / `hist_100pct`：marked pump + HdrHistogram，
+  分别用 1%、10%、100% 采样率记录 observability histograms。
 
-`live_ws_latency` 的主要拆分指标：
+`--prom-out PATH` 会写 Prometheus text exposition snapshots。每个 interval
+snapshot 调用 `Pool::prometheus_metrics_and_reset_interval()`；最后额外写一次
+final interval 和 cumulative snapshot。主要 histogram family：
 
-- `recv_to_tls_plaintext_ns`：recv/read 观察点到 rustls 明文可见。
-- `plaintext_to_ws_payload_ns`：TLS 明文可见到完整 WS Text/Binary payload 可交付。
-- `payload_sink_ns`：payload 进入 bench sink 后的极小 checksum 工作。
-- `total_to_sink_ns`：recv/read 观察点到 sink 工作完成，不应解读为纯 parser 成本。
-- `messages_per_recv_cqe` / `messages_per_plaintext_chunk`：观察 live feed burst
-  是否把多条 WS message 批在同一个 recv CQE / TLS plaintext chunk 内。
+- `talaris_ws_latency_quantile_ns`
+- `talaris_ws_latency_samples`
+- `talaris_ws_latency_sum_ns`
+- `talaris_ws_latency_max_ns`
 
-### Tungstenite 对比
+关键 label：
 
-同机对比不要直接拿本机 tungstenite Criterion 结果和测试机 talaris 结果横比。
-当前采用一个临时 strict compare harness：
+- `stage="recv_to_plaintext" | "plaintext_to_ws" | "recv_to_ws"`
+- `chunk_position="chunk" | "all" | "first" | "queued"`
+- `window="interval" | "cumulative"`
 
-- 同一台 `ripple-testnet-tokyo`
-- 同一 `taskset -c 0-2`
-- 同一份 prebuilt wire
-- 同一 workload：`100k` mixed messages，`1/3` binary `u64`，`2/3` text
-  `{"id":i}`，sink 内 parse/sum
-- 同一 chunk size：`4096`
-- tungstenite 仓库不提交改动；临时 harness 通过 path dependency 调用
-  `~/tungstenite-rs`
-
-结果：
-
-| impl | time / 100k msg | ns/msg | msg/s |
-|---|---:|---:|---:|
-| `talaris` | `1.57-1.66 ms` | `15-16` | `60-63M` |
-| `tungstenite` | `7.63-7.94 ms` | `76-79` | `12.6-13.1M` |
-
-这个结论只覆盖我们关心的 client inbound decode/dispatch hot path；`e2e`、
-outbound、TLS、大 payload 等场景需要单独 benchmark，不能外推。
+`recv_to_plaintext` 是 chunk-level；`plaintext_to_ws` 和 `recv_to_ws` 是
+message-level，并按同一 plaintext chunk 内第一条 message 与后续 queued
+message 拆分。这里的 recv 时间是用户态观察 recv CQE 的时间，不是 NIC 硬件
+timestamp。
 
 ---
 
