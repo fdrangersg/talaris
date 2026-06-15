@@ -607,3 +607,30 @@ pub fn print_ingress_stats(handle: talaris::ConnHandle, stats: Option<IngressSta
         fmt_int(stats.recv_ring_exhaustions)
     );
 }
+
+#[must_use]
+pub const fn ingress_stats_delta(before: IngressStats, after: IngressStats) -> IngressStats {
+    IngressStats {
+        recv_data_cqes: after.recv_data_cqes.saturating_sub(before.recv_data_cqes),
+        recv_bytes: after.recv_bytes.saturating_sub(before.recv_bytes),
+        recv_multishot_rearms: after
+            .recv_multishot_rearms
+            .saturating_sub(before.recv_multishot_rearms),
+        recv_ring_exhaustions: after
+            .recv_ring_exhaustions
+            .saturating_sub(before.recv_ring_exhaustions),
+        plaintext_chunks: after
+            .plaintext_chunks
+            .saturating_sub(before.plaintext_chunks),
+        plaintext_bytes: after.plaintext_bytes.saturating_sub(before.plaintext_bytes),
+        ws_data_drains: after.ws_data_drains.saturating_sub(before.ws_data_drains),
+        ws_data_drain_skips: after
+            .ws_data_drain_skips
+            .saturating_sub(before.ws_data_drain_skips),
+        ws_data_events: after.ws_data_events.saturating_sub(before.ws_data_events),
+        ws_text_events: after.ws_text_events.saturating_sub(before.ws_text_events),
+        ws_binary_events: after
+            .ws_binary_events
+            .saturating_sub(before.ws_binary_events),
+    }
+}

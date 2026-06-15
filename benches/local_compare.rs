@@ -21,6 +21,9 @@ fn main() {
 #[path = "common.rs"]
 mod common;
 
+use std::io::{Read, Write};
+use std::net::TcpStream;
+
 #[cfg(target_os = "linux")]
 fn main() {
     if let Err(e) = run() {
@@ -179,6 +182,7 @@ fn run_talaris_once(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         pump_talaris(&mut pool, cfg.spin_iters, &mut warmup)?;
     }
 
+    let ingress_before = pool.ingress_stats(handle);
     let mut stats = common::MessageStats::default();
     let cpu = common::ThreadCpuTimer::start();
     let started = std::time::Instant::now();
@@ -189,7 +193,11 @@ fn run_talaris_once(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let elapsed = started.elapsed();
     let cpu_elapsed = cpu.elapsed();
     common::print_result("local_compare", "talaris", &stats, elapsed, cpu_elapsed);
-    common::print_ingress_stats(handle, pool.ingress_stats(handle));
+    let ingress_delta = match (ingress_before, pool.ingress_stats(handle)) {
+        (Some(before), Some(after)) => Some(common::ingress_stats_delta(before, after)),
+        _ => None,
+    };
+    common::print_ingress_stats(handle, ingress_delta);
 
     drop(pool);
     server.join()?;
@@ -217,8 +225,6 @@ fn record_talaris_event(stats: &mut common::MessageStats, ev: &talaris::ws::Data
 }
 
 fn run_tungstenite_once(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    use std::net::TcpStream;
-
     use tungstenite::client::{IntoClientRequest, client};
 
     let server =
@@ -228,6 +234,7 @@ fn run_tungstenite_once(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> 
 
     let stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true)?;
+    let stream = CountingStream::new(stream);
     let request = format!("ws://localhost:{}/", addr.port()).into_client_request()?;
     let (mut socket, _) = client(request, stream)?;
 
@@ -236,6 +243,7 @@ fn run_tungstenite_once(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> 
         record_tungstenite_message(&mut warmup, socket.read()?)?;
     }
 
+    socket.get_mut().reset_read_stats();
     let mut stats = common::MessageStats::default();
     let cpu = common::ThreadCpuTimer::start();
     let started = std::time::Instant::now();
@@ -246,10 +254,87 @@ fn run_tungstenite_once(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> 
     let elapsed = started.elapsed();
     let cpu_elapsed = cpu.elapsed();
     common::print_result("local_compare", "tungstenite", &stats, elapsed, cpu_elapsed);
+    print_stream_stats("tungstenite", &stats, socket.get_ref().read_stats());
 
     drop(socket);
     server.join()?;
     Ok(())
+}
+
+#[derive(Debug)]
+struct CountingStream {
+    inner: TcpStream,
+    read_calls: u64,
+    read_bytes: u64,
+}
+
+impl CountingStream {
+    const fn new(inner: TcpStream) -> Self {
+        Self {
+            inner,
+            read_calls: 0,
+            read_bytes: 0,
+        }
+    }
+
+    const fn read_stats(&self) -> StreamReadStats {
+        StreamReadStats {
+            calls: self.read_calls,
+            bytes: self.read_bytes,
+        }
+    }
+
+    const fn reset_read_stats(&mut self) {
+        self.read_calls = 0;
+        self.read_bytes = 0;
+    }
+}
+
+impl Read for CountingStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.read_calls = self.read_calls.saturating_add(1);
+            self.read_bytes = self.read_bytes.saturating_add(n as u64);
+        }
+        Ok(n)
+    }
+}
+
+impl Write for CountingStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StreamReadStats {
+    calls: u64,
+    bytes: u64,
+}
+
+fn print_stream_stats(mode: &str, messages: &common::MessageStats, reads: StreamReadStats) {
+    let messages_per_read = if reads.calls == 0 {
+        0.0
+    } else {
+        messages.messages as f64 / reads.calls as f64
+    };
+    let bytes_per_read = if reads.calls == 0 {
+        0.0
+    } else {
+        reads.bytes as f64 / reads.calls as f64
+    };
+    println!(
+        "bench_stream mode={mode} read_calls={} read_bytes={} messages_per_read={:.3} bytes_per_read={:.1}",
+        common::fmt_int(reads.calls),
+        common::fmt_int(reads.bytes),
+        messages_per_read,
+        bytes_per_read
+    );
 }
 
 fn record_tungstenite_message(
