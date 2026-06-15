@@ -212,8 +212,19 @@ fn run_talaris_once(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(pool.state(handle), Some(talaris::connection::State::Open));
 
     let mut warmup = common::MessageStats::default();
+    let mut warmup_latency = if cfg.timestamps {
+        Some(TalarisLatencyStats::new()?)
+    } else {
+        None
+    };
     while warmup.messages < cfg.warmup_messages {
-        pump_talaris(&mut pool, cfg.spin_iters, cfg.timestamps, &mut warmup, None)?;
+        pump_talaris(
+            &mut pool,
+            cfg.spin_iters,
+            cfg.timestamps,
+            &mut warmup,
+            warmup_latency.as_mut(),
+        )?;
     }
 
     let ingress_before = pool.ingress_stats(handle);
