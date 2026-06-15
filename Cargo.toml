@@ -99,6 +99,10 @@ harness = false
 name    = "local_redundancy"
 harness = false
 
+[[bench]]
+name    = "live_redundancy"
+harness = false
+
 # ─── lints ──────────────────────────────────────────────────────────────
 [lints.rust]
 unsafe_op_in_unsafe_fn        = "warn"
