@@ -286,8 +286,8 @@ impl TlsAdapter {
     where
         F: FnMut(&[u8]),
     {
+        let mut reader = self.conn.reader();
         loop {
-            let mut reader = self.conn.reader();
             match reader.fill_buf() {
                 Ok([]) => break,
                 Ok(chunk) => {
