@@ -536,7 +536,7 @@ Tested on Linux 6.x with io_uring features: `SETUP_CQSIZE`, `SETUP_COOP_TASKRUN`
 
 ## Benchmark suite
 
-`benches/` 现在只保留两条 Linux-only pipeline bench。它们不使用 Criterion
+`benches/` 现在保留 Linux-only pipeline、tuning 和 strict-compare benches。它们不使用 Criterion
 sampling：talaris 的 hot path 是长生命周期 io_uring `recv_multishot`、PBUF
 recycle、TLS/WS staging 和 CQE drain，不适合把一次 `pump_data` 包进短采样
 iteration。非 Linux 只构建并打印 `skipped`，用于保持本地
@@ -553,6 +553,7 @@ iteration。非 Linux 只构建并打印 `skipped`，用于保持本地
 | bench | 测什么 |
 |---|---|
 | `local_pipeline` | loopback plain WS，真实 `Pool + io_uring + PBUF + WS pump`。用于比较 unmarked、marked、采样和 HdrHistogram 记录的 hot-path 成本 |
+| `local_tuning` | loopback plain WS talaris 参数矩阵：扫 `payload × frames-per-write × buf_size × buf_entries × completion_batch × spin_iters`，输出 CSV 和 top variants |
 | `local_compare` | loopback plain WS strict A/B：同一个 stream server、payload、frames-per-write、sink checksum 和 CPU pinning，比较 talaris baseline 与 tungstenite |
 | `live_pipeline` | live TLS WebSocket，使用生产 `Pool::pump_data_spin_marked` 和当前 observability / Prometheus 导出口径 |
 
@@ -576,6 +577,18 @@ taskset -c 0-2 cargo bench --bench local_compare -- \
     --payload 256 \
     --frames-per-write 16 \
     --warmup-messages 100000 \
+    --user-cpu 1 --server-cpu 2
+
+taskset -c 0-2 cargo bench --bench local_tuning -- \
+    --seconds 1 \
+    --payloads 64,256,1024 \
+    --frames-per-write 1,4,16,32 \
+    --buf-sizes 1024,2048,4096,8192,16384,32768 \
+    --buf-entries 256,512 \
+    --completion-batches 64,256 \
+    --spin-iters 256,1024 \
+    --warmup-messages 200000 \
+    --csv /tmp/talaris-tuning.csv \
     --user-cpu 1 --server-cpu 2
 
 taskset -c 0-2 cargo bench --bench live_pipeline -- \

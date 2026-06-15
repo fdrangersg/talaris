@@ -58,6 +58,30 @@ pub fn arg_string(flag: &str, default: &str) -> String {
     optional_arg(flag).unwrap_or_else(|| default.to_owned())
 }
 
+pub fn arg_list<T>(flag: &str, default: &str) -> Result<Vec<T>, String>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    let raw = arg_string(flag, default);
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        out.push(
+            part.parse::<T>()
+                .map_err(|e| format!("{flag} has invalid value {part:?}: {e}"))?,
+        );
+    }
+    if out.is_empty() {
+        Err(format!("{flag} must contain at least one value"))
+    } else {
+        Ok(out)
+    }
+}
+
 pub fn flag_present(flag: &str) -> bool {
     std::env::args().skip(1).any(|arg| arg == flag)
 }

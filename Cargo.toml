@@ -88,6 +88,10 @@ name    = "local_compare"
 harness = false
 
 [[bench]]
+name    = "local_tuning"
+harness = false
+
+[[bench]]
 name    = "live_pipeline"
 harness = false
 
