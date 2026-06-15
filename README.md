@@ -556,6 +556,9 @@ iteration。非 Linux 只构建并打印 `skipped`，用于保持本地
 | `local_tuning` | loopback plain WS talaris 参数矩阵：扫 `payload × frames-per-write × buf_size × buf_entries × completion_batch × spin_iters`，输出 CSV 和 top variants |
 | `local_compare` | loopback plain WS strict A/B：同一个 stream server、payload、frames-per-write、sink checksum 和 CPU pinning，比较 talaris baseline 与 tungstenite |
 | `live_pipeline` | live TLS WebSocket，使用生产 `Pool::pump_data_spin_marked` 和当前 observability / Prometheus 导出口径 |
+| `live_compare` | live Binance USD-M BBO strict A/B：talaris 与 tungstenite 同时订阅相同 combined streams，记录同类 socket/read-to-message 延迟 |
+| `local_redundancy` | loopback BBO redundant-connection race simulation：同一 seq stream 多连接输入，评估去重前 duplicate 放大成本 |
+| `live_redundancy` | live Binance BBO 多冗余连接观测：记录 fastest-copy / duplicate / stale 分类和 duplicate lag |
 
 跑法示例：
 ```bash
@@ -600,7 +603,121 @@ taskset -c 0-2 cargo bench --bench live_pipeline -- \
     --metrics-interval-ms 1000 \
     --prom-out /tmp/talaris-live.prom \
     --user-cpu 1
+
+taskset -c 0-3 cargo bench --bench live_compare -- \
+    --transport both \
+    --stream-counts 4 \
+    --redundancy-counts 1,2,4,8,16,32 \
+    --seconds 30 \
+    --symbols btcusdt,ethusdt,bnbusdt,solusdt \
+    --sample-bps 10000 \
+    --buf-size 1024 \
+    --buf-entries 512 \
+    --completion-batch 64 \
+    --spin-iters 256 \
+    --talaris-cpu 1 \
+    --tungstenite-cpu 2
 ```
+
+### 2026-06-15 live Binance BBO conclusions
+
+以下结果来自 `ripple-testnet-tokyo`，commit `7e6fc78`。测试目标是验证
+Ripple 当前 workload：Binance USD-M Perpetual BBO，TLS WebSocket inbound，
+业务追求可预测、极低的 message pump latency，并接受 busy-spin 独占 CPU。
+
+测试口径：
+
+- `live_compare` 同时启动 talaris 与 tungstenite，订阅相同 Binance combined
+  streams，避免顺序 A/B 被市场活跃度变化污染。
+- talaris：单线程、单 `Pool`、单 io_uring、`pump_data_spin_marked(256)`、
+  pin CPU 1。
+- tungstenite：blocking read；冗余矩阵里每条冗余连接一个 reader thread，
+  全部 pin CPU 2 后聚合。
+- talaris latency 使用 `recv_to_ws`，并拆 `recv_to_plaintext` /
+  `plaintext_to_ws`；tungstenite 使用底层 socket read return 到
+  `Message` 返回，记为 `socket_read_to_ws`。
+- 这里的 recv/read timestamp 都是用户态观察点，不是 NIC hardware timestamp。
+
+#### 2/3/4 路 combined-stream A/B
+
+日志：
+`/tmp/talaris-benches/78d55a2-live-compare-20260615T124646Z/live_compare_2_3_4.log`
+
+单位：microseconds。
+
+| streams | client | msg/s | p50 | p99 | p999 | queued p99 |
+|---:|---|---:|---:|---:|---:|---:|
+| 2 | talaris | 968.017 | 1.049 | 13.351 | 137.471 | 16.991 |
+| 2 | tungstenite | 967.368 | 5.919 | 24.511 | 35.775 | 26.735 |
+| 3 | talaris | 993.683 | 1.024 | 5.959 | 11.575 | 7.471 |
+| 3 | tungstenite | 997.360 | 6.195 | 18.111 | 28.255 | 19.983 |
+| 4 | talaris | 703.900 | 0.980 | 5.059 | 15.583 | 6.531 |
+| 4 | tungstenite | 703.923 | 6.039 | 14.855 | 22.031 | 16.831 |
+
+结论：
+
+- 在 2/3/4 路 live BBO 下，talaris 的 p50 / p99 明显低于 tungstenite。
+- 2 路 talaris 有一次 `recv_to_plaintext` 128 us 级 p999 outlier，导致总
+  p999 高于 tungstenite；这不是 WS parser 本身的常态表现。
+- 3/4 路下，talaris p50 / p99 / p999 均优于 tungstenite。
+- 对当前 Ripple 低延迟行情入口目标，talaris 是更合适的生产方案；前提是
+  给它独占 CPU，并接受 busy-spin 的 CPU 成本。
+
+#### 4-stream BBO redundancy amplification
+
+日志：
+
+- `/tmp/talaris-benches/7e6fc78-redundancy-boundary-20260615T125939Z/live_compare_stream4_red_1_32.log`
+- `/tmp/talaris-benches/7e6fc78-redundancy-boundary-20260615T125939Z/live_compare_stream4_red_24_40.log`
+
+单位：microseconds。冗余数表示同一 4-stream combined BBO 建 N 条相同
+WebSocket 连接；talaris 用一个 Pool 单线程处理 N 条连接，tungstenite 用 N
+个 blocking reader thread 后聚合。
+
+| redundancy | talaris msg/s | tung msg/s | talaris p50 | tung p50 | talaris p99 | tung p99 | talaris p999 | tung p999 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1,104 | 1,105 | 1.004 | 6.287 | 7.655 | 17.951 | 31.855 | 24.927 |
+| 2 | 4,436 | 4,435 | 1.008 | 4.503 | 11.791 | 29.199 | 21.295 | 49.503 |
+| 4 | 6,174 | 6,173 | 0.809 | 2.187 | 11.159 | 24.415 | 19.455 | 58.335 |
+| 8 | 14,323 | 14,323 | 0.921 | 2.171 | 10.207 | 25.759 | 20.431 | 84.031 |
+| 16 | 17,935 | 17,933 | 0.815 | 1.870 | 13.807 | 20.703 | 28.959 | 121.343 |
+| 24 | 38,708 | 38,696 | 1.000 | 2.167 | 18.975 | 17.743 | 40.639 | 51.551 |
+| 32 | 30,814 | 31,229 | 0.681 | 1.886 | 21.199 | 18.495 | 55.487 | 66.751 |
+| 40 | 44,288 | 44,363 | 1.071 | 2.611 | 30.191 | 19.151 | 84.543 | 45.407 |
+
+分界判断：
+
+- `p50`：到 40 路为止，talaris 仍明显更低。
+- `p99`：放大分界点在 `16 -> 24` 之间。16 路 talaris 仍领先；24 路开始
+  被 tungstenite 追上 / 反超。
+- `p999`：分界点在 `32 -> 40` 之间。32 路 talaris 仍略好；40 路 tail
+  明显恶化。
+- 吞吐：到 40 路没有出现明显吞吐断崖，两边 msg/s 基本一致；32/40 路
+  tungstenite 略高，但差距很小。
+- 18/20/22 路补点在建连阶段被 Binance peer reset / connection reset，
+  未采样成功；继续强打会被服务端连接保护机制污染。
+
+talaris 高冗余恶化来源可以通过 staging 解释。40 路时：
+
+| stage | p50 | p99 | p999 |
+|---|---:|---:|---:|
+| `recv_to_plaintext` | 0.535 | 14.991 | 47.455 |
+| `plaintext_to_ws` | 0.434 | 22.223 | 67.967 |
+| `recv_to_ws` | 1.071 | 30.191 | 84.543 |
+
+这说明 40 路的 tail 放大不是单纯 TLS 解密问题；同一 reactor 上多连接、
+同 chunk queued message parsing/dispatch 也开始成为 tail 来源。
+
+生产建议：
+
+- 默认冗余度建议先取 4 路。4 路下 talaris p50/p99/p999 为
+  `0.809 / 11.159 / 19.455 us`，明显优于 tungstenite，且距离 tail 放大区
+  有足够余量。
+- 8 路可作为高波动或特殊行情增强档；8 路仍保持明显 p99/p999 优势。
+- 不建议默认上 16+。16 路 bench 仍有优势，但已经接近 p99 放大区；超过
+  16 路必须按目标机器、目标 feed 和当前参数重新跑 `live_compare`。
+- 当前证据支持：在 Ripple 这类 BBO/行情入口场景下，若目标是可预测极低延迟
+  且可接受独占 CPU，talaris 是比 tungstenite 更合适的 IO 模型。
 
 `local_pipeline --mode` 当前支持：
 
