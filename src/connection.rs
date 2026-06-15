@@ -100,6 +100,14 @@ pub struct IngressStats {
     pub recv_multishot_rearms: u64,
     /// Multishot recv terminations caused by provided-buffer ring exhaustion.
     pub recv_ring_exhaustions: u64,
+    /// Consecutive plain TCP recv CQE runs handled by the data pump batch path.
+    pub plain_recv_batches: u64,
+    /// Total recv CQEs included in those plain TCP batch runs.
+    pub plain_recv_batch_cqes: u64,
+    /// Plain TCP batch runs parsed through the reusable copy scratch buffer.
+    pub plain_recv_copied_batches: u64,
+    /// Bytes copied into the reusable plain TCP batch scratch buffer.
+    pub plain_recv_copied_bytes: u64,
     /// Plaintext chunks fed into the WebSocket parser. For TLS connections this
     /// counts rustls plaintext chunks; for plain TCP this counts recv CQEs.
     pub plaintext_chunks: u64,

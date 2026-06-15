@@ -178,6 +178,10 @@ struct ResultRow {
     ws_events: u64,
     rearms: u64,
     ring_exhaustions: u64,
+    plain_batches: u64,
+    plain_batch_cqes: u64,
+    plain_copied_batches: u64,
+    plain_copied_bytes: u64,
     messages_per_recv_cqe: f64,
     messages_per_plaintext_chunk: f64,
     checksum: u64,
@@ -324,6 +328,10 @@ fn run_variant(cfg: &Config, variant: Variant) -> Result<ResultRow, Box<dyn std:
         ws_events: ingress.ws_data_events,
         rearms: ingress.recv_multishot_rearms,
         ring_exhaustions: ingress.recv_ring_exhaustions,
+        plain_batches: ingress.plain_recv_batches,
+        plain_batch_cqes: ingress.plain_recv_batch_cqes,
+        plain_copied_batches: ingress.plain_recv_copied_batches,
+        plain_copied_bytes: ingress.plain_recv_copied_bytes,
         messages_per_recv_cqe: ratio(stats.messages, ingress.recv_data_cqes),
         messages_per_plaintext_chunk: ratio(stats.messages, ingress.plaintext_chunks),
         checksum: stats.checksum(),
@@ -373,6 +381,18 @@ const fn diff_ingress(
         recv_ring_exhaustions: after
             .recv_ring_exhaustions
             .saturating_sub(before.recv_ring_exhaustions),
+        plain_recv_batches: after
+            .plain_recv_batches
+            .saturating_sub(before.plain_recv_batches),
+        plain_recv_batch_cqes: after
+            .plain_recv_batch_cqes
+            .saturating_sub(before.plain_recv_batch_cqes),
+        plain_recv_copied_batches: after
+            .plain_recv_copied_batches
+            .saturating_sub(before.plain_recv_copied_batches),
+        plain_recv_copied_bytes: after
+            .plain_recv_copied_bytes
+            .saturating_sub(before.plain_recv_copied_bytes),
         plaintext_chunks: after
             .plaintext_chunks
             .saturating_sub(before.plaintext_chunks),
@@ -407,7 +427,7 @@ fn nonzero_list(name: &str, values: Vec<usize>) -> Result<Vec<usize>, String> {
 
 fn print_row(index: usize, row: &ResultRow) {
     println!(
-        "bench_tuning_result index={} payload={} frames_per_write={} buf={}x{} completion_batch={} spin_iters={} copy_batch_bytes={} messages={} bytes={} elapsed_ms={:.3} cpu_ms={:.3} msg_s={:.0} mib_s={:.3} cpu_ns_msg={} recv_cqes={} plaintext_chunks={} ws_events={} messages_per_recv_cqe={:.3} messages_per_plaintext_chunk={:.3} rearms={} ring_exhaustions={} checksum={}",
+        "bench_tuning_result index={} payload={} frames_per_write={} buf={}x{} completion_batch={} spin_iters={} copy_batch_bytes={} messages={} bytes={} elapsed_ms={:.3} cpu_ms={:.3} msg_s={:.0} mib_s={:.3} cpu_ns_msg={} recv_cqes={} plaintext_chunks={} ws_events={} plain_batches={} plain_batch_cqes={} plain_copied_batches={} plain_copied_bytes={} messages_per_recv_cqe={:.3} messages_per_plaintext_chunk={:.3} rearms={} ring_exhaustions={} checksum={}",
         index,
         row.variant.payload_len,
         row.variant.frames_per_write,
@@ -426,6 +446,10 @@ fn print_row(index: usize, row: &ResultRow) {
         row.recv_cqes,
         row.plaintext_chunks,
         row.ws_events,
+        row.plain_batches,
+        row.plain_batch_cqes,
+        row.plain_copied_batches,
+        row.plain_copied_bytes,
         row.messages_per_recv_cqe,
         row.messages_per_plaintext_chunk,
         row.rearms,
@@ -457,7 +481,7 @@ impl CsvOutput {
         };
         writeln!(
             out,
-            "payload,frames_per_write,buf_size,buf_entries,sq_entries,cq_entries,completion_batch,spin_iters,copy_batch_bytes,messages,bytes,elapsed_ms,cpu_ms,msg_s,mib_s,cpu_ns_msg,recv_cqes,plaintext_chunks,ws_events,rearms,ring_exhaustions,messages_per_recv_cqe,messages_per_plaintext_chunk,checksum"
+            "payload,frames_per_write,buf_size,buf_entries,sq_entries,cq_entries,completion_batch,spin_iters,copy_batch_bytes,messages,bytes,elapsed_ms,cpu_ms,msg_s,mib_s,cpu_ns_msg,recv_cqes,plaintext_chunks,ws_events,rearms,ring_exhaustions,plain_batches,plain_batch_cqes,plain_copied_batches,plain_copied_bytes,messages_per_recv_cqe,messages_per_plaintext_chunk,checksum"
         )
     }
 
@@ -467,7 +491,7 @@ impl CsvOutput {
         };
         writeln!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.6},{},{},{},{},{},{},{:.6},{:.6},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.6},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{}",
             row.variant.payload_len,
             row.variant.frames_per_write,
             row.variant.buf_size,
@@ -489,6 +513,10 @@ impl CsvOutput {
             row.ws_events,
             row.rearms,
             row.ring_exhaustions,
+            row.plain_batches,
+            row.plain_batch_cqes,
+            row.plain_copied_batches,
+            row.plain_copied_bytes,
             row.messages_per_recv_cqe,
             row.messages_per_plaintext_chunk,
             row.checksum

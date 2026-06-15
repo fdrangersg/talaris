@@ -1006,6 +1006,38 @@ fn write_ingress_prometheus_help<W: fmt::Write>(out: &mut W) -> fmt::Result {
     )?;
     writeln!(
         out,
+        "# HELP talaris_ingress_plain_recv_batches_total Consecutive plain TCP recv CQE runs handled by the data-pump batch path."
+    )?;
+    writeln!(
+        out,
+        "# TYPE talaris_ingress_plain_recv_batches_total counter"
+    )?;
+    writeln!(
+        out,
+        "# HELP talaris_ingress_plain_recv_batch_cqes_total Total recv CQEs included in plain TCP data-pump batch runs."
+    )?;
+    writeln!(
+        out,
+        "# TYPE talaris_ingress_plain_recv_batch_cqes_total counter"
+    )?;
+    writeln!(
+        out,
+        "# HELP talaris_ingress_plain_recv_copied_batches_total Plain TCP data-pump batch runs parsed through the reusable copy scratch buffer."
+    )?;
+    writeln!(
+        out,
+        "# TYPE talaris_ingress_plain_recv_copied_batches_total counter"
+    )?;
+    writeln!(
+        out,
+        "# HELP talaris_ingress_plain_recv_copied_bytes_total Bytes copied into the reusable plain TCP data-pump batch scratch buffer."
+    )?;
+    writeln!(
+        out,
+        "# TYPE talaris_ingress_plain_recv_copied_bytes_total counter"
+    )?;
+    writeln!(
+        out,
         "# HELP talaris_ingress_plaintext_chunks_total Plaintext chunks fed into the WebSocket parser."
     )?;
     writeln!(out, "# TYPE talaris_ingress_plaintext_chunks_total counter")?;

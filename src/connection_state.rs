@@ -196,6 +196,26 @@ impl ConnectionState {
         )?;
         writeln!(
             out,
+            "talaris_ingress_plain_recv_batches_total{{conn_id=\"{conn_id}\"}} {}",
+            stats.plain_recv_batches
+        )?;
+        writeln!(
+            out,
+            "talaris_ingress_plain_recv_batch_cqes_total{{conn_id=\"{conn_id}\"}} {}",
+            stats.plain_recv_batch_cqes
+        )?;
+        writeln!(
+            out,
+            "talaris_ingress_plain_recv_copied_batches_total{{conn_id=\"{conn_id}\"}} {}",
+            stats.plain_recv_copied_batches
+        )?;
+        writeln!(
+            out,
+            "talaris_ingress_plain_recv_copied_bytes_total{{conn_id=\"{conn_id}\"}} {}",
+            stats.plain_recv_copied_bytes
+        )?;
+        writeln!(
+            out,
             "talaris_ingress_plaintext_chunks_total{{conn_id=\"{conn_id}\"}} {}",
             stats.plaintext_chunks
         )?;
@@ -432,10 +452,16 @@ impl ConnectionState {
         F: for<'a> FnMut(WsDataEvent<'a>),
     {
         debug_assert!(self.tls.is_none());
+        let batch_cqes = u64::try_from(completions.len()).unwrap_or(u64::MAX);
         if let Some(total_bytes) = self.plain_recv_batch_copy_len(completions) {
+            self.record_plain_recv_batch(
+                batch_cqes,
+                Some(u64::try_from(total_bytes).unwrap_or(u64::MAX)),
+            );
             return self.handle_plain_recv_data_batch_copied(completions, total_bytes, sink);
         }
 
+        self.record_plain_recv_batch(batch_cqes, None);
         self.handle_plain_recv_data_batch_slices(completions, sink)
     }
 
@@ -1174,6 +1200,28 @@ impl ConnectionState {
         if self.cfg.track_ingress_stats {
             self.ingress_stats.recv_ring_exhaustions =
                 self.ingress_stats.recv_ring_exhaustions.saturating_add(1);
+        }
+    }
+
+    #[inline]
+    fn record_plain_recv_batch(&mut self, cqes: u64, copied_bytes: Option<u64>) {
+        if self.cfg.track_ingress_stats {
+            self.ingress_stats.plain_recv_batches =
+                self.ingress_stats.plain_recv_batches.saturating_add(1);
+            self.ingress_stats.plain_recv_batch_cqes = self
+                .ingress_stats
+                .plain_recv_batch_cqes
+                .saturating_add(cqes);
+            if let Some(bytes) = copied_bytes {
+                self.ingress_stats.plain_recv_copied_batches = self
+                    .ingress_stats
+                    .plain_recv_copied_batches
+                    .saturating_add(1);
+                self.ingress_stats.plain_recv_copied_bytes = self
+                    .ingress_stats
+                    .plain_recv_copied_bytes
+                    .saturating_add(bytes);
+            }
         }
     }
 

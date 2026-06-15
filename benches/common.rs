@@ -601,8 +601,13 @@ pub fn print_ingress_stats(handle: talaris::ConnHandle, stats: Option<IngressSta
     } else {
         stats.recv_bytes as f64 / stats.recv_data_cqes as f64
     };
+    let cqes_per_plain_batch = if stats.plain_recv_batches == 0 {
+        0.0
+    } else {
+        stats.plain_recv_batch_cqes as f64 / stats.plain_recv_batches as f64
+    };
     println!(
-        "bench_ingress conn_id={} recv_cqes={} recv_bytes={} plaintext_chunks={} plaintext_bytes={} ws_data_drains={} ws_data_drain_skips={} ws_data_events={} text={} binary={} rearm={} ring_exhaustions={} messages_per_recv_cqe={:.3} bytes_per_recv_cqe={:.1}",
+        "bench_ingress conn_id={} recv_cqes={} recv_bytes={} plaintext_chunks={} plaintext_bytes={} ws_data_drains={} ws_data_drain_skips={} ws_data_events={} text={} binary={} rearm={} ring_exhaustions={} plain_batches={} plain_batch_cqes={} plain_copied_batches={} plain_copied_bytes={} cqes_per_plain_batch={:.3} messages_per_recv_cqe={:.3} bytes_per_recv_cqe={:.1}",
         handle.as_u32(),
         fmt_int(stats.recv_data_cqes),
         fmt_int(stats.recv_bytes),
@@ -615,6 +620,11 @@ pub fn print_ingress_stats(handle: talaris::ConnHandle, stats: Option<IngressSta
         fmt_int(stats.ws_binary_events),
         fmt_int(stats.recv_multishot_rearms),
         fmt_int(stats.recv_ring_exhaustions),
+        fmt_int(stats.plain_recv_batches),
+        fmt_int(stats.plain_recv_batch_cqes),
+        fmt_int(stats.plain_recv_copied_batches),
+        fmt_int(stats.plain_recv_copied_bytes),
+        cqes_per_plain_batch,
         messages_per_recv_cqe,
         bytes_per_recv_cqe
     );
@@ -631,6 +641,18 @@ pub const fn ingress_stats_delta(before: IngressStats, after: IngressStats) -> I
         recv_ring_exhaustions: after
             .recv_ring_exhaustions
             .saturating_sub(before.recv_ring_exhaustions),
+        plain_recv_batches: after
+            .plain_recv_batches
+            .saturating_sub(before.plain_recv_batches),
+        plain_recv_batch_cqes: after
+            .plain_recv_batch_cqes
+            .saturating_sub(before.plain_recv_batch_cqes),
+        plain_recv_copied_batches: after
+            .plain_recv_copied_batches
+            .saturating_sub(before.plain_recv_copied_batches),
+        plain_recv_copied_bytes: after
+            .plain_recv_copied_bytes
+            .saturating_sub(before.plain_recv_copied_bytes),
         plaintext_chunks: after
             .plaintext_chunks
             .saturating_sub(before.plaintext_chunks),
