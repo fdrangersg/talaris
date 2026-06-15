@@ -90,7 +90,9 @@ struct Config {
     mode: Mode,
     seconds: u64,
     messages: u64,
+    payload_profile: common::PayloadProfile,
     payload_len: usize,
+    actual_payload_len: usize,
     frames_per_write: usize,
     buf_size: u32,
     buf_entries: u16,
@@ -121,11 +123,17 @@ impl Config {
         common::validate_power_of_two_u32("--sq-entries", sq_entries)?;
         common::validate_power_of_two_u32("--cq-entries", cq_entries)?;
 
+        let payload_profile = common::arg_or("--payload-profile", common::PayloadProfile::Binary);
+        let payload_len = common::arg_or("--payload", 256_usize).max(1);
+        let actual_payload_len = payload_profile.payload_len(payload_len);
+
         Ok(Self {
             mode,
             seconds,
             messages,
-            payload_len: common::arg_or("--payload", 256_usize).max(1),
+            payload_profile,
+            payload_len,
+            actual_payload_len,
             frames_per_write: common::arg_or("--frames-per-write", 16_usize).max(1),
             buf_size,
             buf_entries,
@@ -145,11 +153,13 @@ impl Config {
 
     fn print(&self) {
         println!(
-            "bench_config bench=local_pipeline mode={} seconds={} messages={} payload={} frames_per_write={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} sample_bps={} histograms={} metrics_interval_ms={} prom_out={}",
+            "bench_config bench=local_pipeline mode={} seconds={} messages={} payload_profile={} payload={} actual_payload={} frames_per_write={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} sample_bps={} histograms={} metrics_interval_ms={} prom_out={}",
             self.mode.as_str(),
             self.seconds,
             self.messages,
+            self.payload_profile.as_str(),
             self.payload_len,
+            self.actual_payload_len,
             self.frames_per_write,
             self.buf_entries,
             self.buf_size,
@@ -174,8 +184,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::from_args()?;
     cfg.print();
 
-    let server =
-        common::spawn_local_stream_server(cfg.payload_len, cfg.frames_per_write, cfg.server_cpu)?;
+    let server = common::spawn_local_stream_server_with_profile(
+        cfg.payload_profile,
+        cfg.payload_len,
+        cfg.frames_per_write,
+        cfg.server_cpu,
+    )?;
     let addr = server.addr();
     let _pin = cfg.user_cpu.map(|cpu| common::PinGuard::pin("user", cpu));
 
@@ -184,7 +198,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with_sq_entries(cfg.sq_entries)
         .with_cq_entries(cfg.cq_entries)
         .with_buf_ring(cfg.buf_size, cfg.buf_entries)
-        .with_ws_limits(cfg.payload_len, cfg.payload_len as u64)
+        .with_ws_limits(cfg.actual_payload_len, cfg.actual_payload_len as u64)
         .with_ingress_stats(true)
         .with_observability_sample_rate_bps(cfg.mode.sample_bps())
         .with_observability_histograms(cfg.mode.histograms());
@@ -301,6 +315,7 @@ fn print_usage() {
          Args:\n\
            --seconds N               wall-clock run limit, 0 disables time limit\n\
            --messages N              message limit, 0 disables message limit\n\
+           --payload-profile binary|binance-bbo\n\
            --payload N               binary payload bytes per WS message\n\
            --frames-per-write N      server-side WS frames per write(2)\n\
            --buf-size N              io_uring provided buffer slot size\n\

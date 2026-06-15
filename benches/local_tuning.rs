@@ -44,6 +44,7 @@ struct Config {
     seconds: u64,
     messages: u64,
     warmup_messages: u64,
+    payload_profile: common::PayloadProfile,
     payloads: Vec<usize>,
     frames_per_writes: Vec<usize>,
     buf_sizes: Vec<u32>,
@@ -70,6 +71,7 @@ impl Config {
         }
 
         let payloads = nonzero_list("--payloads", common::arg_list("--payloads", "64,256,1024")?)?;
+        let payload_profile = common::arg_or("--payload-profile", common::PayloadProfile::Binary);
         let frames_per_writes = nonzero_list(
             "--frames-per-write",
             common::arg_list("--frames-per-write", "1,4,16,32")?,
@@ -97,6 +99,7 @@ impl Config {
             seconds,
             messages,
             warmup_messages: common::arg_or("--warmup-messages", 200_000_u64),
+            payload_profile,
             payloads,
             frames_per_writes,
             buf_sizes,
@@ -142,11 +145,12 @@ impl Config {
 
     fn print(&self, variants: usize) {
         println!(
-            "bench_config bench=local_tuning variants={} seconds={} messages={} warmup_messages={} payloads={:?} frames_per_write={:?} buf_sizes={:?} buf_entries={:?} completion_batches={:?} spin_iters={:?} post_progress_spin_iters={} sq_entries={} cq_entries={} copy_batch_bytes={} max_runs={} top={} csv={}",
+            "bench_config bench=local_tuning variants={} seconds={} messages={} warmup_messages={} payload_profile={} payloads={:?} frames_per_write={:?} buf_sizes={:?} buf_entries={:?} completion_batches={:?} spin_iters={:?} post_progress_spin_iters={} sq_entries={} cq_entries={} copy_batch_bytes={} max_runs={} top={} csv={}",
             variants,
             self.seconds,
             self.messages,
             self.warmup_messages,
+            self.payload_profile.as_str(),
             self.payloads,
             self.frames_per_writes,
             self.buf_sizes,
@@ -167,6 +171,8 @@ impl Config {
 #[derive(Clone, Copy, Debug)]
 struct ResultRow {
     variant: Variant,
+    payload_profile: common::PayloadProfile,
+    actual_payload_len: usize,
     sq_entries: u32,
     cq_entries: u32,
     post_progress_spin_iters: usize,
@@ -247,9 +253,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("bench_tuning_top count={}", cfg.top.min(rows.len()));
     for (rank, row) in rows.iter().take(cfg.top).enumerate() {
         println!(
-            "bench_tuning_top_row rank={} payload={} frames_per_write={} buf={}x{} completion_batch={} spin_iters={} post_progress_spin_iters={} copy_batch_bytes={} msg_s={:.0} cpu_ns_msg={} mib_s={:.3} messages_per_recv_cqe={:.3} messages_per_plaintext_chunk={:.3} ring_exhaustions={}",
+            "bench_tuning_top_row rank={} payload_profile={} payload={} actual_payload={} frames_per_write={} buf={}x{} completion_batch={} spin_iters={} post_progress_spin_iters={} copy_batch_bytes={} msg_s={:.0} cpu_ns_msg={} mib_s={:.3} messages_per_recv_cqe={:.3} messages_per_plaintext_chunk={:.3} ring_exhaustions={}",
             rank + 1,
+            row.payload_profile.as_str(),
             row.variant.payload_len,
+            row.actual_payload_len,
             row.variant.frames_per_write,
             row.variant.buf_entries,
             row.variant.buf_size,
@@ -270,7 +278,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_variant(cfg: &Config, variant: Variant) -> Result<ResultRow, Box<dyn std::error::Error>> {
-    let server = common::spawn_local_stream_server(
+    let actual_payload_len = cfg.payload_profile.payload_len(variant.payload_len);
+    let server = common::spawn_local_stream_server_with_profile(
+        cfg.payload_profile,
         variant.payload_len,
         variant.frames_per_write,
         cfg.server_cpu,
@@ -282,7 +292,7 @@ fn run_variant(cfg: &Config, variant: Variant) -> Result<ResultRow, Box<dyn std:
         .with_sq_entries(cfg.sq_entries)
         .with_cq_entries(cfg.cq_entries)
         .with_buf_ring(variant.buf_size, variant.buf_entries)
-        .with_ws_limits(variant.payload_len, variant.payload_len as u64)
+        .with_ws_limits(actual_payload_len, actual_payload_len as u64)
         .with_plain_recv_batch_copy_max_bytes(cfg.copy_batch_bytes)
         .with_ingress_stats(true)
         .with_observability_sample_rate_bps(0)
@@ -320,6 +330,8 @@ fn run_variant(cfg: &Config, variant: Variant) -> Result<ResultRow, Box<dyn std:
     let mib_s = common::mib_per_sec(stats.bytes, elapsed);
     Ok(ResultRow {
         variant,
+        payload_profile: cfg.payload_profile,
+        actual_payload_len,
         sq_entries: cfg.sq_entries,
         cq_entries: cfg.cq_entries,
         post_progress_spin_iters: cfg.post_progress_spin_iters,
@@ -435,9 +447,11 @@ fn nonzero_list(name: &str, values: Vec<usize>) -> Result<Vec<usize>, String> {
 
 fn print_row(index: usize, row: &ResultRow) {
     println!(
-        "bench_tuning_result index={} payload={} frames_per_write={} buf={}x{} completion_batch={} spin_iters={} post_progress_spin_iters={} copy_batch_bytes={} messages={} bytes={} elapsed_ms={:.3} cpu_ms={:.3} msg_s={:.0} mib_s={:.3} cpu_ns_msg={} recv_cqes={} plaintext_chunks={} ws_events={} plain_batches={} plain_batch_cqes={} plain_copied_batches={} plain_copied_bytes={} messages_per_recv_cqe={:.3} messages_per_plaintext_chunk={:.3} rearms={} ring_exhaustions={} checksum={}",
+        "bench_tuning_result index={} payload_profile={} payload={} actual_payload={} frames_per_write={} buf={}x{} completion_batch={} spin_iters={} post_progress_spin_iters={} copy_batch_bytes={} messages={} bytes={} elapsed_ms={:.3} cpu_ms={:.3} msg_s={:.0} mib_s={:.3} cpu_ns_msg={} recv_cqes={} plaintext_chunks={} ws_events={} plain_batches={} plain_batch_cqes={} plain_copied_batches={} plain_copied_bytes={} messages_per_recv_cqe={:.3} messages_per_plaintext_chunk={:.3} rearms={} ring_exhaustions={} checksum={}",
         index,
+        row.payload_profile.as_str(),
         row.variant.payload_len,
+        row.actual_payload_len,
         row.variant.frames_per_write,
         row.variant.buf_entries,
         row.variant.buf_size,
@@ -490,7 +504,7 @@ impl CsvOutput {
         };
         writeln!(
             out,
-            "payload,frames_per_write,buf_size,buf_entries,sq_entries,cq_entries,completion_batch,spin_iters,post_progress_spin_iters,copy_batch_bytes,messages,bytes,elapsed_ms,cpu_ms,msg_s,mib_s,cpu_ns_msg,recv_cqes,plaintext_chunks,ws_events,rearms,ring_exhaustions,plain_batches,plain_batch_cqes,plain_copied_batches,plain_copied_bytes,messages_per_recv_cqe,messages_per_plaintext_chunk,checksum"
+            "payload_profile,payload,actual_payload,frames_per_write,buf_size,buf_entries,sq_entries,cq_entries,completion_batch,spin_iters,post_progress_spin_iters,copy_batch_bytes,messages,bytes,elapsed_ms,cpu_ms,msg_s,mib_s,cpu_ns_msg,recv_cqes,plaintext_chunks,ws_events,rearms,ring_exhaustions,plain_batches,plain_batch_cqes,plain_copied_batches,plain_copied_bytes,messages_per_recv_cqe,messages_per_plaintext_chunk,checksum"
         )
     }
 
@@ -500,8 +514,10 @@ impl CsvOutput {
         };
         writeln!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.6},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.6},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{}",
+            row.payload_profile.as_str(),
             row.variant.payload_len,
+            row.actual_payload_len,
             row.variant.frames_per_write,
             row.variant.buf_size,
             row.variant.buf_entries,
@@ -553,6 +569,7 @@ fn print_usage() {
            --seconds N                  wall-clock seconds per variant, 0 disables time limit\n\
            --messages N                 message limit per variant, 0 disables message limit\n\
            --warmup-messages N          messages discarded before timing each variant\n\
+           --payload-profile binary|binance-bbo\n\
            --payloads A,B,C             payload byte sizes\n\
            --frames-per-write A,B,C     server-side WS frames per write(2)\n\
            --buf-sizes A,B,C            talaris provided-buffer slot sizes, powers of two\n\

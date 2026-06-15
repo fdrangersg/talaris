@@ -68,7 +68,9 @@ struct Config {
     seconds: u64,
     messages: u64,
     warmup_messages: u64,
+    payload_profile: common::PayloadProfile,
     payload_len: usize,
+    actual_payload_len: usize,
     frames_per_write: usize,
     buf_size: u32,
     buf_entries: u16,
@@ -99,12 +101,18 @@ impl Config {
         common::validate_power_of_two_u32("--sq-entries", sq_entries)?;
         common::validate_power_of_two_u32("--cq-entries", cq_entries)?;
 
+        let payload_profile = common::arg_or("--payload-profile", common::PayloadProfile::Binary);
+        let payload_len = common::arg_or("--payload", 256_usize).max(1);
+        let actual_payload_len = payload_profile.payload_len(payload_len);
+
         Ok(Self {
             transport,
             seconds,
             messages,
             warmup_messages: common::arg_or("--warmup-messages", 100_000_u64),
-            payload_len: common::arg_or("--payload", 256_usize).max(1),
+            payload_profile,
+            payload_len,
+            actual_payload_len,
             frames_per_write: common::arg_or("--frames-per-write", 16_usize).max(1),
             buf_size,
             buf_entries,
@@ -121,12 +129,14 @@ impl Config {
 
     fn print(&self) {
         println!(
-            "bench_config bench=local_compare transport={} seconds={} messages={} warmup_messages={} payload={} frames_per_write={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} post_progress_spin_iters={} copy_batch_bytes={}",
+            "bench_config bench=local_compare transport={} seconds={} messages={} warmup_messages={} payload_profile={} payload={} actual_payload={} frames_per_write={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} post_progress_spin_iters={} copy_batch_bytes={}",
             self.transport.as_str(),
             self.seconds,
             self.messages,
             self.warmup_messages,
+            self.payload_profile.as_str(),
             self.payload_len,
+            self.actual_payload_len,
             self.frames_per_write,
             self.buf_entries,
             self.buf_size,
@@ -162,8 +172,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_talaris_once(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    let server =
-        common::spawn_local_stream_server(cfg.payload_len, cfg.frames_per_write, cfg.server_cpu)?;
+    let server = common::spawn_local_stream_server_with_profile(
+        cfg.payload_profile,
+        cfg.payload_len,
+        cfg.frames_per_write,
+        cfg.server_cpu,
+    )?;
     let addr = server.addr();
     let _pin = cfg.user_cpu.map(|cpu| common::PinGuard::pin("user", cpu));
 
@@ -172,7 +186,7 @@ fn run_talaris_once(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .with_sq_entries(cfg.sq_entries)
         .with_cq_entries(cfg.cq_entries)
         .with_buf_ring(cfg.buf_size, cfg.buf_entries)
-        .with_ws_limits(cfg.payload_len, cfg.payload_len as u64)
+        .with_ws_limits(cfg.actual_payload_len, cfg.actual_payload_len as u64)
         .with_plain_recv_batch_copy_max_bytes(cfg.copy_batch_bytes)
         .with_ingress_stats(true)
         .with_observability_sample_rate_bps(0)
@@ -236,8 +250,12 @@ fn record_talaris_event(stats: &mut common::MessageStats, ev: &talaris::ws::Data
 fn run_tungstenite_once(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     use tungstenite::client::{IntoClientRequest, client};
 
-    let server =
-        common::spawn_local_stream_server(cfg.payload_len, cfg.frames_per_write, cfg.server_cpu)?;
+    let server = common::spawn_local_stream_server_with_profile(
+        cfg.payload_profile,
+        cfg.payload_len,
+        cfg.frames_per_write,
+        cfg.server_cpu,
+    )?;
     let addr = server.addr();
     let _pin = cfg.user_cpu.map(|cpu| common::PinGuard::pin("user", cpu));
 
@@ -383,6 +401,7 @@ fn print_usage() {
            --seconds N               wall-clock run limit, 0 disables time limit\n\
            --messages N              message limit, 0 disables message limit\n\
            --warmup-messages N       messages discarded before timing each transport\n\
+           --payload-profile binary|binance-bbo\n\
            --payload N               binary payload bytes per WS message\n\
            --frames-per-write N      server-side WS frames per write(2)\n\
            --buf-size N              talaris io_uring provided buffer slot size\n\

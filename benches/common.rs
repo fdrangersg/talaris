@@ -25,6 +25,43 @@ use talaris::ws::frame::{MAX_HEADER_LEN, OpCode, encode_header};
 use talaris::ws::handshake::compute_accept;
 
 pub const FULL_SAMPLE_BPS: u16 = 10_000;
+const BINANCE_BBO_TEXT: &str = "{\"e\":\"bookTicker\",\"u\":400900217,\"s\":\"BNBUSDT\",\"ps\":\"BNBUSDT\",\"E\":1568014460893,\"T\":1568014460891,\"b\":\"25.35190000\",\"B\":\"31.21000000\",\"a\":\"25.36520000\",\"A\":\"40.66000000\",\"st\":1}";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PayloadProfile {
+    Binary,
+    BinanceBbo,
+}
+
+impl PayloadProfile {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Binary => "binary",
+            Self::BinanceBbo => "binance-bbo",
+        }
+    }
+
+    #[must_use]
+    pub fn payload_len(self, binary_payload_len: usize) -> usize {
+        match self {
+            Self::Binary => binary_payload_len.max(1),
+            Self::BinanceBbo => BINANCE_BBO_TEXT.len(),
+        }
+    }
+}
+
+impl FromStr for PayloadProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "binary" => Ok(Self::Binary),
+            "binance-bbo" | "binance_bbo" => Ok(Self::BinanceBbo),
+            other => Err(format!("unknown payload profile {other:?}")),
+        }
+    }
+}
 
 pub fn arg_or<T>(flag: &str, default: T) -> T
 where
@@ -323,9 +360,23 @@ pub fn spawn_local_stream_server(
     frames_per_write: usize,
     server_cpu: Option<usize>,
 ) -> io::Result<LocalStreamServer> {
+    spawn_local_stream_server_with_profile(
+        PayloadProfile::Binary,
+        payload_len,
+        frames_per_write,
+        server_cpu,
+    )
+}
+
+pub fn spawn_local_stream_server_with_profile(
+    profile: PayloadProfile,
+    payload_len: usize,
+    frames_per_write: usize,
+    server_cpu: Option<usize>,
+) -> io::Result<LocalStreamServer> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let addr = listener.local_addr()?;
-    let chunk = encode_binary_frames(payload_len.max(1), frames_per_write.max(1));
+    let chunk = encode_profile_frames(profile, payload_len.max(1), frames_per_write.max(1));
     let join = thread::spawn(move || run_stream_server(listener, chunk, server_cpu));
     Ok(LocalStreamServer {
         addr,
@@ -376,12 +427,25 @@ pub fn payload(payload_len: usize) -> Vec<u8> {
 
 fn encode_binary_frames(payload_len: usize, frames: usize) -> Vec<u8> {
     let payload = payload(payload_len);
-    let mut out = Vec::with_capacity(frames * (payload_len + MAX_HEADER_LEN));
+    encode_frames(OpCode::Binary, &payload, frames)
+}
+
+fn encode_profile_frames(profile: PayloadProfile, payload_len: usize, frames: usize) -> Vec<u8> {
+    match profile {
+        PayloadProfile::Binary => encode_binary_frames(payload_len, frames),
+        PayloadProfile::BinanceBbo => {
+            encode_frames(OpCode::Text, BINANCE_BBO_TEXT.as_bytes(), frames)
+        }
+    }
+}
+
+fn encode_frames(opcode: OpCode, payload: &[u8], frames: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(frames * (payload.len() + MAX_HEADER_LEN));
     let mut header = [0_u8; MAX_HEADER_LEN];
     for _ in 0..frames {
-        let n = encode_header(&mut header, true, OpCode::Binary, None, payload_len as u64);
+        let n = encode_header(&mut header, true, opcode, None, payload.len() as u64);
         out.extend_from_slice(&header[..n]);
-        out.extend_from_slice(&payload);
+        out.extend_from_slice(payload);
     }
     out
 }
