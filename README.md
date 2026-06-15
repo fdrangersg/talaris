@@ -553,6 +553,7 @@ iteration。非 Linux 只构建并打印 `skipped`，用于保持本地
 | bench | 测什么 |
 |---|---|
 | `local_pipeline` | loopback plain WS，真实 `Pool + io_uring + PBUF + WS pump`。用于比较 unmarked、marked、采样和 HdrHistogram 记录的 hot-path 成本 |
+| `local_compare` | loopback plain WS strict A/B：同一个 stream server、payload、frames-per-write、sink checksum 和 CPU pinning，比较 talaris baseline 与 tungstenite |
 | `live_pipeline` | live TLS WebSocket，使用生产 `Pool::pump_data_spin_marked` 和当前 observability / Prometheus 导出口径 |
 
 跑法示例：
@@ -567,6 +568,14 @@ taskset -c 0-2 cargo bench --bench local_pipeline -- \
     --spin-iters 256 \
     --metrics-interval-ms 1000 \
     --prom-out /tmp/talaris-local.prom \
+    --user-cpu 1 --server-cpu 2
+
+taskset -c 0-2 cargo bench --bench local_compare -- \
+    --transport both \
+    --seconds 8 \
+    --payload 256 \
+    --frames-per-write 16 \
+    --warmup-messages 100000 \
     --user-cpu 1 --server-cpu 2
 
 taskset -c 0-2 cargo bench --bench live_pipeline -- \
