@@ -591,8 +591,18 @@ pub fn print_ingress_stats(handle: talaris::ConnHandle, stats: Option<IngressSta
         println!("bench_ingress conn_id={} unavailable", handle.as_u32());
         return;
     };
+    let messages_per_recv_cqe = if stats.recv_data_cqes == 0 {
+        0.0
+    } else {
+        stats.ws_data_events as f64 / stats.recv_data_cqes as f64
+    };
+    let bytes_per_recv_cqe = if stats.recv_data_cqes == 0 {
+        0.0
+    } else {
+        stats.recv_bytes as f64 / stats.recv_data_cqes as f64
+    };
     println!(
-        "bench_ingress conn_id={} recv_cqes={} recv_bytes={} plaintext_chunks={} plaintext_bytes={} ws_data_drains={} ws_data_drain_skips={} ws_data_events={} text={} binary={} rearm={} ring_exhaustions={}",
+        "bench_ingress conn_id={} recv_cqes={} recv_bytes={} plaintext_chunks={} plaintext_bytes={} ws_data_drains={} ws_data_drain_skips={} ws_data_events={} text={} binary={} rearm={} ring_exhaustions={} messages_per_recv_cqe={:.3} bytes_per_recv_cqe={:.1}",
         handle.as_u32(),
         fmt_int(stats.recv_data_cqes),
         fmt_int(stats.recv_bytes),
@@ -604,7 +614,9 @@ pub fn print_ingress_stats(handle: talaris::ConnHandle, stats: Option<IngressSta
         fmt_int(stats.ws_text_events),
         fmt_int(stats.ws_binary_events),
         fmt_int(stats.recv_multishot_rearms),
-        fmt_int(stats.recv_ring_exhaustions)
+        fmt_int(stats.recv_ring_exhaustions),
+        messages_per_recv_cqe,
+        bytes_per_recv_cqe
     );
 }
 

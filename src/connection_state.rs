@@ -410,6 +410,119 @@ impl ConnectionState {
         }
     }
 
+    #[inline]
+    pub(crate) fn can_handle_plain_recv_data_batch(&self, c: Completion) -> bool {
+        self.tls.is_none()
+            && matches!(self.state, State::Open)
+            && c.user_data.kind() == Some(OpKind::Recv)
+            && c.result > 0
+            && c.buffer_id().is_some()
+    }
+
+    pub(crate) fn handle_plain_recv_data_batch<F>(
+        &mut self,
+        completions: &[Completion],
+        sink: &mut F,
+    ) -> Result<usize, ConnectionError>
+    where
+        F: for<'a> FnMut(WsDataEvent<'a>),
+    {
+        debug_assert!(self.tls.is_none());
+
+        let mut drained_events = 0_usize;
+        let mut plaintext_chunks = 0_u64;
+        let mut plaintext_bytes = 0_u64;
+        let mut text_events = 0_u64;
+        let mut binary_events = 0_u64;
+        let mut first_err = None;
+
+        for &c in completions {
+            if !c.has_more() {
+                self.multishot_armed = false;
+            }
+
+            let Some(bid) = c.buffer_id() else {
+                if first_err.is_none() {
+                    first_err = Some(match c.to_result() {
+                        Ok(0) => {
+                            self.state = State::Closed;
+                            ConnectionError::PeerClosed
+                        }
+                        Ok(_) => ConnectionError::InvalidState(self.state),
+                        Err(e) if is_recv_buffer_ring_exhausted(&e) => {
+                            self.record_recv_ring_exhaustion();
+                            self.multishot_armed = false;
+                            continue;
+                        }
+                        Err(e) => ConnectionError::RecvFailed(e),
+                    });
+                }
+                continue;
+            };
+
+            let n = match c.to_result() {
+                Ok(0) => {
+                    self.buf_ring.as_mut().expect("buf_ring").recycle(bid);
+                    self.state = State::Closed;
+                    if first_err.is_none() {
+                        first_err = Some(ConnectionError::PeerClosed);
+                    }
+                    continue;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    self.buf_ring.as_mut().expect("buf_ring").recycle(bid);
+                    if first_err.is_none() {
+                        first_err = Some(ConnectionError::RecvFailed(e));
+                    }
+                    continue;
+                }
+            };
+
+            self.record_recv_data(n);
+
+            if first_err.is_none() {
+                plaintext_chunks = plaintext_chunks.saturating_add(1);
+                plaintext_bytes = plaintext_bytes.saturating_add(n as u64);
+                let bytes_ptr = self
+                    .buf_ring
+                    .as_ref()
+                    .expect("buf_ring")
+                    .buffer(bid)
+                    .as_ptr();
+                // SAFETY: the selected provided buffer remains owned by this
+                // connection until it is recycled below, after the sink returns.
+                let bytes: &[u8] = unsafe { std::slice::from_raw_parts(bytes_ptr, n) };
+                let result = self
+                    .ws
+                    .drain_data_events_from_ingress(bytes, |ev| {
+                        drained_events = drained_events.saturating_add(1);
+                        match ev {
+                            WsDataEvent::Text(_) => text_events = text_events.saturating_add(1),
+                            WsDataEvent::Binary(_) => {
+                                binary_events = binary_events.saturating_add(1);
+                            }
+                        }
+                        sink(ev);
+                    })
+                    .map_err(ConnectionError::Ws);
+                if let Err(e) = result
+                    && first_err.is_none()
+                {
+                    first_err = Some(e);
+                }
+            }
+
+            self.buf_ring.as_mut().expect("buf_ring").recycle(bid);
+        }
+
+        self.record_plaintext(plaintext_chunks, plaintext_bytes);
+        self.record_ws_data_drains(plaintext_chunks, 0);
+        self.record_ws_data_events(text_events, binary_events);
+
+        first_err.map_or(Ok(drained_events), Err)
+    }
+
     pub(crate) fn handle_completion_data_marked<F>(
         &mut self,
         proactor: &mut Proactor,
@@ -975,12 +1088,20 @@ impl ConnectionState {
     fn record_ws_data_drain_attempt(&mut self, dirty: bool) {
         if self.cfg.track_ingress_stats {
             if dirty {
-                self.ingress_stats.ws_data_drains =
-                    self.ingress_stats.ws_data_drains.saturating_add(1);
+                self.record_ws_data_drains(1, 0);
             } else {
-                self.ingress_stats.ws_data_drain_skips =
-                    self.ingress_stats.ws_data_drain_skips.saturating_add(1);
+                self.record_ws_data_drains(0, 1);
             }
+        }
+    }
+
+    #[inline]
+    fn record_ws_data_drains(&mut self, drains: u64, skips: u64) {
+        if self.cfg.track_ingress_stats {
+            self.ingress_stats.ws_data_drains =
+                self.ingress_stats.ws_data_drains.saturating_add(drains);
+            self.ingress_stats.ws_data_drain_skips =
+                self.ingress_stats.ws_data_drain_skips.saturating_add(skips);
         }
     }
 

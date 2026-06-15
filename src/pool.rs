@@ -430,9 +430,8 @@ impl Pool {
         self.pump_data_spin_marked_impl(spin_iters, sink)
     }
 
-    /// data-only pump 实现。每条 CQE 路由完成后立刻 drain 对应连接的 WS 事件，
-    /// 只把 Text/Binary 交给业务。这样 burst 内第一条行情不必等待整批 CQE 都完成
-    /// TLS 解密后才进入 sink。
+    /// data-only pump 实现。CQE drain 后按连接路由；同一连接连续 plain recv
+    /// data CQE 会在连接内批量推进，仍按 CQE 顺序立刻把 Text/Binary 交给业务。
     fn pump_data_impl<F>(&mut self, wait_nr: usize, mut sink: F) -> Result<(), ConnectionError>
     where
         F: for<'a> FnMut(ConnHandle, WsDataEvent<'a>),
@@ -463,20 +462,7 @@ impl Pool {
 
         completions_buf.clear();
         proactor.drain_completions(|c| completions_buf.push(c));
-        for &c in completions_buf.iter() {
-            let conn_id =
-                u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
-            if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
-                let handle = ConnHandle(conn.conn_id());
-                match conn.handle_completion_data(proactor, c, |ev| sink(handle, ev)) {
-                    Ok(_) => {
-                        conn.sync_ws_open_state();
-                        conn.sync_ws_close_state();
-                    }
-                    Err(e) => fail_conn(conn, e, &mut first_err),
-                }
-            }
-        }
+        dispatch_conn_completions_data(conns, proactor, completions_buf, &mut sink, &mut first_err);
 
         sync_active_count(conns, active_count);
         first_err.map_or(Ok(()), Err)
@@ -862,6 +848,11 @@ fn submit_conn_ops(
     }
 }
 
+#[inline]
+fn completion_conn_id(c: Completion) -> u32 {
+    u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32")
+}
+
 fn drain_conn_completions(
     conns: &mut [Option<ConnectionState>],
     proactor: &mut Proactor,
@@ -896,21 +887,65 @@ where
 {
     completions_buf.clear();
     let count = proactor.drain_completions(|c| completions_buf.push(c));
-    for &c in completions_buf.iter() {
-        let conn_id =
-            u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
-        if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
-            let handle = ConnHandle(conn.conn_id());
-            match conn.handle_completion_data(proactor, c, |ev| sink(handle, ev)) {
-                Ok(_) => {
-                    conn.sync_ws_open_state();
-                    conn.sync_ws_close_state();
+    dispatch_conn_completions_data(conns, proactor, completions_buf, sink, first_err);
+    count
+}
+
+fn dispatch_conn_completions_data<F>(
+    conns: &mut [Option<ConnectionState>],
+    proactor: &mut Proactor,
+    completions_buf: &[Completion],
+    sink: &mut F,
+    first_err: &mut Option<ConnectionError>,
+) where
+    F: for<'a> FnMut(ConnHandle, WsDataEvent<'a>),
+{
+    let mut i = 0_usize;
+    while i < completions_buf.len() {
+        let c = completions_buf[i];
+        let conn_id = completion_conn_id(c);
+        let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) else {
+            i += 1;
+            continue;
+        };
+
+        let handle = ConnHandle(conn.conn_id());
+        if conn.can_handle_plain_recv_data_batch(c) {
+            let mut end = i + 1;
+            while end < completions_buf.len() {
+                let next = completions_buf[end];
+                if completion_conn_id(next) != conn_id
+                    || !conn.can_handle_plain_recv_data_batch(next)
+                {
+                    break;
                 }
-                Err(e) => fail_conn(conn, e, first_err),
+                end += 1;
+            }
+
+            if end > i + 1 {
+                match conn.handle_plain_recv_data_batch(&completions_buf[i..end], &mut |ev| {
+                    sink(handle, ev);
+                }) {
+                    Ok(_) => {
+                        conn.sync_ws_open_state();
+                        conn.sync_ws_close_state();
+                    }
+                    Err(e) => fail_conn(conn, e, first_err),
+                }
+                i = end;
+                continue;
             }
         }
+
+        match conn.handle_completion_data(proactor, c, |ev| sink(handle, ev)) {
+            Ok(_) => {
+                conn.sync_ws_open_state();
+                conn.sync_ws_close_state();
+            }
+            Err(e) => fail_conn(conn, e, first_err),
+        }
+        i += 1;
     }
-    count
 }
 
 fn drain_conn_completions_data_marked<F>(
