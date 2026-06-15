@@ -96,6 +96,10 @@ name    = "live_pipeline"
 harness = false
 
 [[bench]]
+name    = "live_compare"
+harness = false
+
+[[bench]]
 name    = "local_redundancy"
 harness = false
 
