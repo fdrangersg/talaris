@@ -719,6 +719,30 @@ talaris 高冗余恶化来源可以通过 staging 解释。40 路时：
 - 当前证据支持：在 Ripple 这类 BBO/行情入口场景下，若目标是可预测极低延迟
   且可接受独占 CPU，talaris 是比 tungstenite 更合适的 IO 模型。
 
+#### Feed placement / tuning principle
+
+talaris 的低延迟优势来自单 reactor 在热路径上 inline 完成 CQE drain、TLS
+decrypt、WS parse 和 dispatch；对应风险是不同 feed 混跑时会产生
+head-of-line blocking。因此，benchmark 和生产配置都应该按 feed class 隔离，
+而不是把不同交易所、不同消息形态混在同一个 `Pool` / io_uring 中调一个平均值。
+
+推荐原则：
+
+- 一个 `Pool` / io_uring 对应一个 latency class / feed class。
+- 同一个 feed class 内可以包含多个 symbol 和冗余连接；例如 Binance USD-M
+  Perpetual BBO 多 symbol、4 路冗余可以放在同一个 `Pool` 中联合调参。
+- 不同 `message size`、消息频率、burst pattern、冗余路数、parser 成本或
+  latency SLO 的 feed 应该分到不同 `Pool`，分别 benchmark。
+- 每个 feed class 单独寻找最优 `buf_size`、`buf_entries`、
+  `completion_batch`、`spin_iters`、冗余路数、CPU pinning 和采样率。
+- 引入新交易所或新 feed 时，先归类为 BBO / trade / depth delta /
+  snapshot / large JSON 等 workload，再跑专项 bench；不要直接复用其它
+  feed class 的最优参数。
+
+这条原则用于指导本 crate 在上层项目中按交易所和 feed 类型做针对性基准测试：
+先定义 feed class，再为该 class 建立参数矩阵和 latency envelope，最后把最优
+参数固化到对应生产配置。
+
 `local_pipeline --mode` 当前支持：
 
 - `baseline`：unmarked `pump_data_spin`，不构造 metadata。
