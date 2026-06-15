@@ -157,6 +157,11 @@ pub struct ConnectionConfig {
     /// TLS in-flight 期间延迟合入 `send_buf` 的密文 staging buffer 初始容量。
     /// `None` 表示沿用 `buf_ring_slot_size`。
     pub tls_pending_out_initial_capacity: Option<usize>,
+    /// Consecutive plain TCP recv CQEs in one data pump may be copied into a
+    /// reusable scratch buffer and parsed as one larger WebSocket input slice.
+    /// `0` disables copy aggregation. This only affects unmarked plain-WS data
+    /// pumps; TLS and marked observability paths preserve per-CQE staging.
+    pub plain_recv_batch_copy_max_bytes: usize,
     /// 收集 [`IngressStats`]。默认关闭，避免在生产 hot path 上无条件更新计数器。
     pub track_ingress_stats: bool,
     /// Sampling rate for marked observability timestamps. Marked pumps default to
@@ -184,6 +189,7 @@ impl ConnectionConfig {
             ws_config: None,
             send_buffer_initial_capacity: None,
             tls_pending_out_initial_capacity: None,
+            plain_recv_batch_copy_max_bytes: 0,
             track_ingress_stats: false,
             observability_sample_rate: ObservabilitySampleRate::always(),
             record_observability_histograms: false,
@@ -385,6 +391,18 @@ impl ConnectionConfig {
     ) -> Self {
         self.send_buffer_initial_capacity = Some(send_bytes);
         self.tls_pending_out_initial_capacity = Some(tls_pending_out_bytes);
+        self
+    }
+
+    /// Enable copy aggregation for consecutive plain recv CQEs in one data pump.
+    ///
+    /// A value of `0` disables it. This is a throughput-oriented tuning knob:
+    /// it can give the WebSocket parser larger contiguous input, at the cost of
+    /// copying bytes and delaying the first message in the ready CQE run until
+    /// the run has been copied.
+    #[must_use]
+    pub const fn with_plain_recv_batch_copy_max_bytes(mut self, bytes: usize) -> Self {
+        self.plain_recv_batch_copy_max_bytes = bytes;
         self
     }
 

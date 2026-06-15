@@ -76,6 +76,7 @@ struct Config {
     cq_entries: u32,
     completion_batch: usize,
     spin_iters: usize,
+    copy_batch_bytes: usize,
     user_cpu: Option<usize>,
     server_cpu: Option<usize>,
 }
@@ -110,6 +111,7 @@ impl Config {
             cq_entries,
             completion_batch: common::arg_or("--completion-batch", 64_usize).max(1),
             spin_iters: common::arg_or("--spin-iters", 256_usize),
+            copy_batch_bytes: common::arg_or("--copy-batch-bytes", 0_usize),
             user_cpu: common::optional_arg("--user-cpu"),
             server_cpu: common::optional_arg("--server-cpu"),
         })
@@ -117,7 +119,7 @@ impl Config {
 
     fn print(&self) {
         println!(
-            "bench_config bench=local_compare transport={} seconds={} messages={} warmup_messages={} payload={} frames_per_write={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={}",
+            "bench_config bench=local_compare transport={} seconds={} messages={} warmup_messages={} payload={} frames_per_write={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} copy_batch_bytes={}",
             self.transport.as_str(),
             self.seconds,
             self.messages,
@@ -130,6 +132,7 @@ impl Config {
             self.cq_entries,
             self.completion_batch,
             self.spin_iters,
+            self.copy_batch_bytes,
         );
     }
 }
@@ -167,6 +170,7 @@ fn run_talaris_once(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .with_cq_entries(cfg.cq_entries)
         .with_buf_ring(cfg.buf_size, cfg.buf_entries)
         .with_ws_limits(cfg.payload_len, cfg.payload_len as u64)
+        .with_plain_recv_batch_copy_max_bytes(cfg.copy_batch_bytes)
         .with_ingress_stats(true)
         .with_observability_sample_rate_bps(0)
         .with_observability_histograms(false);
@@ -382,6 +386,7 @@ fn print_usage() {
            --cq-entries N            talaris io_uring CQ entries, power of two\n\
            --completion-batch N      talaris Pool CQE scratch buffer capacity\n\
            --spin-iters N            talaris spin count; 0 uses blocking pump_data\n\
+           --copy-batch-bytes N      max bytes copied across a plain recv CQE batch; 0 disables\n\
            --user-cpu N              pin benchmark thread\n\
            --server-cpu N            pin loopback server thread"
     );

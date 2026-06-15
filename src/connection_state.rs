@@ -56,6 +56,9 @@ pub(crate) struct ConnectionState {
     /// `tls.egress_plaintext(&[u8], &mut Vec<u8>)` 直接 push 到 send_buf 末端。
     pub(crate) send_buf: Vec<u8>,
     pub(crate) send_head: usize,
+    /// Reused only when `plain_recv_batch_copy_max_bytes > 0`: consecutive
+    /// plain recv CQEs can be copied here and parsed as one larger WS slice.
+    plain_recv_batch_scratch: Vec<u8>,
     /// TLS 层在 in-flight 期间想发的密文累加器（**永远不直接交给 kernel**）。
     /// `on_recv_cqe` 在处理 TLS handshake reply / re-key / alert 时 append 到这里；
     /// `try_submit_send` 在 `!send_inflight` 时把它 drain 到 `send_buf` 一并提交。
@@ -120,6 +123,7 @@ impl ConnectionState {
             buf_ring: None,
             send_buf: Vec::with_capacity(send_cap),
             send_head: 0,
+            plain_recv_batch_scratch: Vec::new(),
             tls_pending_out: Vec::with_capacity(tls_pending_out_cap),
             send_inflight: false,
             multishot_armed: false,
@@ -428,7 +432,106 @@ impl ConnectionState {
         F: for<'a> FnMut(WsDataEvent<'a>),
     {
         debug_assert!(self.tls.is_none());
+        if let Some(total_bytes) = self.plain_recv_batch_copy_len(completions) {
+            return self.handle_plain_recv_data_batch_copied(completions, total_bytes, sink);
+        }
 
+        self.handle_plain_recv_data_batch_slices(completions, sink)
+    }
+
+    fn plain_recv_batch_copy_len(&self, completions: &[Completion]) -> Option<usize> {
+        let max_bytes = self.cfg.plain_recv_batch_copy_max_bytes;
+        if max_bytes == 0 {
+            return None;
+        }
+
+        let mut total = 0_usize;
+        for &c in completions {
+            if c.result <= 0 || c.buffer_id().is_none() {
+                return None;
+            }
+            #[allow(clippy::cast_sign_loss)]
+            let n = c.result as usize;
+            total = total.checked_add(n)?;
+            if total > max_bytes {
+                return None;
+            }
+        }
+        Some(total)
+    }
+
+    fn handle_plain_recv_data_batch_copied<F>(
+        &mut self,
+        completions: &[Completion],
+        total_bytes: usize,
+        sink: &mut F,
+    ) -> Result<usize, ConnectionError>
+    where
+        F: for<'a> FnMut(WsDataEvent<'a>),
+    {
+        self.plain_recv_batch_scratch.clear();
+        self.plain_recv_batch_scratch.reserve(total_bytes);
+
+        let mut plaintext_chunks = 0_u64;
+        for &c in completions {
+            if !c.has_more() {
+                self.multishot_armed = false;
+            }
+
+            let bid = c
+                .buffer_id()
+                .expect("copy batch only accepts provided-buffer recv CQEs");
+            #[allow(clippy::cast_sign_loss)]
+            let n = c.result as usize;
+            self.record_recv_data(n);
+            plaintext_chunks = plaintext_chunks.saturating_add(1);
+
+            let bytes_ptr = self
+                .buf_ring
+                .as_ref()
+                .expect("buf_ring")
+                .buffer(bid)
+                .as_ptr();
+            // SAFETY: the selected provided buffer remains valid until it is
+            // recycled below; bytes are copied into scratch before recycle.
+            let bytes: &[u8] = unsafe { std::slice::from_raw_parts(bytes_ptr, n) };
+            self.plain_recv_batch_scratch.extend_from_slice(bytes);
+            self.buf_ring.as_mut().expect("buf_ring").recycle(bid);
+        }
+
+        debug_assert_eq!(self.plain_recv_batch_scratch.len(), total_bytes);
+
+        let mut drained_events = 0_usize;
+        let mut text_events = 0_u64;
+        let mut binary_events = 0_u64;
+        let bytes = self.plain_recv_batch_scratch.as_slice();
+        let result = self
+            .ws
+            .drain_data_events_from_ingress(bytes, |ev| {
+                drained_events = drained_events.saturating_add(1);
+                match ev {
+                    WsDataEvent::Text(_) => text_events = text_events.saturating_add(1),
+                    WsDataEvent::Binary(_) => binary_events = binary_events.saturating_add(1),
+                }
+                sink(ev);
+            })
+            .map_err(ConnectionError::Ws);
+
+        self.record_plaintext(plaintext_chunks, total_bytes as u64);
+        self.record_ws_data_drains(plaintext_chunks, 0);
+        self.record_ws_data_events(text_events, binary_events);
+
+        result.map(|_| drained_events)
+    }
+
+    fn handle_plain_recv_data_batch_slices<F>(
+        &mut self,
+        completions: &[Completion],
+        sink: &mut F,
+    ) -> Result<usize, ConnectionError>
+    where
+        F: for<'a> FnMut(WsDataEvent<'a>),
+    {
         let mut drained_events = 0_usize;
         let mut plaintext_chunks = 0_u64;
         let mut plaintext_bytes = 0_u64;

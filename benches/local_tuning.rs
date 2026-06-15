@@ -52,6 +52,7 @@ struct Config {
     spin_iters: Vec<usize>,
     sq_entries: u32,
     cq_entries: u32,
+    copy_batch_bytes: usize,
     max_runs: usize,
     top: usize,
     csv_out: Option<String>,
@@ -102,6 +103,7 @@ impl Config {
             spin_iters,
             sq_entries,
             cq_entries,
+            copy_batch_bytes: common::arg_or("--copy-batch-bytes", 0_usize),
             max_runs: common::arg_or("--max-runs", usize::MAX),
             top: common::arg_or("--top", 12_usize),
             csv_out: common::optional_string("--csv"),
@@ -137,7 +139,7 @@ impl Config {
 
     fn print(&self, variants: usize) {
         println!(
-            "bench_config bench=local_tuning variants={} seconds={} messages={} warmup_messages={} payloads={:?} frames_per_write={:?} buf_sizes={:?} buf_entries={:?} completion_batches={:?} spin_iters={:?} sq_entries={} cq_entries={} max_runs={} top={} csv={}",
+            "bench_config bench=local_tuning variants={} seconds={} messages={} warmup_messages={} payloads={:?} frames_per_write={:?} buf_sizes={:?} buf_entries={:?} completion_batches={:?} spin_iters={:?} sq_entries={} cq_entries={} copy_batch_bytes={} max_runs={} top={} csv={}",
             variants,
             self.seconds,
             self.messages,
@@ -150,6 +152,7 @@ impl Config {
             self.spin_iters,
             self.sq_entries,
             self.cq_entries,
+            self.copy_batch_bytes,
             self.max_runs,
             self.top,
             self.csv_out.as_deref().unwrap_or("-")
@@ -162,6 +165,7 @@ struct ResultRow {
     variant: Variant,
     sq_entries: u32,
     cq_entries: u32,
+    copy_batch_bytes: usize,
     messages: u64,
     bytes: u64,
     elapsed_ms: f64,
@@ -234,7 +238,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("bench_tuning_top count={}", cfg.top.min(rows.len()));
     for (rank, row) in rows.iter().take(cfg.top).enumerate() {
         println!(
-            "bench_tuning_top_row rank={} payload={} frames_per_write={} buf={}x{} completion_batch={} spin_iters={} msg_s={:.0} cpu_ns_msg={} mib_s={:.3} messages_per_recv_cqe={:.3} messages_per_plaintext_chunk={:.3} ring_exhaustions={}",
+            "bench_tuning_top_row rank={} payload={} frames_per_write={} buf={}x{} completion_batch={} spin_iters={} copy_batch_bytes={} msg_s={:.0} cpu_ns_msg={} mib_s={:.3} messages_per_recv_cqe={:.3} messages_per_plaintext_chunk={:.3} ring_exhaustions={}",
             rank + 1,
             row.variant.payload_len,
             row.variant.frames_per_write,
@@ -242,6 +246,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             row.variant.buf_size,
             row.variant.completion_batch,
             row.variant.spin_iters,
+            row.copy_batch_bytes,
             row.msg_s,
             row.cpu_ns_msg,
             row.mib_s,
@@ -268,6 +273,7 @@ fn run_variant(cfg: &Config, variant: Variant) -> Result<ResultRow, Box<dyn std:
         .with_cq_entries(cfg.cq_entries)
         .with_buf_ring(variant.buf_size, variant.buf_entries)
         .with_ws_limits(variant.payload_len, variant.payload_len as u64)
+        .with_plain_recv_batch_copy_max_bytes(cfg.copy_batch_bytes)
         .with_ingress_stats(true)
         .with_observability_sample_rate_bps(0)
         .with_observability_histograms(false);
@@ -305,6 +311,7 @@ fn run_variant(cfg: &Config, variant: Variant) -> Result<ResultRow, Box<dyn std:
         variant,
         sq_entries: cfg.sq_entries,
         cq_entries: cfg.cq_entries,
+        copy_batch_bytes: cfg.copy_batch_bytes,
         messages: stats.messages,
         bytes: stats.bytes,
         elapsed_ms: common::elapsed_ms(elapsed),
@@ -400,7 +407,7 @@ fn nonzero_list(name: &str, values: Vec<usize>) -> Result<Vec<usize>, String> {
 
 fn print_row(index: usize, row: &ResultRow) {
     println!(
-        "bench_tuning_result index={} payload={} frames_per_write={} buf={}x{} completion_batch={} spin_iters={} messages={} bytes={} elapsed_ms={:.3} cpu_ms={:.3} msg_s={:.0} mib_s={:.3} cpu_ns_msg={} recv_cqes={} plaintext_chunks={} ws_events={} messages_per_recv_cqe={:.3} messages_per_plaintext_chunk={:.3} rearms={} ring_exhaustions={} checksum={}",
+        "bench_tuning_result index={} payload={} frames_per_write={} buf={}x{} completion_batch={} spin_iters={} copy_batch_bytes={} messages={} bytes={} elapsed_ms={:.3} cpu_ms={:.3} msg_s={:.0} mib_s={:.3} cpu_ns_msg={} recv_cqes={} plaintext_chunks={} ws_events={} messages_per_recv_cqe={:.3} messages_per_plaintext_chunk={:.3} rearms={} ring_exhaustions={} checksum={}",
         index,
         row.variant.payload_len,
         row.variant.frames_per_write,
@@ -408,6 +415,7 @@ fn print_row(index: usize, row: &ResultRow) {
         row.variant.buf_size,
         row.variant.completion_batch,
         row.variant.spin_iters,
+        row.copy_batch_bytes,
         row.messages,
         row.bytes,
         row.elapsed_ms,
@@ -449,7 +457,7 @@ impl CsvOutput {
         };
         writeln!(
             out,
-            "payload,frames_per_write,buf_size,buf_entries,sq_entries,cq_entries,completion_batch,spin_iters,messages,bytes,elapsed_ms,cpu_ms,msg_s,mib_s,cpu_ns_msg,recv_cqes,plaintext_chunks,ws_events,rearms,ring_exhaustions,messages_per_recv_cqe,messages_per_plaintext_chunk,checksum"
+            "payload,frames_per_write,buf_size,buf_entries,sq_entries,cq_entries,completion_batch,spin_iters,copy_batch_bytes,messages,bytes,elapsed_ms,cpu_ms,msg_s,mib_s,cpu_ns_msg,recv_cqes,plaintext_chunks,ws_events,rearms,ring_exhaustions,messages_per_recv_cqe,messages_per_plaintext_chunk,checksum"
         )
     }
 
@@ -459,7 +467,7 @@ impl CsvOutput {
         };
         writeln!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.6},{},{},{},{},{},{},{:.6},{:.6},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.6},{},{},{},{},{},{},{:.6},{:.6},{}",
             row.variant.payload_len,
             row.variant.frames_per_write,
             row.variant.buf_size,
@@ -468,6 +476,7 @@ impl CsvOutput {
             row.cq_entries,
             row.variant.completion_batch,
             row.variant.spin_iters,
+            row.copy_batch_bytes,
             row.messages,
             row.bytes,
             row.elapsed_ms,
@@ -514,6 +523,7 @@ fn print_usage() {
            --spin-iters A,B,C           talaris spin counts; 0 uses blocking pump_data\n\
            --sq-entries N               io_uring SQ entries, power of two\n\
            --cq-entries N               io_uring CQ entries, power of two\n\
+           --copy-batch-bytes N         max bytes copied across a plain recv CQE batch; 0 disables\n\
            --max-runs N                 truncate matrix for smoke tests\n\
            --top N                      print top N variants by msg/s\n\
            --csv PATH|-                 write CSV rows to file or stdout\n\
