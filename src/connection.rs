@@ -13,6 +13,7 @@ use std::{io, sync::Arc};
 
 use thiserror::Error;
 
+use crate::observability::{ObservabilityError, ObservabilitySampleRate};
 use crate::proactor::{BufferRingError, ProactorConfig, ProactorError, ProactorSetupFlags};
 use crate::tls::TlsError;
 use crate::ws::{WsConfig, WsError};
@@ -66,6 +67,8 @@ pub enum ConnectionError {
     Tls(#[from] TlsError),
     #[error("ws: {0}")]
     Ws(#[from] WsError),
+    #[error("observability: {0}")]
+    Observability(#[from] ObservabilityError),
     #[error("operation not allowed in state {0:?}")]
     InvalidState(State),
     #[error("connect failed: {0}")]
@@ -93,12 +96,25 @@ pub struct IngressStats {
     pub recv_data_cqes: u64,
     /// Ciphertext bytes carried by those CQEs.
     pub recv_bytes: u64,
+    /// Times a recv multishot SQE was submitted or rearmed for this connection.
+    pub recv_multishot_rearms: u64,
     /// Multishot recv terminations caused by provided-buffer ring exhaustion.
     pub recv_ring_exhaustions: u64,
+    /// Plaintext chunks fed into the WebSocket parser. For TLS connections this
+    /// counts rustls plaintext chunks; for plain TCP this counts recv CQEs.
+    pub plaintext_chunks: u64,
+    /// Plaintext bytes fed into the WebSocket parser.
+    pub plaintext_bytes: u64,
     /// Data-pump CQEs that fed plaintext into the WebSocket receive buffer.
     pub ws_data_drains: u64,
     /// Data-pump CQEs that skipped WebSocket draining because no plaintext arrived.
     pub ws_data_drain_skips: u64,
+    /// Text/Binary data messages emitted to the user's data sink.
+    pub ws_data_events: u64,
+    /// Text messages emitted to the user's data sink.
+    pub ws_text_events: u64,
+    /// Binary messages emitted to the user's data sink.
+    pub ws_binary_events: u64,
 }
 
 /// 构造单条 conn 的参数。`proactor` 是创建 [`Pool`](crate::Pool) 时的便利默认值；
@@ -143,6 +159,12 @@ pub struct ConnectionConfig {
     pub tls_pending_out_initial_capacity: Option<usize>,
     /// 收集 [`IngressStats`]。默认关闭，避免在生产 hot path 上无条件更新计数器。
     pub track_ingress_stats: bool,
+    /// Sampling rate for marked observability timestamps. Marked pumps default to
+    /// 100%; unmarked pumps never read these clocks.
+    pub observability_sample_rate: ObservabilitySampleRate,
+    /// Record sampled marked data-event stage latencies into per-connection
+    /// HdrHistograms for Prometheus export. Default off.
+    pub record_observability_histograms: bool,
 }
 
 impl ConnectionConfig {
@@ -163,6 +185,8 @@ impl ConnectionConfig {
             send_buffer_initial_capacity: None,
             tls_pending_out_initial_capacity: None,
             track_ingress_stats: false,
+            observability_sample_rate: ObservabilitySampleRate::always(),
+            record_observability_histograms: false,
         }
     }
 
@@ -368,6 +392,25 @@ impl ConnectionConfig {
     #[must_use]
     pub const fn with_ingress_stats(mut self, on: bool) -> Self {
         self.track_ingress_stats = on;
+        self
+    }
+
+    /// Configure marked observability sampling in basis points.
+    ///
+    /// `10_000` means 100%, `1_000` means 10%, and values above `10_000`
+    /// saturate to 100%. This only affects marked data-pump APIs.
+    #[must_use]
+    pub const fn with_observability_sample_rate_bps(mut self, basis_points: u16) -> Self {
+        self.observability_sample_rate = ObservabilitySampleRate::from_basis_points(basis_points);
+        self
+    }
+
+    /// Enable per-connection HdrHistogram recording for marked observability
+    /// latency stages. Use [`crate::Pool::write_prometheus_metrics`] or
+    /// [`crate::Pool::prometheus_metrics`] to expose the current snapshot.
+    #[must_use]
+    pub const fn with_observability_histograms(mut self, on: bool) -> Self {
+        self.record_observability_histograms = on;
         self
     }
 }

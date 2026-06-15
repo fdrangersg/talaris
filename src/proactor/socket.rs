@@ -5,8 +5,7 @@
 //! 2. 我们要拿 raw fd 直接喂给 io_uring SQE，包一层 std 没意义；
 //! 3. `connect(2)` 我们走 [`super::Proactor::submit_connect`] 异步发——不在这里 block。
 //!
-//! F1 范围内只需要 socket(2) + setsockopt + Drop close。`bind` / `listen` / `accept`
-//! 留到 F2 真正用到的时候再加（v1 全是 client 连接，不需要 listen）。
+//! 只做 socket(2) + setsockopt + Drop close。
 
 // 模块内的 `.expect()` 全部是 c_int → socklen_t 的静态 size 断言（`sockaddr_in`
 // / `sockaddr_in6` / `c_int` 的字节宽度在 libc 头里是 compile-time 常量）。
@@ -126,7 +125,7 @@ impl TcpSocket {
         Ok(Self { fd })
     }
 
-    /// 关 Nagle —— HFT 必开。
+    /// 关 Nagle。
     pub fn set_nodelay(&self, on: bool) -> io::Result<()> {
         let val: libc::c_int = on.into();
         // SAFETY: setsockopt 接受 (fd, level, optname, optval ptr, optlen) 五个参数；
@@ -146,7 +145,7 @@ impl TcpSocket {
         Ok(())
     }
 
-    /// `SO_REUSEADDR`。F1 client 用不到，但 F2 起 listener / 测试都要。
+    /// `SO_REUSEADDR`。
     pub fn set_reuseaddr(&self, on: bool) -> io::Result<()> {
         let val: libc::c_int = on.into();
         // SAFETY: 同 set_nodelay

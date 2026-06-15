@@ -252,6 +252,96 @@ pool.state(h);  // Option<State>: Init / Connecting / TlsHandshake / WsHandshake
 pool.conn_count();  // 当前 active conn 数
 ```
 
+### Opt-in observability
+
+默认 hot path 不读时钟、不构造 metadata。需要定位瓶颈时显式切到 marked API。
+marked API 默认 100% 采样；需要降采样时在连接配置里设置 basis points：
+
+```rust
+let cfg = ConnectionConfig::new(host, 443, path)
+    .with_observability_sample_rate_bps(1_000); // 10%; 10_000 = 100%
+```
+
+```rust
+use talaris::ws::MarkedDataEvent;
+
+let got = pool.pump_data_spin_marked(256, |h, data| match data {
+    MarkedDataEvent::Text { payload, meta } => {
+        if meta.sampled {
+            // meta.source_recv_time_nanos: Unix epoch nanos，可写入下游 wire
+            // meta.recv_sequence: 本连接 marked recv CQE 序号
+            // meta.message_sequence: 本连接 marked data message 序号
+            let recv_to_plaintext = meta.recv_to_plaintext_nanos();
+            let plaintext_to_ws = meta.plaintext_to_ws_nanos();
+            let recv_to_ws = meta.recv_to_ws_nanos();
+        }
+        parse_json(payload);
+    }
+    MarkedDataEvent::Binary { payload, meta } => {
+        decode_binary(payload, meta);
+    }
+})?;
+```
+
+`source_recv_time_nanos` 是用户态观察到 recv CQE 时采样的 Unix epoch nanos；
+跨机器使用它需要 chrony/PTP 等时钟同步。`*_mono_nanos` 只能在本进程内做差，
+不要跨机器比较。`recv_sequence` / `message_sequence` 是每条连接 marked data-pump
+内部维护的 `u64` 序号；普通未 marked pump 不推进这些序号。`tls_plaintext_chunk_index`
+和 `chunk_message_index` 是单个 recv / plaintext chunk 内的 `u16` 索引，极端情况下会
+saturate 到 `u16::MAX`。当前采样在 recv CQE 粒度做确定性选择；被采样 CQE 产生的
+data message 会带 `sampled = true` 和分段时间戳，未采样事件仍正常分发但时间戳为 0，
+delta helper 返回 `None`。
+
+生产模式下可以让 talaris 用 HdrHistogram 直接维护本地 quantile，并导出
+Prometheus text exposition。记录仍只发生在 marked pump 路径里：
+
+```rust
+let cfg = ConnectionConfig::new(host, 443, path)
+    .with_observability_sample_rate_bps(10_000)
+    .with_observability_histograms(true);
+
+let h = pool.connect_blocking(cfg)?;
+
+pool.pump_data_spin_marked(256, |h, data| {
+    // 正常业务处理；talaris 会在调用 sink 前记录 sampled 事件的 stage latency。
+})?;
+
+// 在你的 /metrics HTTP handler 中返回这个 body（连接生命周期累计窗口）。
+let body = pool.prometheus_metrics();
+
+// 更适合 dashboard / alert 的 interval 窗口：导出后 reset interval histograms。
+let interval_body = pool.prometheus_metrics_and_reset_interval();
+```
+
+Prometheus 输出包含 `talaris_ws_latency_quantile_ns`、`samples`、`sum_ns`、
+`max_ns`，并用 label 区分 `window="cumulative|interval"`、`scope="chunk|message"`、
+`stage` 和 `chunk_position`：
+
+- `scope="chunk", stage="recv_to_plaintext", chunk_position="chunk"`：plaintext
+  chunk 产出至少一条 data message 时记录一次。
+- `scope="message", stage="plaintext_to_ws|recv_to_ws", chunk_position="all"`：
+  所有 sampled data message。
+- `chunk_position="first"`：plaintext chunk 内第一条 WS data message。
+- `chunk_position="queued"`：同一 plaintext chunk 内后续 WS data message，能直接观察
+  chunk 内排队和前序 sink 回调带来的影响。
+
+这些 quantile 是每条连接本地 HdrHistogram 的客户端 quantile，不适合跨连接直接聚合。
+`prometheus_metrics_and_reset_interval()` 只 reset interval latency histograms；
+ingress counters 仍是 lifetime cumulative counters。
+
+长期低成本 counters 也默认关闭，需要按连接开启：
+
+```rust
+let cfg = ConnectionConfig::new(host, 443, path)
+    .with_ingress_stats(true);
+
+let stats = pool.ingress_stats(h);
+```
+
+这会统计 recv CQE、ciphertext bytes、multishot rearm、ring exhaustion、
+plaintext chunk/bytes、WS Text/Binary event 等。没有开启 `with_ingress_stats(true)`
+时，这些 counter 不更新。
+
 ---
 
 ## 调优参数（按 ROI 排）

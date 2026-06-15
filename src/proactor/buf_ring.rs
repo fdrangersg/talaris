@@ -1,4 +1,4 @@
-//! Provided Buffer Ring —— F3.3 multishot recv 的 buffer 来源
+//! Provided Buffer Ring —— multishot recv 的 buffer 来源
 //!
 //! io_uring 的 `IORING_REGISTER_PBUF_RING` 让 caller 注册一个 buffer 池给 kernel，
 //! kernel 在 multishot recv 完成时**自己**从池里挑一块写入，CQE 通过

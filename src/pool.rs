@@ -31,13 +31,18 @@
 // 一定 fits u32）。走到 panic 等于 Pool 内部状态已坏 —— HFT 进程应立即重启。
 #![allow(clippy::expect_used)]
 
+use std::fmt;
 use std::marker::PhantomData;
 use std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::connection::{ConnectionConfig, ConnectionError, IngressStats, State};
 use crate::connection_state::ConnectionState;
+use crate::observability::LatencyHistograms;
 use crate::proactor::{Completion, Proactor, ProactorConfig, ProactorError};
-use crate::ws::{ConnState as WsConnState, DataEvent as WsDataEvent, Event as WsEvent};
+use crate::ws::{
+    ConnState as WsConnState, DataEvent as WsDataEvent, Event as WsEvent,
+    MarkedDataEvent as WsMarkedDataEvent,
+};
 
 /// CQE.token() 中 conn_id 的位掩码 —— 28 bit，最多 ~2.6 亿条 conn / Pool，
 /// 远超任何实际场景。bits 55..28 预留给 op-seq dedup（v1 不使用）。
@@ -378,6 +383,24 @@ impl Pool {
         self.pump_data_impl(0, sink)
     }
 
+    /// Marked data-only pump. This is the opt-in observability variant of
+    /// [`Self::pump_data`]; the default API does not read clocks or construct
+    /// timing metadata.
+    pub fn pump_data_marked<F>(&mut self, sink: F) -> Result<(), ConnectionError>
+    where
+        F: for<'a> FnMut(ConnHandle, WsMarkedDataEvent<'a>),
+    {
+        self.pump_data_marked_impl(1, sink)
+    }
+
+    /// Non-blocking marked data-only pump.
+    pub fn pump_data_marked_nowait<F>(&mut self, sink: F) -> Result<(), ConnectionError>
+    where
+        F: for<'a> FnMut(ConnHandle, WsMarkedDataEvent<'a>),
+    {
+        self.pump_data_marked_impl(0, sink)
+    }
+
     /// Busy-poll 版本的 [`pump_data`](Self::pump_data)。
     ///
     /// 本方法只轮询 mmap 出来的 CQ ring，不调用 [`Proactor::wait_for_cqe`]。
@@ -389,6 +412,22 @@ impl Pool {
         F: for<'a> FnMut(ConnHandle, WsDataEvent<'a>),
     {
         self.pump_data_spin_impl(spin_iters, sink)
+    }
+
+    /// Busy-poll marked data-only pump.
+    ///
+    /// Use this when measuring transport/TLS/WS stage latency. It carries
+    /// [`crate::observability::DataEventMeta`] with each Text/Binary payload.
+    /// Unmarked `pump_data_spin` stays free of clock reads.
+    pub fn pump_data_spin_marked<F>(
+        &mut self,
+        spin_iters: usize,
+        sink: F,
+    ) -> Result<bool, ConnectionError>
+    where
+        F: for<'a> FnMut(ConnHandle, WsMarkedDataEvent<'a>),
+    {
+        self.pump_data_spin_marked_impl(spin_iters, sink)
     }
 
     /// data-only pump 实现。每条 CQE 路由完成后立刻 drain 对应连接的 WS 事件，
@@ -443,6 +482,59 @@ impl Pool {
         first_err.map_or(Ok(()), Err)
     }
 
+    fn pump_data_marked_impl<F>(
+        &mut self,
+        wait_nr: usize,
+        mut sink: F,
+    ) -> Result<(), ConnectionError>
+    where
+        F: for<'a> FnMut(ConnHandle, WsMarkedDataEvent<'a>),
+    {
+        let Self {
+            proactor,
+            conns,
+            completions_buf,
+            active_count,
+            ..
+        } = self;
+
+        let mut first_err: Option<ConnectionError> = None;
+
+        for slot in conns.iter_mut() {
+            let Some(conn) = slot.as_mut() else { continue };
+            if let Err(e) = conn.try_submit_send(proactor) {
+                fail_conn(conn, e, &mut first_err);
+                continue;
+            }
+            if let Err(e) = conn.try_rearm_multishot(proactor) {
+                fail_conn(conn, e, &mut first_err);
+            }
+        }
+
+        proactor.submit()?;
+        proactor.wait_for_cqe(wait_nr)?;
+
+        completions_buf.clear();
+        proactor.drain_completions(|c| completions_buf.push(c));
+        for &c in completions_buf.iter() {
+            let conn_id =
+                u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
+            if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
+                let handle = ConnHandle(conn.conn_id());
+                match conn.handle_completion_data_marked(proactor, c, |ev| sink(handle, ev)) {
+                    Ok(_) => {
+                        conn.sync_ws_open_state();
+                        conn.sync_ws_close_state();
+                    }
+                    Err(e) => fail_conn(conn, e, &mut first_err),
+                }
+            }
+        }
+
+        sync_active_count(conns, active_count);
+        first_err.map_or(Ok(()), Err)
+    }
+
     fn pump_data_spin_impl<F>(
         &mut self,
         spin_iters: usize,
@@ -467,6 +559,53 @@ impl Pool {
 
         for iter in 0..=spin_iters {
             let cqes = drain_conn_completions_data(
+                conns,
+                proactor,
+                completions_buf,
+                &mut sink,
+                &mut first_err,
+            );
+            progressed |= cqes > 0;
+
+            if progressed || first_err.is_some() {
+                break;
+            }
+            if iter < spin_iters {
+                std::hint::spin_loop();
+            }
+        }
+
+        sync_active_count(conns, active_count);
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(progressed),
+        }
+    }
+
+    fn pump_data_spin_marked_impl<F>(
+        &mut self,
+        spin_iters: usize,
+        mut sink: F,
+    ) -> Result<bool, ConnectionError>
+    where
+        F: for<'a> FnMut(ConnHandle, WsMarkedDataEvent<'a>),
+    {
+        let Self {
+            proactor,
+            conns,
+            completions_buf,
+            active_count,
+            ..
+        } = self;
+
+        let mut first_err: Option<ConnectionError> = None;
+        let mut progressed = false;
+
+        submit_conn_ops(conns, proactor, &mut first_err);
+        proactor.submit()?;
+
+        for iter in 0..=spin_iters {
+            let cqes = drain_conn_completions_data_marked(
                 conns,
                 proactor,
                 completions_buf,
@@ -647,6 +786,50 @@ impl Pool {
             .map(ConnectionState::ingress_stats)
     }
 
+    /// Render a Prometheus text exposition snapshot for all live connections.
+    #[must_use]
+    pub fn prometheus_metrics(&self) -> String {
+        let mut out = String::new();
+        self.write_prometheus_metrics(&mut out)
+            .expect("writing Prometheus metrics to String cannot fail");
+        out
+    }
+
+    /// Write a Prometheus text exposition snapshot for all live connections.
+    pub fn write_prometheus_metrics<W: fmt::Write>(&self, out: &mut W) -> fmt::Result {
+        LatencyHistograms::write_prometheus_help(out)?;
+        write_ingress_prometheus_help(out)?;
+        for conn in self.conns.iter().flatten() {
+            conn.write_prometheus_metrics(out)?;
+        }
+        Ok(())
+    }
+
+    /// Render interval Prometheus metrics and reset interval latency histograms.
+    #[must_use]
+    pub fn prometheus_metrics_and_reset_interval(&mut self) -> String {
+        let mut out = String::new();
+        self.write_prometheus_metrics_and_reset_interval(&mut out)
+            .expect("writing Prometheus metrics to String cannot fail");
+        out
+    }
+
+    /// Write interval Prometheus metrics and reset interval latency histograms.
+    ///
+    /// Ingress counters remain lifetime cumulative; only latency histograms are
+    /// reset after a successful write.
+    pub fn write_prometheus_metrics_and_reset_interval<W: fmt::Write>(
+        &mut self,
+        out: &mut W,
+    ) -> fmt::Result {
+        LatencyHistograms::write_prometheus_help(out)?;
+        write_ingress_prometheus_help(out)?;
+        for conn in self.conns.iter_mut().flatten() {
+            conn.write_prometheus_metrics_and_reset_interval(out)?;
+        }
+        Ok(())
+    }
+
     fn conn_mut(&mut self, h: ConnHandle) -> Result<&mut ConnectionState, ConnectionError> {
         self.conns
             .get_mut(h.0 as usize)
@@ -728,6 +911,102 @@ where
         }
     }
     count
+}
+
+fn drain_conn_completions_data_marked<F>(
+    conns: &mut [Option<ConnectionState>],
+    proactor: &mut Proactor,
+    completions_buf: &mut Vec<Completion>,
+    sink: &mut F,
+    first_err: &mut Option<ConnectionError>,
+) -> usize
+where
+    F: for<'a> FnMut(ConnHandle, WsMarkedDataEvent<'a>),
+{
+    completions_buf.clear();
+    let count = proactor.drain_completions(|c| completions_buf.push(c));
+    for &c in completions_buf.iter() {
+        let conn_id =
+            u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
+        if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
+            let handle = ConnHandle(conn.conn_id());
+            match conn.handle_completion_data_marked(proactor, c, |ev| sink(handle, ev)) {
+                Ok(_) => {
+                    conn.sync_ws_open_state();
+                    conn.sync_ws_close_state();
+                }
+                Err(e) => fail_conn(conn, e, first_err),
+            }
+        }
+    }
+    count
+}
+
+fn write_ingress_prometheus_help<W: fmt::Write>(out: &mut W) -> fmt::Result {
+    writeln!(
+        out,
+        "# HELP talaris_ingress_recv_data_cqes_total Positive-length recv data CQEs handled by a connection."
+    )?;
+    writeln!(out, "# TYPE talaris_ingress_recv_data_cqes_total counter")?;
+    writeln!(
+        out,
+        "# HELP talaris_ingress_recv_bytes_total Ciphertext bytes carried by recv data CQEs."
+    )?;
+    writeln!(out, "# TYPE talaris_ingress_recv_bytes_total counter")?;
+    writeln!(
+        out,
+        "# HELP talaris_ingress_recv_multishot_rearms_total Recv multishot SQEs submitted or rearmed."
+    )?;
+    writeln!(
+        out,
+        "# TYPE talaris_ingress_recv_multishot_rearms_total counter"
+    )?;
+    writeln!(
+        out,
+        "# HELP talaris_ingress_recv_ring_exhaustions_total Recv multishot terminations caused by provided-buffer ring exhaustion."
+    )?;
+    writeln!(
+        out,
+        "# TYPE talaris_ingress_recv_ring_exhaustions_total counter"
+    )?;
+    writeln!(
+        out,
+        "# HELP talaris_ingress_plaintext_chunks_total Plaintext chunks fed into the WebSocket parser."
+    )?;
+    writeln!(out, "# TYPE talaris_ingress_plaintext_chunks_total counter")?;
+    writeln!(
+        out,
+        "# HELP talaris_ingress_plaintext_bytes_total Plaintext bytes fed into the WebSocket parser."
+    )?;
+    writeln!(out, "# TYPE talaris_ingress_plaintext_bytes_total counter")?;
+    writeln!(
+        out,
+        "# HELP talaris_ingress_ws_data_drains_total Data-pump CQEs that fed plaintext into WebSocket receive processing."
+    )?;
+    writeln!(out, "# TYPE talaris_ingress_ws_data_drains_total counter")?;
+    writeln!(
+        out,
+        "# HELP talaris_ingress_ws_data_drain_skips_total Data-pump CQEs that skipped WebSocket draining because no plaintext arrived."
+    )?;
+    writeln!(
+        out,
+        "# TYPE talaris_ingress_ws_data_drain_skips_total counter"
+    )?;
+    writeln!(
+        out,
+        "# HELP talaris_ingress_ws_data_events_total Text/Binary data messages emitted to the user's data sink."
+    )?;
+    writeln!(out, "# TYPE talaris_ingress_ws_data_events_total counter")?;
+    writeln!(
+        out,
+        "# HELP talaris_ingress_ws_text_events_total Text messages emitted to the user's data sink."
+    )?;
+    writeln!(out, "# TYPE talaris_ingress_ws_text_events_total counter")?;
+    writeln!(
+        out,
+        "# HELP talaris_ingress_ws_binary_events_total Binary messages emitted to the user's data sink."
+    )?;
+    writeln!(out, "# TYPE talaris_ingress_ws_binary_events_total counter")
 }
 
 /// pump 内 per-conn 错误处理：保留第一条错误，把对应 conn 推到 Closed 以便

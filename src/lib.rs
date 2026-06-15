@@ -52,6 +52,8 @@ pub mod connection;
 
 pub mod pool;
 
+pub mod observability;
+
 pub mod ws;
 
 pub mod tls;

@@ -21,8 +21,6 @@
 //!
 //! 取走 CQE 后 lifetime 约束解除——可以 drop / 复用 / move。
 //!
-//! 后续 F3 引入 `IORING_REGISTER_BUFFERS` + 自管 buffer pool 后，这些 unsafe
-//! 接口会被 safe wrapper 包起来（buffer 归 proactor 所有）。
 
 use std::io;
 use std::os::fd::{IntoRawFd, OwnedFd, RawFd};

@@ -33,6 +33,7 @@ use super::mask::mask_inplace;
 use super::parser::{FeedOutcome, FrameEvent, FrameParser};
 use crate::cursor_buf::CursorBuf;
 use crate::http::{HttpError, parse_response};
+use crate::observability::{DataEventMeta, MarkedDataEvent};
 use thiserror::Error;
 
 /// 默认单条 message 最大长度（fragmented 累计）：8 MiB。
@@ -280,6 +281,18 @@ pub struct WsClient {
     /// CSPRNG handle。`SystemRandom::new()` 是 cheap（thread-local），但仍然
     /// 持久化以表达"这条 ws 的 mask key 来源固定"的语义。
     mask_rng: ring::rand::SystemRandom,
+}
+
+#[inline]
+fn next_marked_meta(
+    base_meta: DataEventMeta,
+    chunk_message_index: &mut u16,
+    message_sequence: &mut u64,
+) -> DataEventMeta {
+    let meta = base_meta.ws_payload_ready_now(*chunk_message_index, *message_sequence);
+    *chunk_message_index = (*chunk_message_index).saturating_add(1);
+    *message_sequence = (*message_sequence).saturating_add(1);
+    meta
 }
 
 impl WsClient {
@@ -566,6 +579,159 @@ impl WsClient {
         self.drain_data_events(sink)
     }
 
+    /// Same as [`Self::drain_data_events`], but each Text/Binary payload carries
+    /// caller-supplied transport timing metadata.
+    ///
+    /// This is an opt-in observability path. The unmarked data path does not
+    /// construct [`DataEventMeta`] and does not read clocks.
+    pub fn drain_data_events_marked<F>(
+        &mut self,
+        base_meta: DataEventMeta,
+        mut sink: F,
+    ) -> Result<usize, WsError>
+    where
+        F: FnMut(MarkedDataEvent<'_>),
+    {
+        let mut message_index = 0_u16;
+        let mut message_sequence = base_meta.message_sequence;
+        self.drain_data_events_marked_from_index(
+            base_meta,
+            &mut message_index,
+            &mut message_sequence,
+            &mut sink,
+        )
+    }
+
+    fn drain_data_events_marked_from_index<F>(
+        &mut self,
+        base_meta: DataEventMeta,
+        message_index: &mut u16,
+        message_sequence: &mut u64,
+        mut sink: F,
+    ) -> Result<usize, WsError>
+    where
+        F: FnMut(MarkedDataEvent<'_>),
+    {
+        let mut events = 0_usize;
+        loop {
+            self.clear_after_emit();
+            let (direct_events, direct_result) = self.try_drain_data_events_marked(
+                base_meta,
+                message_index,
+                message_sequence,
+                &mut sink,
+            )?;
+            events += direct_events;
+            match direct_result {
+                DirectDataResult::Drained => continue,
+                DirectDataResult::WaitForMore => return Ok(events),
+                DirectDataResult::Fallback => {}
+            }
+
+            let Some(res) = self.poll_event() else {
+                return Ok(events);
+            };
+            let ev = res?;
+            events += 1;
+            match ev {
+                Event::Text(payload) => {
+                    let meta = next_marked_meta(base_meta, message_index, message_sequence);
+                    sink(MarkedDataEvent::Text { payload, meta });
+                }
+                Event::Binary(payload) => {
+                    let meta = next_marked_meta(base_meta, message_index, message_sequence);
+                    sink(MarkedDataEvent::Binary { payload, meta });
+                }
+                Event::HandshakeComplete
+                | Event::Ping(_)
+                | Event::Pong(_)
+                | Event::Close { .. } => {}
+            }
+        }
+    }
+
+    /// Feed a newly-arrived plaintext chunk and drain marked data events.
+    ///
+    /// This mirrors [`Self::drain_data_events_from_ingress`] but carries timing
+    /// metadata through to each emitted data payload.
+    pub fn drain_data_events_from_ingress_marked<F>(
+        &mut self,
+        bytes: &[u8],
+        base_meta: DataEventMeta,
+        mut sink: F,
+    ) -> Result<usize, WsError>
+    where
+        F: for<'a> FnMut(MarkedDataEvent<'a>),
+    {
+        let mut message_sequence = base_meta.message_sequence;
+        self.drain_data_events_from_ingress_marked_with_message_sequence(
+            bytes,
+            base_meta,
+            &mut message_sequence,
+            &mut sink,
+        )
+    }
+
+    pub(crate) fn drain_data_events_from_ingress_marked_with_message_sequence<F>(
+        &mut self,
+        bytes: &[u8],
+        base_meta: DataEventMeta,
+        message_sequence: &mut u64,
+        mut sink: F,
+    ) -> Result<usize, WsError>
+    where
+        F: for<'a> FnMut(MarkedDataEvent<'a>),
+    {
+        self.clear_after_emit();
+        if bytes.is_empty() {
+            let mut message_index = 0_u16;
+            return self.drain_data_events_marked_from_index(
+                base_meta,
+                &mut message_index,
+                message_sequence,
+                &mut sink,
+            );
+        }
+
+        if self.can_drain_ingress_directly() {
+            let mut message_index = 0_u16;
+            let (events, consumed, result) = self.try_drain_ingress_data_events_marked(
+                bytes,
+                base_meta,
+                &mut message_index,
+                message_sequence,
+                &mut sink,
+            )?;
+            match result {
+                DirectDataResult::Drained => return Ok(events),
+                DirectDataResult::WaitForMore => {
+                    self.recv_buf.extend_from_slice(&bytes[consumed..]);
+                    return Ok(events);
+                }
+                DirectDataResult::Fallback => {
+                    self.recv_buf.extend_from_slice(&bytes[consumed..]);
+                    return self
+                        .drain_data_events_marked_from_index(
+                            base_meta,
+                            &mut message_index,
+                            message_sequence,
+                            &mut sink,
+                        )
+                        .map(|fallback_events| events + fallback_events);
+                }
+            }
+        }
+
+        self.feed_recv(bytes);
+        let mut message_index = 0_u16;
+        self.drain_data_events_marked_from_index(
+            base_meta,
+            &mut message_index,
+            message_sequence,
+            sink,
+        )
+    }
+
     /// data-only 常见路径：完整单帧直接借 recv_buf payload 给 sink，回调返回后
     /// 立即 consume。control / fragmented frame 返回 Fallback，由 poll_event
     /// 完整状态机接手。
@@ -653,6 +819,107 @@ impl WsClient {
                     sink(DataEvent::Text(text));
                 }
                 OpCode::Binary => sink(DataEvent::Binary(payload)),
+                _ => unreachable!("guarded above"),
+            }
+            consumed += frame_len;
+            events += 1;
+        }
+    }
+
+    fn try_drain_data_events_marked<F>(
+        &mut self,
+        base_meta: DataEventMeta,
+        message_index: &mut u16,
+        message_sequence: &mut u64,
+        sink: &mut F,
+    ) -> Result<(usize, DirectDataResult), WsError>
+    where
+        F: FnMut(MarkedDataEvent<'_>),
+    {
+        if self.state != ConnState::Open
+            || !self.parser.is_idle()
+            || self.msg_opcode.is_some()
+            || self.recv_buf.is_empty()
+        {
+            return Ok((0, DirectDataResult::Fallback));
+        }
+
+        let mut consumed = 0_usize;
+        let mut events = 0_usize;
+        loop {
+            let bytes = &self.recv_buf.as_slice()[consumed..];
+            if bytes.is_empty() {
+                self.recv_buf.consume(consumed);
+                return Ok((events, DirectDataResult::Drained));
+            }
+
+            let header = match parse_server_data_header_fast(bytes) {
+                Ok(FastDataHeaderResult::Parsed(header)) => header,
+                Ok(FastDataHeaderResult::NeedMore) => {
+                    self.recv_buf.consume(consumed);
+                    return Ok((events, DirectDataResult::WaitForMore));
+                }
+                Ok(FastDataHeaderResult::Fallback) => {
+                    self.recv_buf.consume(consumed);
+                    return Ok((events, DirectDataResult::Fallback));
+                }
+                Err(e) => {
+                    self.recv_buf.consume(consumed);
+                    self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
+                    return Err(WsError::Frame(e));
+                }
+            };
+
+            if header.payload_len_u64 > self.config.max_frame_payload {
+                self.recv_buf.consume(consumed);
+                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                return Err(WsError::MessageTooLarge);
+            }
+
+            let payload_len = header.payload_len;
+            if payload_len > self.config.max_message_size {
+                self.recv_buf.consume(consumed);
+                self.queue_close(
+                    CloseCode::MessageTooBig.as_u16(),
+                    "message exceeds max_message_size",
+                );
+                return Err(WsError::MessageTooLarge);
+            }
+            let Some(frame_len) = header.header_len.checked_add(payload_len) else {
+                self.recv_buf.consume(consumed);
+                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                return Err(WsError::MessageTooLarge);
+            };
+            if bytes.len() < frame_len {
+                self.recv_buf.consume(consumed);
+                return Ok((events, DirectDataResult::WaitForMore));
+            }
+
+            let payload = &bytes[header.header_len..frame_len];
+            match header.opcode {
+                OpCode::Text => {
+                    let text = if self.config.assume_text_utf8 {
+                        // SAFETY: Enabled only through `unsafe`
+                        // `WsConfig::with_assume_text_utf8_unchecked`, whose
+                        // caller promises all server text payloads are UTF-8.
+                        unsafe { std::str::from_utf8_unchecked(payload) }
+                    } else if let Ok(text) = std::str::from_utf8(payload) {
+                        text
+                    } else {
+                        self.recv_buf.consume(consumed);
+                        self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
+                        return Err(WsError::Utf8Invalid);
+                    };
+                    let meta = next_marked_meta(base_meta, message_index, message_sequence);
+                    sink(MarkedDataEvent::Text {
+                        payload: text,
+                        meta,
+                    });
+                }
+                OpCode::Binary => {
+                    let meta = next_marked_meta(base_meta, message_index, message_sequence);
+                    sink(MarkedDataEvent::Binary { payload, meta });
+                }
                 _ => unreachable!("guarded above"),
             }
             consumed += frame_len;
@@ -750,6 +1017,102 @@ impl WsClient {
                     sink(DataEvent::Text(text));
                 }
                 OpCode::Binary => sink(DataEvent::Binary(payload)),
+                _ => unreachable!("guarded above"),
+            }
+            events += 1;
+            bytes = &bytes[frame_len..];
+        }
+    }
+
+    fn try_drain_ingress_data_events_marked<F>(
+        &mut self,
+        mut bytes: &[u8],
+        base_meta: DataEventMeta,
+        message_index: &mut u16,
+        message_sequence: &mut u64,
+        sink: &mut F,
+    ) -> Result<(usize, usize, DirectDataResult), WsError>
+    where
+        F: for<'a> FnMut(MarkedDataEvent<'a>),
+    {
+        let original_len = bytes.len();
+        let mut events = 0_usize;
+        loop {
+            if bytes.is_empty() {
+                return Ok((events, original_len, DirectDataResult::Drained));
+            }
+
+            let header = match parse_server_data_header_fast(bytes) {
+                Ok(FastDataHeaderResult::Parsed(header)) => header,
+                Ok(FastDataHeaderResult::NeedMore) => {
+                    return Ok((
+                        events,
+                        original_len - bytes.len(),
+                        DirectDataResult::WaitForMore,
+                    ));
+                }
+                Ok(FastDataHeaderResult::Fallback) => {
+                    return Ok((
+                        events,
+                        original_len - bytes.len(),
+                        DirectDataResult::Fallback,
+                    ));
+                }
+                Err(e) => {
+                    self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
+                    return Err(WsError::Frame(e));
+                }
+            };
+
+            if header.payload_len_u64 > self.config.max_frame_payload {
+                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                return Err(WsError::MessageTooLarge);
+            }
+
+            let payload_len = header.payload_len;
+            if payload_len > self.config.max_message_size {
+                self.queue_close(
+                    CloseCode::MessageTooBig.as_u16(),
+                    "message exceeds max_message_size",
+                );
+                return Err(WsError::MessageTooLarge);
+            }
+            let Some(frame_len) = header.header_len.checked_add(payload_len) else {
+                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                return Err(WsError::MessageTooLarge);
+            };
+            if bytes.len() < frame_len {
+                return Ok((
+                    events,
+                    original_len - bytes.len(),
+                    DirectDataResult::WaitForMore,
+                ));
+            }
+
+            let payload = &bytes[header.header_len..frame_len];
+            match header.opcode {
+                OpCode::Text => {
+                    let text = if self.config.assume_text_utf8 {
+                        // SAFETY: Enabled only through `unsafe`
+                        // `WsConfig::with_assume_text_utf8_unchecked`, whose
+                        // caller promises all server text payloads are UTF-8.
+                        unsafe { std::str::from_utf8_unchecked(payload) }
+                    } else {
+                        std::str::from_utf8(payload).map_err(|_| {
+                            self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
+                            WsError::Utf8Invalid
+                        })?
+                    };
+                    let meta = next_marked_meta(base_meta, message_index, message_sequence);
+                    sink(MarkedDataEvent::Text {
+                        payload: text,
+                        meta,
+                    });
+                }
+                OpCode::Binary => {
+                    let meta = next_marked_meta(base_meta, message_index, message_sequence);
+                    sink(MarkedDataEvent::Binary { payload, meta });
+                }
                 _ => unreachable!("guarded above"),
             }
             events += 1;
@@ -1576,6 +1939,56 @@ mod tests {
     }
 
     #[test]
+    fn drain_data_events_from_ingress_marked_dispatches_meta() {
+        let mut c = mk_open_client();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&server_text(b"alpha"));
+        wire.extend_from_slice(&server_binary(b"bravo"));
+
+        let base_meta = DataEventMeta {
+            sampled: true,
+            source_recv_time_nanos: 42,
+            recv_sequence: 9,
+            transport_recv_mono_nanos: 7,
+            tls_plaintext_ready_mono_nanos: 11,
+            ws_payload_ready_mono_nanos: 0,
+            message_sequence: 17,
+            tls_plaintext_chunk_index: 3,
+            chunk_message_index: 0,
+        };
+
+        let mut data = Vec::new();
+        let events = c
+            .drain_data_events_from_ingress_marked(&wire, base_meta, |ev| match ev {
+                MarkedDataEvent::Text { payload, meta } => {
+                    data.push((format!("text:{payload}"), meta));
+                }
+                MarkedDataEvent::Binary { payload, meta } => {
+                    data.push((
+                        format!("binary:{}", std::str::from_utf8(payload).unwrap()),
+                        meta,
+                    ));
+                }
+            })
+            .unwrap();
+
+        assert_eq!(events, 2);
+        assert_eq!(data[0].0, "text:alpha");
+        assert_eq!(data[1].0, "binary:bravo");
+        assert_eq!(data[0].1.source_recv_time_nanos, 42);
+        assert_eq!(data[0].1.recv_sequence, 9);
+        assert_eq!(data[0].1.message_sequence, 17);
+        assert_eq!(data[0].1.tls_plaintext_chunk_index, 3);
+        assert_eq!(data[0].1.chunk_message_index, 0);
+        assert_eq!(data[1].1.source_recv_time_nanos, 42);
+        assert_eq!(data[1].1.recv_sequence, 9);
+        assert_eq!(data[1].1.message_sequence, 18);
+        assert_eq!(data[1].1.tls_plaintext_chunk_index, 3);
+        assert_eq!(data[1].1.chunk_message_index, 1);
+        assert!(c.recv_buf.is_empty());
+    }
+
+    #[test]
     fn drain_data_events_from_ingress_dispatches_extended_16bit_text_frame() {
         let mut c = mk_open_client();
         let payload = vec![b'x'; 130];
@@ -1624,6 +2037,48 @@ mod tests {
     }
 
     #[test]
+    fn drain_data_events_from_ingress_marked_handles_partial_frame() {
+        let mut c = mk_open_client();
+        let wire = server_text(b"partial");
+        let split_at = wire.len() - 2;
+        let base_meta = DataEventMeta {
+            sampled: true,
+            source_recv_time_nanos: 77,
+            recv_sequence: 4,
+            transport_recv_mono_nanos: 1,
+            tls_plaintext_ready_mono_nanos: 2,
+            ws_payload_ready_mono_nanos: 0,
+            message_sequence: 0,
+            tls_plaintext_chunk_index: 5,
+            chunk_message_index: 0,
+        };
+
+        let mut data = Vec::new();
+        let events = c
+            .drain_data_events_from_ingress_marked(&wire[..split_at], base_meta, |ev| match ev {
+                MarkedDataEvent::Text { payload, meta } => data.push((payload.to_owned(), meta)),
+                MarkedDataEvent::Binary { .. } => panic!("unexpected binary"),
+            })
+            .unwrap();
+        assert_eq!(events, 0);
+        assert!(!c.recv_buf.is_empty(), "partial frame must be buffered");
+
+        let events = c
+            .drain_data_events_from_ingress_marked(&wire[split_at..], base_meta, |ev| match ev {
+                MarkedDataEvent::Text { payload, meta } => data.push((payload.to_owned(), meta)),
+                MarkedDataEvent::Binary { .. } => panic!("unexpected binary"),
+            })
+            .unwrap();
+        assert_eq!(events, 1);
+        assert_eq!(data[0].0, "partial");
+        assert_eq!(data[0].1.source_recv_time_nanos, 77);
+        assert_eq!(data[0].1.recv_sequence, 4);
+        assert_eq!(data[0].1.message_sequence, 0);
+        assert_eq!(data[0].1.tls_plaintext_chunk_index, 5);
+        assert_eq!(data[0].1.chunk_message_index, 0);
+    }
+
+    #[test]
     fn drain_data_events_from_ingress_falls_back_for_control_frames() {
         let mut c = mk_open_client();
         let mut wire = Vec::new();
@@ -1641,6 +2096,62 @@ mod tests {
 
         assert_eq!(events, 3);
         assert_eq!(data, vec!["before".to_owned(), "after".to_owned()]);
+        assert!(
+            !c.pending_tx().is_empty(),
+            "Ping fallback should still queue auto-pong"
+        );
+    }
+
+    #[test]
+    fn drain_data_events_from_ingress_marked_preserves_index_after_control_fallback() {
+        let mut c = mk_open_client();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&server_text(b"before"));
+        wire.extend_from_slice(&server_control(OpCode::Ping, b"hb"));
+        wire.extend_from_slice(&server_text(b"after"));
+
+        let base_meta = DataEventMeta {
+            sampled: true,
+            source_recv_time_nanos: 99,
+            recv_sequence: 6,
+            transport_recv_mono_nanos: 1,
+            tls_plaintext_ready_mono_nanos: 2,
+            ws_payload_ready_mono_nanos: 0,
+            message_sequence: 0,
+            tls_plaintext_chunk_index: 8,
+            chunk_message_index: 0,
+        };
+
+        let mut message_sequence = 41;
+        let mut data = Vec::new();
+        let events = c
+            .drain_data_events_from_ingress_marked_with_message_sequence(
+                &wire,
+                base_meta,
+                &mut message_sequence,
+                |ev| match ev {
+                    MarkedDataEvent::Text { payload, meta } => {
+                        data.push((payload.to_owned(), meta));
+                    }
+                    MarkedDataEvent::Binary { .. } => panic!("unexpected binary"),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(events, 3);
+        assert_eq!(message_sequence, 43);
+        assert_eq!(data[0].0, "before");
+        assert_eq!(data[0].1.source_recv_time_nanos, 99);
+        assert_eq!(data[0].1.recv_sequence, 6);
+        assert_eq!(data[0].1.message_sequence, 41);
+        assert_eq!(data[0].1.tls_plaintext_chunk_index, 8);
+        assert_eq!(data[0].1.chunk_message_index, 0);
+        assert_eq!(data[1].0, "after");
+        assert_eq!(data[1].1.source_recv_time_nanos, 99);
+        assert_eq!(data[1].1.recv_sequence, 6);
+        assert_eq!(data[1].1.message_sequence, 42);
+        assert_eq!(data[1].1.tls_plaintext_chunk_index, 8);
+        assert_eq!(data[1].1.chunk_message_index, 1);
         assert!(
             !c.pending_tx().is_empty(),
             "Ping fallback should still queue auto-pong"

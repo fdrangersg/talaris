@@ -13,15 +13,19 @@
 // supervisor 重启，而不是继续吞错。
 #![allow(clippy::expect_used)]
 
-use std::io;
 use std::net::SocketAddr;
+use std::{fmt, io};
 
 use crate::connection::{ConnectionConfig, ConnectionError, IngressStats, State};
+use crate::observability::LatencyHistograms;
 use crate::proactor::{
     BufferRing, Completion, Domain, OpKind, Proactor, SockAddr, SqeFlags, TcpSocket, UserData,
 };
 use crate::tls::TlsAdapter;
-use crate::ws::{ConnState as WsConnState, DataEvent as WsDataEvent, WsClient, WsConfig};
+use crate::ws::{
+    ConnState as WsConnState, DataEvent as WsDataEvent, DataEventMeta, MarkedDataEvent, WsClient,
+    WsConfig,
+};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum WsIngressState {
@@ -65,6 +69,9 @@ pub(crate) struct ConnectionState {
     /// leave this false, so the data hot path can skip a guaranteed no-op drain.
     ws_ingress: WsIngressState,
     pub(crate) ingress_stats: IngressStats,
+    marked_recv_sequence: u64,
+    marked_message_sequence: u64,
+    observability_histograms: Option<LatencyHistograms>,
     pub(crate) cfg: ConnectionConfig,
 }
 
@@ -99,6 +106,11 @@ impl ConnectionState {
         let init_cap = cfg.buf_ring_slot_size as usize;
         let send_cap = cfg.send_buffer_initial_capacity.unwrap_or(init_cap);
         let tls_pending_out_cap = cfg.tls_pending_out_initial_capacity.unwrap_or(init_cap);
+        let observability_histograms = if cfg.record_observability_histograms {
+            Some(LatencyHistograms::new()?)
+        } else {
+            None
+        };
         Ok(Self {
             socket,
             addr: sock_addr,
@@ -114,6 +126,9 @@ impl ConnectionState {
             ws_handshake_begun: false,
             ws_ingress: WsIngressState::Clean,
             ingress_stats: IngressStats::default(),
+            marked_recv_sequence: 0,
+            marked_message_sequence: 0,
+            observability_histograms,
             cfg,
         })
     }
@@ -131,6 +146,85 @@ impl ConnectionState {
     #[inline]
     pub(crate) const fn ingress_stats(&self) -> IngressStats {
         self.ingress_stats
+    }
+
+    pub(crate) fn write_prometheus_metrics<W: fmt::Write>(&self, out: &mut W) -> fmt::Result {
+        let conn_id = self.cfg.conn_id;
+        if let Some(histograms) = &self.observability_histograms {
+            histograms.write_prometheus_cumulative(conn_id, out)?;
+        }
+        self.write_ingress_prometheus_metrics(out)
+    }
+
+    pub(crate) fn write_prometheus_metrics_and_reset_interval<W: fmt::Write>(
+        &mut self,
+        out: &mut W,
+    ) -> fmt::Result {
+        let conn_id = self.cfg.conn_id;
+        if let Some(histograms) = &mut self.observability_histograms {
+            histograms.write_prometheus_interval_and_reset(conn_id, out)?;
+        }
+        self.write_ingress_prometheus_metrics(out)
+    }
+
+    fn write_ingress_prometheus_metrics<W: fmt::Write>(&self, out: &mut W) -> fmt::Result {
+        let conn_id = self.cfg.conn_id;
+        let stats = self.ingress_stats;
+        writeln!(
+            out,
+            "talaris_ingress_recv_data_cqes_total{{conn_id=\"{conn_id}\"}} {}",
+            stats.recv_data_cqes
+        )?;
+        writeln!(
+            out,
+            "talaris_ingress_recv_bytes_total{{conn_id=\"{conn_id}\"}} {}",
+            stats.recv_bytes
+        )?;
+        writeln!(
+            out,
+            "talaris_ingress_recv_multishot_rearms_total{{conn_id=\"{conn_id}\"}} {}",
+            stats.recv_multishot_rearms
+        )?;
+        writeln!(
+            out,
+            "talaris_ingress_recv_ring_exhaustions_total{{conn_id=\"{conn_id}\"}} {}",
+            stats.recv_ring_exhaustions
+        )?;
+        writeln!(
+            out,
+            "talaris_ingress_plaintext_chunks_total{{conn_id=\"{conn_id}\"}} {}",
+            stats.plaintext_chunks
+        )?;
+        writeln!(
+            out,
+            "talaris_ingress_plaintext_bytes_total{{conn_id=\"{conn_id}\"}} {}",
+            stats.plaintext_bytes
+        )?;
+        writeln!(
+            out,
+            "talaris_ingress_ws_data_drains_total{{conn_id=\"{conn_id}\"}} {}",
+            stats.ws_data_drains
+        )?;
+        writeln!(
+            out,
+            "talaris_ingress_ws_data_drain_skips_total{{conn_id=\"{conn_id}\"}} {}",
+            stats.ws_data_drain_skips
+        )?;
+        writeln!(
+            out,
+            "talaris_ingress_ws_data_events_total{{conn_id=\"{conn_id}\"}} {}",
+            stats.ws_data_events
+        )?;
+        writeln!(
+            out,
+            "talaris_ingress_ws_text_events_total{{conn_id=\"{conn_id}\"}} {}",
+            stats.ws_text_events
+        )?;
+        writeln!(
+            out,
+            "talaris_ingress_ws_binary_events_total{{conn_id=\"{conn_id}\"}} {}",
+            stats.ws_binary_events
+        )
     }
 
     pub(crate) fn assert_open(&self) -> Result<(), ConnectionError> {
@@ -260,6 +354,7 @@ impl ConnectionState {
             )?;
         }
         self.multishot_armed = true;
+        self.record_recv_multishot_rearm();
         Ok(())
     }
 
@@ -315,6 +410,37 @@ impl ConnectionState {
         }
     }
 
+    pub(crate) fn handle_completion_data_marked<F>(
+        &mut self,
+        proactor: &mut Proactor,
+        c: Completion,
+        mut sink: F,
+    ) -> Result<usize, ConnectionError>
+    where
+        F: for<'a> FnMut(MarkedDataEvent<'a>),
+    {
+        let kind = c
+            .user_data
+            .kind()
+            .ok_or_else(|| ConnectionError::UnknownOpKind(c.user_data.raw()))?;
+        match kind {
+            OpKind::Connect => {
+                self.on_connect_cqe(proactor, c)?;
+                Ok(0)
+            }
+            OpKind::Send => {
+                self.on_send_cqe(c)?;
+                Ok(0)
+            }
+            OpKind::Recv => self.on_recv_cqe_data_marked(c, &mut sink),
+            OpKind::Close => {
+                self.state = State::Closed;
+                Ok(0)
+            }
+            OpKind::Nop => Ok(0),
+        }
+    }
+
     fn on_connect_cqe(
         &mut self,
         proactor: &mut Proactor,
@@ -339,6 +465,7 @@ impl ConnectionState {
             )?;
         }
         self.multishot_armed = true;
+        self.record_recv_multishot_rearm();
 
         self.state = if self.tls.is_some() {
             State::TlsHandshake
@@ -464,6 +591,7 @@ impl ConnectionState {
         recv_result
     }
 
+    #[allow(clippy::too_many_lines)]
     fn on_recv_cqe_data<F>(&mut self, c: Completion, sink: &mut F) -> Result<usize, ConnectionError>
     where
         F: for<'a> FnMut(WsDataEvent<'a>),
@@ -520,12 +648,218 @@ impl ConnectionState {
             let mut fed_plaintext = false;
             let mut drained_events = 0_usize;
             let mut ws_error = None;
+            let mut plaintext_chunks = 0_u64;
+            let mut plaintext_bytes = 0_u64;
+            let mut text_events = 0_u64;
+            let mut binary_events = 0_u64;
+            if self.cfg.track_ingress_stats {
+                tls.ingest_ciphertext(bytes, &mut self.tls_pending_out, |plaintext| {
+                    fed_plaintext = true;
+                    plaintext_chunks = plaintext_chunks.saturating_add(1);
+                    plaintext_bytes = plaintext_bytes.saturating_add(plaintext.len() as u64);
+                    match ws.drain_data_events_from_ingress(plaintext, |ev| {
+                        drained_events = drained_events.saturating_add(1);
+                        match ev {
+                            WsDataEvent::Text(_) => text_events = text_events.saturating_add(1),
+                            WsDataEvent::Binary(_) => {
+                                binary_events = binary_events.saturating_add(1);
+                            }
+                        }
+                        sink(ev);
+                    }) {
+                        Ok(_) => {}
+                        Err(e) if ws_error.is_none() => {
+                            ws_error = Some(e);
+                        }
+                        Err(_) => {}
+                    }
+                })?;
+            } else {
+                tls.ingest_ciphertext(bytes, &mut self.tls_pending_out, |plaintext| {
+                    fed_plaintext = true;
+                    match ws.drain_data_events_from_ingress(plaintext, |ev| {
+                        drained_events = drained_events.saturating_add(1);
+                        sink(ev);
+                    }) {
+                        Ok(_) => {}
+                        Err(e) if ws_error.is_none() => {
+                            ws_error = Some(e);
+                        }
+                        Err(_) => {}
+                    }
+                })?;
+            }
+            if !tls.is_handshaking()
+                && matches!(self.state, State::TlsHandshake)
+                && !self.ws_handshake_begun
+            {
+                tls.verify_alpn()?;
+                self.state = State::WsHandshake;
+                self.ws.begin_handshake()?;
+                self.ws_handshake_begun = true;
+            }
+            if tls.received_close_notify() && !matches!(self.state, State::Closed | State::Closing)
+            {
+                self.state = State::Closing;
+            }
+            self.record_ws_data_drain_attempt(fed_plaintext);
+            if self.cfg.track_ingress_stats {
+                self.record_plaintext(plaintext_chunks, plaintext_bytes);
+                self.record_ws_data_events(text_events, binary_events);
+            }
+            match ws_error {
+                Some(e) => Err(ConnectionError::Ws(e)),
+                None => Ok(drained_events),
+            }
+        } else {
+            let mut drained_events = 0_usize;
+            let result = if self.cfg.track_ingress_stats {
+                let mut text_events = 0_u64;
+                let mut binary_events = 0_u64;
+                let result = self
+                    .ws
+                    .drain_data_events_from_ingress(bytes, |ev| {
+                        drained_events = drained_events.saturating_add(1);
+                        match ev {
+                            WsDataEvent::Text(_) => text_events = text_events.saturating_add(1),
+                            WsDataEvent::Binary(_) => {
+                                binary_events = binary_events.saturating_add(1);
+                            }
+                        }
+                        sink(ev);
+                    })
+                    .map(|_| drained_events)
+                    .map_err(ConnectionError::Ws);
+                self.record_plaintext(1, n as u64);
+                self.record_ws_data_events(text_events, binary_events);
+                result
+            } else {
+                self.ws
+                    .drain_data_events_from_ingress(bytes, |ev| {
+                        drained_events = drained_events.saturating_add(1);
+                        sink(ev);
+                    })
+                    .map(|_| drained_events)
+                    .map_err(ConnectionError::Ws)
+            };
+            self.record_ws_data_drain_attempt(true);
+            result
+        };
+
+        self.buf_ring.as_mut().expect("buf_ring").recycle(bid);
+
+        recv_result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn on_recv_cqe_data_marked<F>(
+        &mut self,
+        c: Completion,
+        sink: &mut F,
+    ) -> Result<usize, ConnectionError>
+    where
+        F: for<'a> FnMut(MarkedDataEvent<'a>),
+    {
+        if !c.has_more() {
+            self.multishot_armed = false;
+        }
+
+        let Some(bid) = c.buffer_id() else {
+            return match c.to_result() {
+                Ok(0) => {
+                    self.state = State::Closed;
+                    Err(ConnectionError::PeerClosed)
+                }
+                Ok(_) => Ok(0),
+                Err(e) if is_recv_buffer_ring_exhausted(&e) => {
+                    self.record_recv_ring_exhaustion();
+                    self.multishot_armed = false;
+                    tracing::warn!(
+                        conn_id = self.cfg.conn_id,
+                        bgid = self.buf_ring.as_ref().map_or(0, BufferRing::bgid),
+                        "recv multishot provided-buffer ring exhausted; will rearm next pump"
+                    );
+                    Ok(0)
+                }
+                Err(e) => Err(ConnectionError::RecvFailed(e)),
+            };
+        };
+
+        let n = c.to_result().map_err(ConnectionError::RecvFailed)?;
+
+        if n == 0 {
+            self.buf_ring
+                .as_mut()
+                .expect("buf_ring 应在 on_connect_cqe 注册")
+                .recycle(bid);
+            self.state = State::Closed;
+            return Err(ConnectionError::PeerClosed);
+        }
+
+        let recv_sequence = self.marked_recv_sequence;
+        let sampled = self
+            .cfg
+            .observability_sample_rate
+            .should_sample_sequence(recv_sequence);
+        let recv_meta = DataEventMeta::recv_observed_now(recv_sequence, sampled);
+        self.marked_recv_sequence = self.marked_recv_sequence.saturating_add(1);
+        self.record_recv_data(n);
+        let bytes_ptr = self
+            .buf_ring
+            .as_ref()
+            .expect("buf_ring")
+            .buffer(bid)
+            .as_ptr();
+        // SAFETY: Same invariant as on_recv_cqe: the buffer is not recycled until
+        // recv_result is built, and Proactor is single-thread owned.
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(bytes_ptr, n) };
+
+        let recv_result = if let Some(tls) = &mut self.tls {
+            let ws = &mut self.ws;
+            let marked_message_sequence = &mut self.marked_message_sequence;
+            let observability_histograms = &mut self.observability_histograms;
+            let mut fed_plaintext = false;
+            let mut plaintext_chunks = 0_u64;
+            let mut plaintext_bytes = 0_u64;
+            let mut drained_events = 0_usize;
+            let mut text_events = 0_u64;
+            let mut binary_events = 0_u64;
+            let mut chunk_index = 0_u16;
+            let mut ws_error = None;
             tls.ingest_ciphertext(bytes, &mut self.tls_pending_out, |plaintext| {
                 fed_plaintext = true;
-                match ws.drain_data_events_from_ingress(plaintext, |ev| {
-                    drained_events = drained_events.saturating_add(1);
-                    sink(ev);
-                }) {
+                plaintext_chunks = plaintext_chunks.saturating_add(1);
+                plaintext_bytes = plaintext_bytes.saturating_add(plaintext.len() as u64);
+                let base_meta = recv_meta.plaintext_ready_now(chunk_index);
+                chunk_index = chunk_index.saturating_add(1);
+                let chunk_events_before = drained_events;
+                let drain_result = ws.drain_data_events_from_ingress_marked_with_message_sequence(
+                    plaintext,
+                    base_meta,
+                    marked_message_sequence,
+                    |ev| {
+                        let meta = ev.meta();
+                        if let Some(histograms) = observability_histograms.as_mut() {
+                            histograms.record_message(meta);
+                        }
+                        drained_events = drained_events.saturating_add(1);
+                        match ev {
+                            MarkedDataEvent::Text { .. } => {
+                                text_events = text_events.saturating_add(1);
+                            }
+                            MarkedDataEvent::Binary { .. } => {
+                                binary_events = binary_events.saturating_add(1);
+                            }
+                        }
+                        sink(ev);
+                    },
+                );
+                if drained_events > chunk_events_before
+                    && let Some(histograms) = observability_histograms.as_mut()
+                {
+                    histograms.record_plaintext_chunk(base_meta);
+                }
+                match drain_result {
                     Ok(_) => {}
                     Err(e) if ws_error.is_none() => {
                         ws_error = Some(e);
@@ -547,21 +881,53 @@ impl ConnectionState {
                 self.state = State::Closing;
             }
             self.record_ws_data_drain_attempt(fed_plaintext);
+            self.record_plaintext(plaintext_chunks, plaintext_bytes);
+            self.record_ws_data_events(text_events, binary_events);
             match ws_error {
                 Some(e) => Err(ConnectionError::Ws(e)),
                 None => Ok(drained_events),
             }
         } else {
             let mut drained_events = 0_usize;
+            let mut text_events = 0_u64;
+            let mut binary_events = 0_u64;
+            let base_meta = recv_meta.plaintext_ready_at(recv_meta.transport_recv_mono_nanos, 0);
+            let marked_message_sequence = &mut self.marked_message_sequence;
+            let observability_histograms = &mut self.observability_histograms;
+            let chunk_events_before = drained_events;
             let result = self
                 .ws
-                .drain_data_events_from_ingress(bytes, |ev| {
-                    drained_events = drained_events.saturating_add(1);
-                    sink(ev);
-                })
+                .drain_data_events_from_ingress_marked_with_message_sequence(
+                    bytes,
+                    base_meta,
+                    marked_message_sequence,
+                    |ev| {
+                        let meta = ev.meta();
+                        if let Some(histograms) = observability_histograms.as_mut() {
+                            histograms.record_message(meta);
+                        }
+                        drained_events = drained_events.saturating_add(1);
+                        match ev {
+                            MarkedDataEvent::Text { .. } => {
+                                text_events = text_events.saturating_add(1);
+                            }
+                            MarkedDataEvent::Binary { .. } => {
+                                binary_events = binary_events.saturating_add(1);
+                            }
+                        }
+                        sink(ev);
+                    },
+                )
                 .map(|_| drained_events)
                 .map_err(ConnectionError::Ws);
+            if drained_events > chunk_events_before
+                && let Some(histograms) = observability_histograms.as_mut()
+            {
+                histograms.record_plaintext_chunk(base_meta);
+            }
             self.record_ws_data_drain_attempt(true);
+            self.record_plaintext(1, n as u64);
+            self.record_ws_data_events(text_events, binary_events);
             result
         };
 
@@ -580,10 +946,28 @@ impl ConnectionState {
     }
 
     #[inline]
+    fn record_recv_multishot_rearm(&mut self) {
+        if self.cfg.track_ingress_stats {
+            self.ingress_stats.recv_multishot_rearms =
+                self.ingress_stats.recv_multishot_rearms.saturating_add(1);
+        }
+    }
+
+    #[inline]
     fn record_recv_ring_exhaustion(&mut self) {
         if self.cfg.track_ingress_stats {
             self.ingress_stats.recv_ring_exhaustions =
                 self.ingress_stats.recv_ring_exhaustions.saturating_add(1);
+        }
+    }
+
+    #[inline]
+    fn record_plaintext(&mut self, chunks: u64, bytes: u64) {
+        if self.cfg.track_ingress_stats {
+            self.ingress_stats.plaintext_chunks =
+                self.ingress_stats.plaintext_chunks.saturating_add(chunks);
+            self.ingress_stats.plaintext_bytes =
+                self.ingress_stats.plaintext_bytes.saturating_add(bytes);
         }
     }
 
@@ -597,6 +981,24 @@ impl ConnectionState {
                 self.ingress_stats.ws_data_drain_skips =
                     self.ingress_stats.ws_data_drain_skips.saturating_add(1);
             }
+        }
+    }
+
+    #[inline]
+    fn record_ws_data_events(&mut self, text_events: u64, binary_events: u64) {
+        if self.cfg.track_ingress_stats {
+            self.ingress_stats.ws_text_events = self
+                .ingress_stats
+                .ws_text_events
+                .saturating_add(text_events);
+            self.ingress_stats.ws_binary_events = self
+                .ingress_stats
+                .ws_binary_events
+                .saturating_add(binary_events);
+            self.ingress_stats.ws_data_events = self
+                .ingress_stats
+                .ws_data_events
+                .saturating_add(text_events.saturating_add(binary_events));
         }
     }
 
