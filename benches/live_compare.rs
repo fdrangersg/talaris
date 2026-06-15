@@ -5,6 +5,7 @@
     clippy::indexing_slicing,
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
+    clippy::needless_pass_by_value,
     clippy::panic,
     clippy::print_stderr,
     clippy::print_stdout,
@@ -500,7 +501,6 @@ fn connect_tungstenite_socket(
     Ok(socket)
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn run_tungstenite_worker(
     cfg: Arc<Config>,
     mut socket: tungstenite::WebSocket<TlsCountingStream>,
