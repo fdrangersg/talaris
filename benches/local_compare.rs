@@ -76,6 +76,7 @@ struct Config {
     cq_entries: u32,
     completion_batch: usize,
     spin_iters: usize,
+    post_progress_spin_iters: usize,
     copy_batch_bytes: usize,
     user_cpu: Option<usize>,
     server_cpu: Option<usize>,
@@ -111,6 +112,7 @@ impl Config {
             cq_entries,
             completion_batch: common::arg_or("--completion-batch", 64_usize).max(1),
             spin_iters: common::arg_or("--spin-iters", 256_usize),
+            post_progress_spin_iters: common::arg_or("--post-progress-spin-iters", 0_usize),
             copy_batch_bytes: common::arg_or("--copy-batch-bytes", 0_usize),
             user_cpu: common::optional_arg("--user-cpu"),
             server_cpu: common::optional_arg("--server-cpu"),
@@ -119,7 +121,7 @@ impl Config {
 
     fn print(&self) {
         println!(
-            "bench_config bench=local_compare transport={} seconds={} messages={} warmup_messages={} payload={} frames_per_write={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} copy_batch_bytes={}",
+            "bench_config bench=local_compare transport={} seconds={} messages={} warmup_messages={} payload={} frames_per_write={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} post_progress_spin_iters={} copy_batch_bytes={}",
             self.transport.as_str(),
             self.seconds,
             self.messages,
@@ -132,6 +134,7 @@ impl Config {
             self.cq_entries,
             self.completion_batch,
             self.spin_iters,
+            self.post_progress_spin_iters,
             self.copy_batch_bytes,
         );
     }
@@ -176,7 +179,9 @@ fn run_talaris_once(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .with_observability_histograms(false);
     let proactor_cfg = conn_cfg.proactor;
     let mut pool = talaris::Pool::new(
-        talaris::PoolConfig::new(proactor_cfg).with_completion_batch_capacity(cfg.completion_batch),
+        talaris::PoolConfig::new(proactor_cfg)
+            .with_completion_batch_capacity(cfg.completion_batch)
+            .with_post_progress_spin_iters(cfg.post_progress_spin_iters),
     )?;
     let handle = pool.connect_blocking_to(conn_cfg, addr)?;
     assert_eq!(pool.state(handle), Some(talaris::connection::State::Open));
@@ -386,6 +391,7 @@ fn print_usage() {
            --cq-entries N            talaris io_uring CQ entries, power of two\n\
            --completion-batch N      talaris Pool CQE scratch buffer capacity\n\
            --spin-iters N            talaris spin count; 0 uses blocking pump_data\n\
+           --post-progress-spin-iters N  extra spin/drain budget after first progress\n\
            --copy-batch-bytes N      max bytes copied across a plain recv CQE batch; 0 disables\n\
            --user-cpu N              pin benchmark thread\n\
            --server-cpu N            pin loopback server thread"

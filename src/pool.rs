@@ -65,6 +65,10 @@ pub struct PoolConfig {
     /// `pump_impl` drain CQE 暂存区初始容量。高 fanout / burst 场景可增大，
     /// 避免第一轮大 batch grow。
     pub completion_batch_capacity: usize,
+    /// Busy-spin data pumps stop after first progress by default. This optional
+    /// budget keeps draining briefly after progress to coalesce nearby CQEs in
+    /// one pump call without delaying the first emitted event.
+    pub post_progress_spin_iters: usize,
 }
 
 impl PoolConfig {
@@ -74,6 +78,7 @@ impl PoolConfig {
             proactor,
             initial_conn_capacity: DEFAULT_POOL_INITIAL_CONN_CAPACITY,
             completion_batch_capacity: DEFAULT_POOL_COMPLETION_BATCH_CAPACITY,
+            post_progress_spin_iters: 0,
         }
     }
 
@@ -86,6 +91,12 @@ impl PoolConfig {
     #[must_use]
     pub const fn with_completion_batch_capacity(mut self, capacity: usize) -> Self {
         self.completion_batch_capacity = capacity;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_post_progress_spin_iters(mut self, iters: usize) -> Self {
+        self.post_progress_spin_iters = iters;
         self
     }
 }
@@ -126,6 +137,7 @@ pub struct Pool {
     /// 这是 hot loop 第一大 alloc：每轮 pump 一次 `Vec::with_capacity(16)`）。
     /// 初始 cap 16 已足够单 conn 单轮 ≤ 4 CQE；多 conn 高峰按需 grow 一次后稳定。
     completions_buf: Vec<Completion>,
+    post_progress_spin_iters: usize,
     /// `Pool: !Send + !Sync` 显式标记。raw pointer phantom 不实际持有。
     _not_send: PhantomData<*const ()>,
 }
@@ -153,6 +165,7 @@ impl Pool {
             next_conn_id: 0,
             next_bgid: 0,
             completions_buf: Vec::with_capacity(cfg.completion_batch_capacity),
+            post_progress_spin_iters: cfg.post_progress_spin_iters,
             _not_send: PhantomData,
         })
     }
@@ -529,6 +542,7 @@ impl Pool {
     where
         F: for<'a> FnMut(ConnHandle, WsDataEvent<'a>),
     {
+        let post_progress_spin_iters = self.post_progress_spin_iters;
         let Self {
             proactor,
             conns,
@@ -551,7 +565,22 @@ impl Pool {
                 &mut sink,
                 &mut first_err,
             );
-            progressed |= cqes > 0;
+            if cqes > 0 {
+                progressed = true;
+                for _ in 0..post_progress_spin_iters {
+                    std::hint::spin_loop();
+                    let more = drain_conn_completions_data(
+                        conns,
+                        proactor,
+                        completions_buf,
+                        &mut sink,
+                        &mut first_err,
+                    );
+                    if more == 0 || first_err.is_some() {
+                        break;
+                    }
+                }
+            }
 
             if progressed || first_err.is_some() {
                 break;
