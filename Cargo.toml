@@ -40,10 +40,6 @@ libc         = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
 
-[dev-dependencies]
-# live_ws_latency 对照用；TLS 仍由本 crate 直接使用 rustls 驱动。
-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
-
 # ─── profiles ───────────────────────────────────────────────────────────
 [profile.dev]
 opt-level = 0
@@ -77,30 +73,14 @@ strip         = false
 #
 # 跑法：`taskset -c 0-7 cargo bench --bench <name> -- <args>`
 # 单独 release build：`cargo build --release --bench <name>`，产物在
-# `target/release/deps/<name>-<hash>`（带 hash，因为 dev-dep 不一样）。
+# `target/release/deps/<name>-<hash>`。
 
 [[bench]]
-name    = "framing"
+name    = "local_pipeline"
 harness = false
 
 [[bench]]
-name    = "read"
-harness = false
-
-[[bench]]
-name    = "ws_chunking"
-harness = false
-
-[[bench]]
-name    = "ingress"
-harness = false
-
-[[bench]]
-name    = "e2e"
-harness = false
-
-[[bench]]
-name    = "live_ws_latency"
+name    = "live_pipeline"
 harness = false
 
 # ─── lints ──────────────────────────────────────────────────────────────

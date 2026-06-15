@@ -3,6 +3,7 @@
     clippy::cast_precision_loss,
     clippy::expect_used,
     clippy::indexing_slicing,
+    clippy::missing_errors_doc,
     clippy::missing_panics_doc,
     clippy::panic,
     clippy::print_stderr,
@@ -10,16 +11,20 @@
     clippy::unwrap_used
 )]
 
+use std::fs::File;
+use std::hint::black_box;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::str::FromStr;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use talaris::ws::frame::{MAX_HEADER_LEN, OpCode, encode_header, parse_header};
+use talaris::connection::IngressStats;
+use talaris::observability::DataEventMeta;
+use talaris::ws::frame::{MAX_HEADER_LEN, OpCode, encode_header};
 use talaris::ws::handshake::compute_accept;
-use talaris::ws::mask::mask_inplace;
-use talaris::ws::{Event, WsClient, WsConfig};
+
+pub const FULL_SAMPLE_BPS: u16 = 10_000;
 
 pub fn arg_or<T>(flag: &str, default: T) -> T
 where
@@ -49,20 +54,50 @@ where
     None
 }
 
+pub fn arg_string(flag: &str, default: &str) -> String {
+    optional_arg(flag).unwrap_or_else(|| default.to_owned())
+}
+
 pub fn flag_present(flag: &str) -> bool {
     std::env::args().skip(1).any(|arg| arg == flag)
 }
 
-pub fn parse_usize_list(flag: &str, default: &str) -> Vec<usize> {
-    let raw: String = arg_or(flag, default.to_owned());
-    raw.split(',')
-        .filter_map(|part| part.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .collect()
+pub fn optional_string(flag: &str) -> Option<String> {
+    optional_arg(flag)
 }
 
 pub fn print_linux_only(name: &str) {
-    eprintln!("{name}: skipped - talaris benches only run on Linux");
+    eprintln!("{name}: skipped - talaris pipeline benches only run on Linux");
+}
+
+pub fn validate_power_of_two_u16(name: &str, value: u16) -> Result<(), String> {
+    if value > 0 && value.is_power_of_two() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name} must be a non-zero power of two, got {value}"
+        ))
+    }
+}
+
+pub fn validate_power_of_two_u32(name: &str, value: u32) -> Result<(), String> {
+    if value > 0 && value.is_power_of_two() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name} must be a non-zero power of two, got {value}"
+        ))
+    }
+}
+
+pub fn validate_sampling_bps(value: u16) -> Result<(), String> {
+    if value <= FULL_SAMPLE_BPS {
+        Ok(())
+    } else {
+        Err(format!(
+            "--sample-bps must be <= {FULL_SAMPLE_BPS}, got {value}"
+        ))
+    }
 }
 
 pub struct PinGuard {
@@ -74,7 +109,7 @@ impl PinGuard {
         if let Err(e) = talaris::proactor::pin_current_thread_to(cpu) {
             eprintln!("[{label}] pin_current_thread_to({cpu}) failed: {e}");
         } else {
-            eprintln!("[{label}] user thread -> CPU {cpu}");
+            eprintln!("[{label}] pinned to CPU {cpu}");
         }
         Self { label }
     }
@@ -126,22 +161,321 @@ fn thread_cpu_time() -> libc::timespec {
     ts
 }
 
-pub fn ns_per_frame(cpu: Duration, frames: u64) -> u64 {
-    if frames == 0 {
-        return 0;
-    }
-    u64::try_from(cpu.as_nanos() / u128::from(frames)).unwrap_or(u64::MAX)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromWindow {
+    Interval,
+    Cumulative,
 }
 
-pub fn duration_ns_u64(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos().max(1)).unwrap_or(u64::MAX)
+impl PromWindow {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Interval => "interval",
+            Self::Cumulative => "cumulative",
+        }
+    }
 }
 
-pub fn cpu_pct(cpu: Duration, elapsed: Duration) -> f64 {
-    if elapsed.is_zero() {
-        return 0.0;
+pub struct PromWriter {
+    out: Box<dyn Write>,
+}
+
+impl PromWriter {
+    pub fn from_arg(path: Option<String>) -> io::Result<Option<Self>> {
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        let out: Box<dyn Write> = if path == "-" {
+            Box::new(io::stdout())
+        } else {
+            Box::new(File::create(path)?)
+        };
+        Ok(Some(Self { out }))
     }
-    100.0 * cpu.as_secs_f64() / elapsed.as_secs_f64()
+
+    pub fn write_snapshot(
+        &mut self,
+        bench: &str,
+        window: PromWindow,
+        elapsed: Duration,
+        metrics: &str,
+    ) -> io::Result<()> {
+        writeln!(
+            self.out,
+            "# talaris_bench_snapshot bench=\"{bench}\" window=\"{}\" elapsed_ms=\"{:.3}\"",
+            window.as_str(),
+            elapsed_ms(elapsed)
+        )?;
+        self.out.write_all(metrics.as_bytes())?;
+        if !metrics.ends_with('\n') {
+            writeln!(self.out)?;
+        }
+        writeln!(self.out)?;
+        self.out.flush()
+    }
+}
+
+#[derive(Debug)]
+pub struct MetricsSchedule {
+    interval: Duration,
+    next: Option<Instant>,
+}
+
+impl MetricsSchedule {
+    pub fn new(started: Instant, interval: Duration) -> Self {
+        let next = if interval.is_zero() {
+            None
+        } else {
+            Some(started + interval)
+        };
+        Self { interval, next }
+    }
+
+    pub fn write_due(
+        &mut self,
+        writer: &mut Option<PromWriter>,
+        bench: &str,
+        pool: &mut talaris::Pool,
+        started: Instant,
+    ) -> io::Result<()> {
+        let Some(writer) = writer.as_mut() else {
+            return Ok(());
+        };
+        let Some(next) = self.next else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        if now >= next {
+            let metrics = pool.prometheus_metrics_and_reset_interval();
+            writer.write_snapshot(
+                bench,
+                PromWindow::Interval,
+                now.duration_since(started),
+                &metrics,
+            )?;
+            self.next = Some(now + self.interval);
+        }
+        Ok(())
+    }
+
+    pub fn write_final(
+        writer: &mut Option<PromWriter>,
+        bench: &str,
+        pool: &mut talaris::Pool,
+        elapsed: Duration,
+    ) -> io::Result<()> {
+        let Some(writer) = writer.as_mut() else {
+            return Ok(());
+        };
+        let interval = pool.prometheus_metrics_and_reset_interval();
+        writer.write_snapshot(bench, PromWindow::Interval, elapsed, &interval)?;
+        let cumulative = pool.prometheus_metrics();
+        writer.write_snapshot(bench, PromWindow::Cumulative, elapsed, &cumulative)
+    }
+}
+
+pub struct LocalStreamServer {
+    addr: SocketAddr,
+    join: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl LocalStreamServer {
+    #[must_use]
+    pub const fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    pub fn join(mut self) -> io::Result<()> {
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        join.join()
+            .unwrap_or_else(|_| Err(io::Error::other("local websocket server panicked")))
+    }
+}
+
+pub fn spawn_local_stream_server(
+    payload_len: usize,
+    frames_per_write: usize,
+    server_cpu: Option<usize>,
+) -> io::Result<LocalStreamServer> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let addr = listener.local_addr()?;
+    let chunk = encode_binary_frames(payload_len.max(1), frames_per_write.max(1));
+    let join = thread::spawn(move || run_stream_server(listener, chunk, server_cpu));
+    Ok(LocalStreamServer {
+        addr,
+        join: Some(join),
+    })
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_stream_server(
+    listener: TcpListener,
+    chunk: Vec<u8>,
+    server_cpu: Option<usize>,
+) -> io::Result<()> {
+    let _pin = server_cpu.map(|cpu| PinGuard::pin("server", cpu));
+    let (mut stream, _) = listener.accept()?;
+    stream.set_nodelay(true)?;
+    server_upgrade(&mut stream)?;
+    loop {
+        match stream.write_all(&chunk) {
+            Ok(()) => {}
+            Err(e) if is_expected_disconnect(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn is_expected_disconnect(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotConnected
+    )
+}
+
+pub fn payload(payload_len: usize) -> Vec<u8> {
+    (0..payload_len)
+        .map(|i| {
+            u8::try_from(i % 251)
+                .expect("modulo result fits u8")
+                .wrapping_mul(31)
+                .wrapping_add(7)
+        })
+        .collect()
+}
+
+fn encode_binary_frames(payload_len: usize, frames: usize) -> Vec<u8> {
+    let payload = payload(payload_len);
+    let mut out = Vec::with_capacity(frames * (payload_len + MAX_HEADER_LEN));
+    let mut header = [0_u8; MAX_HEADER_LEN];
+    for _ in 0..frames {
+        let n = encode_header(&mut header, true, OpCode::Binary, None, payload_len as u64);
+        out.extend_from_slice(&header[..n]);
+        out.extend_from_slice(&payload);
+    }
+    out
+}
+
+fn extract_ws_key(request: &[u8]) -> io::Result<String> {
+    let request =
+        std::str::from_utf8(request).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    for line in request.lines() {
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("Sec-WebSocket-Key")
+        {
+            return Ok(value.trim().to_owned());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "Sec-WebSocket-Key missing from request",
+    ))
+}
+
+fn upgrade_response_for_request(request: &[u8]) -> io::Result<Vec<u8>> {
+    let key = extract_ws_key(request)?;
+    let accept = compute_accept(&key);
+    Ok(format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept}\r\n\r\n"
+    )
+    .into_bytes())
+}
+
+fn server_upgrade(stream: &mut TcpStream) -> io::Result<()> {
+    let mut buf = [0_u8; 4096];
+    let mut req = Vec::with_capacity(1024);
+    loop {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "client closed during websocket upgrade",
+            ));
+        }
+        req.extend_from_slice(&buf[..n]);
+        if req.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if req.len() > 64 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "websocket upgrade request too large",
+            ));
+        }
+    }
+    let response = upgrade_response_for_request(&req)?;
+    stream.write_all(&response)
+}
+
+#[derive(Debug, Default)]
+pub struct MessageStats {
+    pub messages: u64,
+    pub text_messages: u64,
+    pub binary_messages: u64,
+    pub bytes: u64,
+    pub sampled_messages: u64,
+    pub chunk_first_messages: u64,
+    pub chunk_queued_messages: u64,
+    pub max_chunk_message_index: u16,
+    pub first_recv_sequence: Option<u64>,
+    pub last_recv_sequence: Option<u64>,
+    checksum: u64,
+}
+
+impl MessageStats {
+    pub fn record_text(&mut self, payload: &str) {
+        self.text_messages = self.text_messages.saturating_add(1);
+        self.record_payload(payload.as_bytes());
+    }
+
+    pub fn record_binary(&mut self, payload: &[u8]) {
+        self.binary_messages = self.binary_messages.saturating_add(1);
+        self.record_payload(payload);
+    }
+
+    pub fn record_meta(&mut self, meta: DataEventMeta) {
+        if meta.sampled {
+            self.sampled_messages = self.sampled_messages.saturating_add(1);
+        }
+        if meta.chunk_message_index == 0 {
+            self.chunk_first_messages = self.chunk_first_messages.saturating_add(1);
+        } else {
+            self.chunk_queued_messages = self.chunk_queued_messages.saturating_add(1);
+        }
+        self.max_chunk_message_index = self.max_chunk_message_index.max(meta.chunk_message_index);
+        self.first_recv_sequence.get_or_insert(meta.recv_sequence);
+        self.last_recv_sequence = Some(meta.recv_sequence);
+    }
+
+    fn record_payload(&mut self, payload: &[u8]) {
+        self.messages = self.messages.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(payload.len() as u64);
+        self.checksum = mix_checksum(self.checksum, payload);
+    }
+
+    pub const fn checksum(&self) -> u64 {
+        self.checksum
+    }
+}
+
+fn mix_checksum(mut checksum: u64, payload: &[u8]) -> u64 {
+    checksum = checksum.rotate_left(5) ^ payload.len() as u64;
+    if let Some(first) = payload.first() {
+        checksum = checksum.wrapping_add(u64::from(*first));
+    }
+    if let Some(last) = payload.last() {
+        checksum = checksum.wrapping_mul(16_777_619) ^ u64::from(*last);
+    }
+    checksum
 }
 
 pub fn fmt_int(n: u64) -> String {
@@ -156,11 +490,15 @@ pub fn fmt_int(n: u64) -> String {
     out.chars().rev().collect()
 }
 
-pub fn frames_per_sec(frames: u64, elapsed: Duration) -> f64 {
+pub fn elapsed_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+pub fn messages_per_sec(messages: u64, elapsed: Duration) -> f64 {
     if elapsed.is_zero() {
         return 0.0;
     }
-    frames as f64 / elapsed.as_secs_f64()
+    messages as f64 / elapsed.as_secs_f64()
 }
 
 pub fn mib_per_sec(bytes: u64, elapsed: Duration) -> f64 {
@@ -170,225 +508,78 @@ pub fn mib_per_sec(bytes: u64, elapsed: Duration) -> f64 {
     bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
 }
 
-pub fn payload(payload_len: usize) -> Vec<u8> {
-    (0..payload_len)
-        .map(|i| {
-            u8::try_from(i % 251)
-                .expect("modulo result fits u8")
-                .wrapping_mul(31)
-                .wrapping_add(7)
-        })
-        .collect()
-}
-
-pub fn encode_binary_frames(payload_len: usize, frames: usize) -> Vec<u8> {
-    let payload = payload(payload_len);
-    let mut out = Vec::with_capacity(frames * (payload_len + MAX_HEADER_LEN));
-    let mut header = [0_u8; MAX_HEADER_LEN];
-    for _ in 0..frames {
-        let n = encode_header(&mut header, true, OpCode::Binary, None, payload_len as u64);
-        out.extend_from_slice(&header[..n]);
-        out.extend_from_slice(&payload);
+pub fn ns_per_message(cpu: Duration, messages: u64) -> u64 {
+    if messages == 0 {
+        return 0;
     }
-    out
+    u64::try_from(cpu.as_nanos() / u128::from(messages)).unwrap_or(u64::MAX)
 }
 
-pub fn encode_text_frames(payload: &str, frames: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(frames * (payload.len() + MAX_HEADER_LEN));
-    let mut header = [0_u8; MAX_HEADER_LEN];
-    for _ in 0..frames {
-        let n = encode_header(&mut header, true, OpCode::Text, None, payload.len() as u64);
-        out.extend_from_slice(&header[..n]);
-        out.extend_from_slice(payload.as_bytes());
+pub fn cpu_pct(cpu: Duration, elapsed: Duration) -> f64 {
+    if elapsed.is_zero() {
+        return 0.0;
     }
-    out
+    100.0 * cpu.as_secs_f64() / elapsed.as_secs_f64()
 }
 
-pub fn parse_wire_frames(mut wire: &[u8]) -> (u64, u64) {
-    let mut frames = 0_u64;
-    let mut bytes = 0_u64;
-    while !wire.is_empty() {
-        let (header, header_len) = parse_header(wire)
-            .expect("valid frame")
-            .expect("full header");
-        let payload_len = usize::try_from(header.payload_len).expect("payload fits usize");
-        let frame_len = header_len + payload_len;
-        bytes += header.payload_len;
-        frames += 1;
-        wire = &wire[frame_len..];
-    }
-    (frames, bytes)
-}
-
-pub fn extract_ws_key(request: &[u8]) -> String {
-    let request = std::str::from_utf8(request).expect("upgrade request is utf-8");
-    for line in request.lines() {
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("Sec-WebSocket-Key")
-        {
-            return value.trim().to_owned();
-        }
-    }
-    panic!("Sec-WebSocket-Key missing from request");
-}
-
-pub fn upgrade_response_for_request(request: &[u8]) -> Vec<u8> {
-    let key = extract_ws_key(request);
-    let accept = compute_accept(&key);
-    format!(
-        "HTTP/1.1 101 Switching Protocols\r\n\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Accept: {accept}\r\n\r\n"
-    )
-    .into_bytes()
-}
-
-pub fn server_upgrade(stream: &mut TcpStream) -> io::Result<()> {
-    let mut buf = [0_u8; 4096];
-    let mut req = Vec::new();
-    loop {
-        let n = stream.read(&mut buf)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "client closed during websocket upgrade",
-            ));
-        }
-        req.extend_from_slice(&buf[..n]);
-        if req.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-    }
-    let response = upgrade_response_for_request(&req);
-    stream.write_all(&response)?;
-    Ok(())
-}
-
-pub fn open_ws_client(recv_capacity: usize, max_payload_len: usize) -> WsClient {
-    let max_payload_len = max_payload_len.max(1);
-    let mut ws = WsClient::new_client(
-        WsConfig::new("localhost", "/")
-            .with_max_message_size(max_payload_len)
-            .with_max_frame_payload(max_payload_len as u64)
-            .with_initial_buffer_capacities(recv_capacity.max(1), max_payload_len, 4096),
-    )
-    .expect("ws client");
-    ws.begin_handshake().expect("begin handshake");
-    let request = ws.pending_tx().to_vec();
-    ws.ack_tx(request.len());
-    let response = upgrade_response_for_request(&request);
-    ws.feed_recv(&response);
-    match ws.poll_event() {
-        Some(Ok(Event::HandshakeComplete)) => ws,
-        other => panic!("expected HandshakeComplete, got {other:?}"),
-    }
-}
-
-pub fn spawn_stream_server(
-    listener: TcpListener,
-    chunk: Vec<u8>,
-    server_cpu: Option<usize>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let _pin = server_cpu.map(|cpu| PinGuard::pin("server", cpu));
-        let (mut stream, _) = listener.accept().expect("accept");
-        stream.set_nodelay(true).expect("nodelay");
-        server_upgrade(&mut stream).expect("upgrade");
-        loop {
-            if stream.write_all(&chunk).is_err() {
-                return;
-            }
-        }
-    })
-}
-
-pub fn spawn_echo_server(
-    listener: TcpListener,
-    messages: usize,
-    server_cpu: Option<usize>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let _pin = server_cpu.map(|cpu| PinGuard::pin("server", cpu));
-        let (mut stream, _) = listener.accept().expect("accept");
-        stream.set_nodelay(true).expect("nodelay");
-        server_upgrade(&mut stream).expect("upgrade");
-        for _ in 0..messages {
-            let Some((opcode, payload)) = read_client_frame(&mut stream).expect("read frame")
-            else {
-                return;
-            };
-            let mut header = [0_u8; MAX_HEADER_LEN];
-            let n = encode_header(&mut header, true, opcode, None, payload.len() as u64);
-            stream.write_all(&header[..n]).expect("write header");
-            stream.write_all(&payload).expect("write payload");
-        }
-    })
-}
-
-fn read_client_frame(stream: &mut TcpStream) -> io::Result<Option<(OpCode, Vec<u8>)>> {
-    let mut header = [0_u8; MAX_HEADER_LEN];
-    let mut filled = 0_usize;
-    let (frame, header_len) = loop {
-        if filled == header.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "websocket header too long",
-            ));
-        }
-        let n = stream.read(&mut header[filled..=filled])?;
-        if n == 0 {
-            return Ok(None);
-        }
-        filled += n;
-        if let Some(parsed) = parse_header(&header[..filled]).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("bad frame header: {e}"))
-        })? {
-            break parsed;
-        }
-    };
-    let mut payload = vec![0_u8; usize::try_from(frame.payload_len).expect("payload fits usize")];
-    stream.read_exact(&mut payload)?;
-    if let Some(mask) = frame.mask {
-        mask_inplace(&mut payload, mask);
-    }
-    if frame.opcode == OpCode::Close {
-        return Ok(None);
-    }
-    let _ = header_len;
-    Ok(Some((frame.opcode, payload)))
-}
-
-pub fn sampled_hist() -> hdrhistogram::Histogram<u64> {
-    hdrhistogram::Histogram::new_with_bounds(1, 60_000_000_000, 3).expect("histogram")
-}
-
-pub fn maybe_record_arrival(
-    hist: &mut hdrhistogram::Histogram<u64>,
-    last: &mut Option<Instant>,
-    sample_every: u64,
-    frame: u64,
+pub fn print_result(
+    bench: &str,
+    mode: &str,
+    stats: &MessageStats,
+    elapsed: Duration,
+    cpu: Duration,
 ) {
-    if sample_every == 0 || !frame.is_multiple_of(sample_every) {
-        return;
-    }
-    let now = Instant::now();
-    if let Some(prev) = last.replace(now) {
-        hist.record(duration_ns_u64(now.duration_since(prev))).ok();
-    }
+    println!(
+        "bench_result bench={bench} mode={mode} messages={} text={} binary={} bytes={} elapsed_ms={:.3} cpu_ms={:.3} cpu_pct={:.1} msg_s={:.0} mib_s={:.3} cpu_ns_msg={} checksum={}",
+        fmt_int(stats.messages),
+        fmt_int(stats.text_messages),
+        fmt_int(stats.binary_messages),
+        fmt_int(stats.bytes),
+        elapsed_ms(elapsed),
+        elapsed_ms(cpu),
+        cpu_pct(cpu, elapsed),
+        messages_per_sec(stats.messages, elapsed),
+        mib_per_sec(stats.bytes, elapsed),
+        ns_per_message(cpu, stats.messages),
+        black_box(stats.checksum())
+    );
 }
 
-pub fn print_hist(label: &str, hist: &hdrhistogram::Histogram<u64>) {
-    if hist.is_empty() {
-        println!("{label}: no samples");
-        return;
-    }
+pub fn print_marked_summary(stats: &MessageStats) {
     println!(
-        "{label:<14} p50={}ns p99={}ns p999={}ns max={}ns samples={}",
-        fmt_int(hist.value_at_quantile(0.50)),
-        fmt_int(hist.value_at_quantile(0.99)),
-        fmt_int(hist.value_at_quantile(0.999)),
-        fmt_int(hist.max()),
-        fmt_int(hist.len())
+        "bench_marked messages={} sampled={} chunk_first={} chunk_queued={} max_chunk_message_index={} recv_sequence={}..{}",
+        fmt_int(stats.messages),
+        fmt_int(stats.sampled_messages),
+        fmt_int(stats.chunk_first_messages),
+        fmt_int(stats.chunk_queued_messages),
+        stats.max_chunk_message_index,
+        stats
+            .first_recv_sequence
+            .map_or_else(|| "-".to_owned(), |v| v.to_string()),
+        stats
+            .last_recv_sequence
+            .map_or_else(|| "-".to_owned(), |v| v.to_string())
+    );
+}
+
+pub fn print_ingress_stats(handle: talaris::ConnHandle, stats: Option<IngressStats>) {
+    let Some(stats) = stats else {
+        println!("bench_ingress conn_id={} unavailable", handle.as_u32());
+        return;
+    };
+    println!(
+        "bench_ingress conn_id={} recv_cqes={} recv_bytes={} plaintext_chunks={} plaintext_bytes={} ws_data_drains={} ws_data_drain_skips={} ws_data_events={} text={} binary={} rearm={} ring_exhaustions={}",
+        handle.as_u32(),
+        fmt_int(stats.recv_data_cqes),
+        fmt_int(stats.recv_bytes),
+        fmt_int(stats.plaintext_chunks),
+        fmt_int(stats.plaintext_bytes),
+        fmt_int(stats.ws_data_drains),
+        fmt_int(stats.ws_data_drain_skips),
+        fmt_int(stats.ws_data_events),
+        fmt_int(stats.ws_text_events),
+        fmt_int(stats.ws_binary_events),
+        fmt_int(stats.recv_multishot_rearms),
+        fmt_int(stats.recv_ring_exhaustions)
     );
 }
