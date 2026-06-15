@@ -553,6 +553,36 @@ impl MessageStats {
     pub const fn checksum(&self) -> u64 {
         self.checksum
     }
+
+    pub fn merge_from(&mut self, other: &Self) {
+        self.messages = self.messages.saturating_add(other.messages);
+        self.text_messages = self.text_messages.saturating_add(other.text_messages);
+        self.binary_messages = self.binary_messages.saturating_add(other.binary_messages);
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        self.sampled_messages = self.sampled_messages.saturating_add(other.sampled_messages);
+        self.chunk_first_messages = self
+            .chunk_first_messages
+            .saturating_add(other.chunk_first_messages);
+        self.chunk_queued_messages = self
+            .chunk_queued_messages
+            .saturating_add(other.chunk_queued_messages);
+        self.max_chunk_message_index = self
+            .max_chunk_message_index
+            .max(other.max_chunk_message_index);
+        self.first_recv_sequence = match (self.first_recv_sequence, other.first_recv_sequence) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        self.last_recv_sequence = match (self.last_recv_sequence, other.last_recv_sequence) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        self.checksum ^= other.checksum.rotate_left(17);
+    }
 }
 
 fn mix_checksum(mut checksum: u64, payload: &[u8]) -> u64 {

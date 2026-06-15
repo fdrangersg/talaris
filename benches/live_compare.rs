@@ -22,14 +22,12 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-#[cfg(target_os = "linux")]
 use std::sync::{Arc, Barrier, OnceLock};
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 use talaris::connection::IngressStats;
 use talaris::observability::DataEventMeta;
-#[cfg(target_os = "linux")]
 use tungstenite::client::{IntoClientRequest, client};
 
 type BenchResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -79,6 +77,7 @@ struct Config {
     port: u16,
     symbols: Vec<String>,
     stream_counts: Vec<usize>,
+    redundancy_counts: Vec<usize>,
     seconds: u64,
     sample_bps: u16,
     buf_size: u32,
@@ -127,12 +126,20 @@ impl Config {
             }
         }
 
+        let redundancy_counts = common::arg_list("--redundancy-counts", "1")?;
+        for count in &redundancy_counts {
+            if *count == 0 {
+                return Err("--redundancy-counts values must be positive".to_owned());
+            }
+        }
+
         Ok(Self {
             transport: common::arg_or("--transport", Transport::Both),
             host: common::arg_string("--host", "fstream.binance.com"),
             port: common::arg_or("--port", 443_u16),
             symbols,
             stream_counts,
+            redundancy_counts,
             seconds: common::arg_or("--seconds", 45_u64).max(1),
             sample_bps,
             buf_size: common::arg_or("--buf-size", 1024_u32),
@@ -148,12 +155,13 @@ impl Config {
 
     fn print(&self) {
         println!(
-            "bench_config bench=live_compare transport={} endpoint={}:{} symbols={} stream_counts={:?} seconds={} sample_bps={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} talaris_cpu={} tungstenite_cpu={}",
+            "bench_config bench=live_compare transport={} endpoint={}:{} symbols={} stream_counts={:?} redundancy_counts={:?} seconds={} sample_bps={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} talaris_cpu={} tungstenite_cpu={}",
             self.transport.as_str(),
             self.host,
             self.port,
             self.symbols.join(","),
             self.stream_counts,
+            self.redundancy_counts,
             self.seconds,
             self.sample_bps,
             self.buf_entries,
@@ -181,10 +189,14 @@ fn run() -> BenchResult<()> {
     cfg.print();
 
     for &stream_count in &cfg.stream_counts {
-        let path = build_combined_path(&cfg.symbols, stream_count);
-        println!("bench_live_compare_start streams={stream_count} path={path}");
-        let result = run_stream_count(Arc::clone(&cfg), stream_count, path)?;
-        result.print();
+        for &redundancy_count in &cfg.redundancy_counts {
+            let path = build_combined_path(&cfg.symbols, stream_count);
+            println!(
+                "bench_live_compare_start streams={stream_count} redundancy={redundancy_count} path={path}"
+            );
+            let result = run_stream_count(Arc::clone(&cfg), stream_count, redundancy_count, path)?;
+            result.print();
+        }
     }
 
     Ok(())
@@ -194,6 +206,7 @@ fn run() -> BenchResult<()> {
 fn run_stream_count(
     cfg: Arc<Config>,
     stream_count: usize,
+    redundancy_count: usize,
     path: String,
 ) -> BenchResult<LiveCompareResult> {
     let ready = Arc::new(Barrier::new(match cfg.transport {
@@ -207,7 +220,9 @@ fn run_stream_count(
         let ready = Arc::clone(&ready);
         let start = Arc::clone(&start);
         let path = path.clone();
-        std::thread::spawn(move || run_talaris(cfg, stream_count, &path, ready, start))
+        std::thread::spawn(move || {
+            run_talaris(cfg, stream_count, redundancy_count, &path, ready, start)
+        })
     });
 
     let tungstenite_thread = matches!(cfg.transport, Transport::Tungstenite | Transport::Both)
@@ -216,7 +231,9 @@ fn run_stream_count(
             let ready = Arc::clone(&ready);
             let start = Arc::clone(&start);
             let path = path.clone();
-            std::thread::spawn(move || run_tungstenite(cfg, stream_count, &path, ready, start))
+            std::thread::spawn(move || {
+                run_tungstenite(cfg, stream_count, redundancy_count, &path, ready, start)
+            })
         });
 
     ready.wait();
@@ -235,6 +252,7 @@ fn run_stream_count(
 
     Ok(LiveCompareResult {
         stream_count,
+        redundancy_count,
         path,
         talaris,
         tungstenite,
@@ -245,6 +263,7 @@ fn run_stream_count(
 fn run_talaris(
     cfg: Arc<Config>,
     stream_count: usize,
+    redundancy_count: usize,
     path: &str,
     ready: Arc<Barrier>,
     start: Arc<OnceLock<Instant>>,
@@ -253,22 +272,19 @@ fn run_talaris(
         .talaris_cpu
         .map(|cpu| common::PinGuard::pin("talaris", cpu));
 
-    let conn_cfg = talaris::connection::ConnectionConfig::new(&cfg.host, cfg.port, path)
-        .with_sq_entries(cfg.sq_entries)
-        .with_cq_entries(cfg.cq_entries)
-        .with_buf_ring(cfg.buf_size, cfg.buf_entries)
-        .with_ws_limits(8 * 1024 * 1024, 16 * 1024 * 1024)
-        .with_ws_buffer_capacities(128 * 1024, 128 * 1024, 16 * 1024)
-        .with_ingress_stats(true)
-        .with_observability_sample_rate_bps(cfg.sample_bps)
-        .with_observability_histograms(false);
+    let conn_cfg = talaris_conn_config(&cfg, path);
     let proactor_cfg = conn_cfg.proactor;
     let mut pool = talaris::Pool::new(
         talaris::PoolConfig::new(proactor_cfg).with_completion_batch_capacity(cfg.completion_batch),
     )?;
-    let handle = pool.connect_blocking(conn_cfg)?;
-    assert_eq!(pool.state(handle), Some(talaris::connection::State::Open));
-    let ingress_before = pool.ingress_stats(handle);
+    let mut handles = Vec::with_capacity(redundancy_count);
+    let mut ingress_before = Vec::with_capacity(redundancy_count);
+    for _ in 0..redundancy_count {
+        let handle = pool.connect_blocking(talaris_conn_config(&cfg, path))?;
+        assert_eq!(pool.state(handle), Some(talaris::connection::State::Open));
+        ingress_before.push(pool.ingress_stats(handle).unwrap_or_default());
+        handles.push(handle);
+    }
 
     ready.wait();
     ready.wait();
@@ -286,19 +302,71 @@ fn run_talaris(
 
     let elapsed = started.elapsed();
     let cpu_elapsed = cpu.elapsed();
-    let ingress = match (ingress_before, pool.ingress_stats(handle)) {
-        (Some(before), Some(after)) => Some(common::ingress_stats_delta(before, after)),
-        _ => None,
-    };
+    let ingress = aggregate_ingress_delta(&pool, &handles, &ingress_before);
 
     Ok(TalarisRun {
         stream_count,
+        redundancy_count,
         stats,
         latency,
         ingress,
         elapsed,
         cpu: cpu_elapsed,
     })
+}
+
+fn talaris_conn_config(cfg: &Config, path: &str) -> talaris::connection::ConnectionConfig {
+    talaris::connection::ConnectionConfig::new(&cfg.host, cfg.port, path)
+        .with_sq_entries(cfg.sq_entries)
+        .with_cq_entries(cfg.cq_entries)
+        .with_buf_ring(cfg.buf_size, cfg.buf_entries)
+        .with_ws_limits(8 * 1024 * 1024, 16 * 1024 * 1024)
+        .with_ws_buffer_capacities(128 * 1024, 128 * 1024, 16 * 1024)
+        .with_ingress_stats(true)
+        .with_observability_sample_rate_bps(cfg.sample_bps)
+        .with_observability_histograms(false)
+}
+
+fn aggregate_ingress_delta(
+    pool: &talaris::Pool,
+    handles: &[talaris::ConnHandle],
+    before: &[IngressStats],
+) -> Option<IngressStats> {
+    let mut out = IngressStats::default();
+    for (handle, before) in handles.iter().copied().zip(before.iter().copied()) {
+        let after = pool.ingress_stats(handle)?;
+        let delta = common::ingress_stats_delta(before, after);
+        out.recv_data_cqes = out.recv_data_cqes.saturating_add(delta.recv_data_cqes);
+        out.recv_bytes = out.recv_bytes.saturating_add(delta.recv_bytes);
+        out.recv_multishot_rearms = out
+            .recv_multishot_rearms
+            .saturating_add(delta.recv_multishot_rearms);
+        out.recv_ring_exhaustions = out
+            .recv_ring_exhaustions
+            .saturating_add(delta.recv_ring_exhaustions);
+        out.plain_recv_batches = out
+            .plain_recv_batches
+            .saturating_add(delta.plain_recv_batches);
+        out.plain_recv_batch_cqes = out
+            .plain_recv_batch_cqes
+            .saturating_add(delta.plain_recv_batch_cqes);
+        out.plain_recv_copied_batches = out
+            .plain_recv_copied_batches
+            .saturating_add(delta.plain_recv_copied_batches);
+        out.plain_recv_copied_bytes = out
+            .plain_recv_copied_bytes
+            .saturating_add(delta.plain_recv_copied_bytes);
+        out.plaintext_chunks = out.plaintext_chunks.saturating_add(delta.plaintext_chunks);
+        out.plaintext_bytes = out.plaintext_bytes.saturating_add(delta.plaintext_bytes);
+        out.ws_data_drains = out.ws_data_drains.saturating_add(delta.ws_data_drains);
+        out.ws_data_drain_skips = out
+            .ws_data_drain_skips
+            .saturating_add(delta.ws_data_drain_skips);
+        out.ws_data_events = out.ws_data_events.saturating_add(delta.ws_data_events);
+        out.ws_text_events = out.ws_text_events.saturating_add(delta.ws_text_events);
+        out.ws_binary_events = out.ws_binary_events.saturating_add(delta.ws_binary_events);
+    }
+    Some(out)
 }
 
 #[cfg(target_os = "linux")]
@@ -341,14 +409,68 @@ fn record_talaris_marked_event(
 fn run_tungstenite(
     cfg: Arc<Config>,
     stream_count: usize,
+    redundancy_count: usize,
     path: &str,
     ready: Arc<Barrier>,
     start: Arc<OnceLock<Instant>>,
 ) -> BenchResult<TungsteniteRun> {
-    let _pin = cfg
-        .tungstenite_cpu
-        .map(|cpu| common::PinGuard::pin("tungstenite", cpu));
+    let mut sockets = Vec::with_capacity(redundancy_count);
+    for _ in 0..redundancy_count {
+        sockets.push(connect_tungstenite_socket(&cfg, path)?);
+    }
 
+    let worker_start = Arc::new(OnceLock::new());
+    let worker_ready = Arc::new(Barrier::new(redundancy_count + 1));
+    let mut workers = Vec::with_capacity(redundancy_count);
+    for socket in sockets {
+        let cfg = Arc::clone(&cfg);
+        let worker_start = Arc::clone(&worker_start);
+        let worker_ready = Arc::clone(&worker_ready);
+        workers.push(std::thread::spawn(move || {
+            run_tungstenite_worker(cfg, socket, worker_start, worker_ready)
+        }));
+    }
+
+    ready.wait();
+    ready.wait();
+    let started = *start
+        .get()
+        .expect("start set before second barrier returns");
+    worker_start
+        .set(started)
+        .map_err(|_| "worker start already set")?;
+    worker_ready.wait();
+
+    let mut stats = common::MessageStats::default();
+    let mut latency = TungsteniteLatencyStats::new()?;
+    let mut read_stats = StreamReadStats::default();
+    let mut cpu_elapsed = Duration::ZERO;
+    for worker in workers {
+        let run = worker
+            .join()
+            .map_err(|_| "tungstenite worker thread panicked")??;
+        stats.merge_from(&run.stats);
+        latency.merge_from(&run.latency);
+        read_stats.merge_from(run.read_stats);
+        cpu_elapsed = cpu_elapsed.saturating_add(run.cpu);
+    }
+    let elapsed = started.elapsed();
+
+    Ok(TungsteniteRun {
+        stream_count,
+        redundancy_count,
+        stats,
+        latency,
+        read_stats,
+        elapsed,
+        cpu: cpu_elapsed,
+    })
+}
+
+fn connect_tungstenite_socket(
+    cfg: &Config,
+    path: &str,
+) -> BenchResult<tungstenite::WebSocket<TlsCountingStream>> {
     let mut tcp = CountingTcpStream::connect((&cfg.host[..], cfg.port))?;
     tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -363,7 +485,7 @@ fn run_tungstenite(
     while tls_conn.is_handshaking() {
         match tls_conn.complete_io(&mut tcp) {
             Ok(_) => {}
-            Err(e) if is_timeout(&e) => continue,
+            Err(e) if is_timeout(&e) => {}
             Err(e) => return Err(Box::new(e)),
         }
     }
@@ -375,14 +497,25 @@ fn run_tungstenite(
     let request = format!("wss://{}:{}{}", cfg.host, cfg.port, path).into_client_request()?;
     let (mut socket, _) = client(request, stream)?;
     socket.get_mut().reset_read_stats();
+    Ok(socket)
+}
 
-    ready.wait();
+#[allow(clippy::needless_pass_by_value)]
+fn run_tungstenite_worker(
+    cfg: Arc<Config>,
+    mut socket: tungstenite::WebSocket<TlsCountingStream>,
+    start: Arc<OnceLock<Instant>>,
+    ready: Arc<Barrier>,
+) -> BenchResult<TungsteniteWorkerRun> {
+    let _pin = cfg
+        .tungstenite_cpu
+        .map(|cpu| common::PinGuard::pin("tungstenite", cpu));
+
     ready.wait();
     let started = *start
         .get()
-        .expect("start set before second barrier returns");
+        .expect("start set before worker barrier returns");
     let deadline = started + Duration::from_secs(cfg.seconds);
-
     let mut stats = common::MessageStats::default();
     let mut latency = TungsteniteLatencyStats::new()?;
     let cpu = common::ThreadCpuTimer::start();
@@ -404,8 +537,7 @@ fn run_tungstenite(
     let cpu_elapsed = cpu.elapsed();
     let read_stats = socket.get_ref().read_stats();
 
-    Ok(TungsteniteRun {
-        stream_count,
+    Ok(TungsteniteWorkerRun {
         stats,
         latency,
         read_stats,
@@ -437,6 +569,7 @@ fn record_tungstenite_message(
 #[derive(Debug)]
 struct LiveCompareResult {
     stream_count: usize,
+    redundancy_count: usize,
     path: String,
     talaris: Option<TalarisRun>,
     tungstenite: Option<TungsteniteRun>,
@@ -445,8 +578,8 @@ struct LiveCompareResult {
 impl LiveCompareResult {
     fn print(&self) {
         println!(
-            "bench_live_compare_done streams={} path={}",
-            self.stream_count, self.path
+            "bench_live_compare_done streams={} redundancy={} path={}",
+            self.stream_count, self.redundancy_count, self.path
         );
         if let Some(talaris) = &self.talaris {
             talaris.print();
@@ -460,6 +593,7 @@ impl LiveCompareResult {
 #[derive(Debug)]
 struct TalarisRun {
     stream_count: usize,
+    redundancy_count: usize,
     stats: common::MessageStats,
     latency: TalarisLatencyStats,
     ingress: Option<IngressStats>,
@@ -471,20 +605,32 @@ impl TalarisRun {
     fn print(&self) {
         print_result(
             self.stream_count,
+            self.redundancy_count,
             "talaris",
             &self.stats,
             self.elapsed,
             self.cpu,
         );
-        common::print_marked_summary(&self.stats);
-        self.latency.print(self.stream_count, "talaris");
-        print_ingress_stats(self.stream_count, self.ingress);
+        print_marked_summary(self.stream_count, self.redundancy_count, &self.stats);
+        self.latency
+            .print(self.stream_count, self.redundancy_count, "talaris");
+        print_ingress_stats(self.stream_count, self.redundancy_count, self.ingress);
     }
+}
+
+#[derive(Debug)]
+struct TungsteniteWorkerRun {
+    stats: common::MessageStats,
+    latency: TungsteniteLatencyStats,
+    read_stats: StreamReadStats,
+    elapsed: Duration,
+    cpu: Duration,
 }
 
 #[derive(Debug)]
 struct TungsteniteRun {
     stream_count: usize,
+    redundancy_count: usize,
     stats: common::MessageStats,
     latency: TungsteniteLatencyStats,
     read_stats: StreamReadStats,
@@ -496,14 +642,17 @@ impl TungsteniteRun {
     fn print(&self) {
         print_result(
             self.stream_count,
+            self.redundancy_count,
             "tungstenite",
             &self.stats,
             self.elapsed,
             self.cpu,
         );
-        self.latency.print(self.stream_count, "tungstenite");
+        self.latency
+            .print(self.stream_count, self.redundancy_count, "tungstenite");
         print_stream_stats(
             self.stream_count,
+            self.redundancy_count,
             "tungstenite",
             &self.stats,
             self.read_stats,
@@ -540,13 +689,23 @@ impl TalarisLatencyStats {
         }
     }
 
-    fn print(&self, streams: usize, mode: &str) {
-        self.recv_to_plaintext
-            .print(streams, mode, "recv_to_plaintext", "chunk_message");
-        self.plaintext_to_ws
-            .print(streams, mode, "plaintext_to_ws", "chunk_message");
+    fn print(&self, streams: usize, redundancy: usize, mode: &str) {
+        self.recv_to_plaintext.print(
+            streams,
+            redundancy,
+            mode,
+            "recv_to_plaintext",
+            "chunk_message",
+        );
+        self.plaintext_to_ws.print(
+            streams,
+            redundancy,
+            mode,
+            "plaintext_to_ws",
+            "chunk_message",
+        );
         self.recv_to_ws
-            .print(streams, mode, "recv_to_ws", "chunk_message");
+            .print(streams, redundancy, mode, "recv_to_ws", "chunk_message");
     }
 }
 
@@ -586,11 +745,21 @@ impl TungsteniteLatencyStats {
             .record(MessagePosition::from_index(index), nanos);
     }
 
-    fn print(&self, streams: usize, mode: &str) {
-        self.read_to_ws
-            .print(streams, mode, "socket_read_to_ws", "read_message");
+    fn merge_from(&mut self, other: &Self) {
+        self.read_to_ws.merge_from(&other.read_to_ws);
+        self.missing_markers = self.missing_markers.saturating_add(other.missing_markers);
+    }
+
+    fn print(&self, streams: usize, redundancy: usize, mode: &str) {
+        self.read_to_ws.print(
+            streams,
+            redundancy,
+            mode,
+            "socket_read_to_ws",
+            "read_message",
+        );
         println!(
-            "bench_latency_marker bench=live_compare mode={mode} streams={streams} missing_markers={}",
+            "bench_latency_marker bench=live_compare mode={mode} streams={streams} redundancy={redundancy} missing_markers={}",
             common::fmt_int(self.missing_markers)
         );
     }
@@ -620,12 +789,26 @@ impl StageLatencyStats {
         }
     }
 
-    fn print(&self, streams: usize, mode: &str, stage: &str, position_scope: &str) {
-        self.all.print(streams, mode, stage, position_scope, "all");
+    fn merge_from(&mut self, other: &Self) {
+        self.all.merge_from(&other.all);
+        self.first.merge_from(&other.first);
+        self.queued.merge_from(&other.queued);
+    }
+
+    fn print(
+        &self,
+        streams: usize,
+        redundancy: usize,
+        mode: &str,
+        stage: &str,
+        position_scope: &str,
+    ) {
+        self.all
+            .print(streams, redundancy, mode, stage, position_scope, "all");
         self.first
-            .print(streams, mode, stage, position_scope, "first");
+            .print(streams, redundancy, mode, stage, position_scope, "first");
         self.queued
-            .print(streams, mode, stage, position_scope, "queued");
+            .print(streams, redundancy, mode, stage, position_scope, "queued");
     }
 }
 
@@ -664,11 +847,26 @@ impl BenchHistogram {
         self.sum = self.sum.saturating_add(nanos);
     }
 
-    fn print(&self, streams: usize, mode: &str, stage: &str, position_scope: &str, position: &str) {
+    fn merge_from(&mut self, other: &Self) {
+        self.hist
+            .add(&other.hist)
+            .expect("compatible benchmark histograms");
+        self.sum = self.sum.saturating_add(other.sum);
+    }
+
+    fn print(
+        &self,
+        streams: usize,
+        redundancy: usize,
+        mode: &str,
+        stage: &str,
+        position_scope: &str,
+        position: &str,
+    ) {
         let samples = self.hist.len();
         let avg = self.sum.checked_div(samples).unwrap_or(0);
         println!(
-            "bench_latency bench=live_compare mode={mode} streams={streams} stage={stage} position_scope={position_scope} position={position} samples={} avg_ns={} p50_ns={} p90_ns={} p99_ns={} p999_ns={} max_ns={}",
+            "bench_latency bench=live_compare mode={mode} streams={streams} redundancy={redundancy} stage={stage} position_scope={position_scope} position={position} samples={} avg_ns={} p50_ns={} p90_ns={} p99_ns={} p999_ns={} max_ns={}",
             common::fmt_int(samples),
             avg,
             histogram_quantile(&self.hist, 0.50),
@@ -808,10 +1006,17 @@ impl Write for TlsCountingStream {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct StreamReadStats {
     calls: u64,
     bytes: u64,
+}
+
+impl StreamReadStats {
+    const fn merge_from(&mut self, other: Self) {
+        self.calls = self.calls.saturating_add(other.calls);
+        self.bytes = self.bytes.saturating_add(other.bytes);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -860,13 +1065,14 @@ fn duration_nanos(duration: Duration) -> u64 {
 
 fn print_result(
     streams: usize,
+    redundancy: usize,
     mode: &str,
     stats: &common::MessageStats,
     elapsed: Duration,
     cpu: Duration,
 ) {
     println!(
-        "bench_result bench=live_compare mode={mode} streams={streams} messages={} text={} binary={} bytes={} elapsed_ms={:.3} cpu_ms={:.3} cpu_pct={:.1} msg_s={:.3} mib_s={:.3} cpu_ns_msg={} checksum={}",
+        "bench_result bench=live_compare mode={mode} streams={streams} redundancy={redundancy} messages={} text={} binary={} bytes={} elapsed_ms={:.3} cpu_ms={:.3} cpu_pct={:.1} msg_s={:.3} mib_s={:.3} cpu_ns_msg={} checksum={}",
         common::fmt_int(stats.messages),
         common::fmt_int(stats.text_messages),
         common::fmt_int(stats.binary_messages),
@@ -881,9 +1087,28 @@ fn print_result(
     );
 }
 
-fn print_ingress_stats(streams: usize, stats: Option<IngressStats>) {
+fn print_marked_summary(streams: usize, redundancy: usize, stats: &common::MessageStats) {
+    println!(
+        "bench_marked bench=live_compare mode=talaris streams={streams} redundancy={redundancy} messages={} sampled={} chunk_first={} chunk_queued={} max_chunk_message_index={} recv_sequence={}..{}",
+        common::fmt_int(stats.messages),
+        common::fmt_int(stats.sampled_messages),
+        common::fmt_int(stats.chunk_first_messages),
+        common::fmt_int(stats.chunk_queued_messages),
+        stats.max_chunk_message_index,
+        stats
+            .first_recv_sequence
+            .map_or_else(|| "-".to_owned(), |v| v.to_string()),
+        stats
+            .last_recv_sequence
+            .map_or_else(|| "-".to_owned(), |v| v.to_string())
+    );
+}
+
+fn print_ingress_stats(streams: usize, redundancy: usize, stats: Option<IngressStats>) {
     let Some(stats) = stats else {
-        println!("bench_ingress bench=live_compare streams={streams} mode=talaris unavailable");
+        println!(
+            "bench_ingress bench=live_compare streams={streams} redundancy={redundancy} mode=talaris unavailable"
+        );
         return;
     };
     let messages_per_recv_cqe = if stats.recv_data_cqes == 0 {
@@ -897,7 +1122,7 @@ fn print_ingress_stats(streams: usize, stats: Option<IngressStats>) {
         stats.ws_data_events as f64 / stats.plaintext_chunks as f64
     };
     println!(
-        "bench_ingress bench=live_compare mode=talaris streams={streams} recv_cqes={} recv_bytes={} plaintext_chunks={} plaintext_bytes={} ws_data_events={} text={} binary={} rearm={} ring_exhaustions={} messages_per_recv_cqe={:.3} messages_per_plaintext_chunk={:.3}",
+        "bench_ingress bench=live_compare mode=talaris streams={streams} redundancy={redundancy} recv_cqes={} recv_bytes={} plaintext_chunks={} plaintext_bytes={} ws_data_events={} text={} binary={} rearm={} ring_exhaustions={} messages_per_recv_cqe={:.3} messages_per_plaintext_chunk={:.3}",
         common::fmt_int(stats.recv_data_cqes),
         common::fmt_int(stats.recv_bytes),
         common::fmt_int(stats.plaintext_chunks),
@@ -914,6 +1139,7 @@ fn print_ingress_stats(streams: usize, stats: Option<IngressStats>) {
 
 fn print_stream_stats(
     streams: usize,
+    redundancy: usize,
     mode: &str,
     messages: &common::MessageStats,
     reads: StreamReadStats,
@@ -929,7 +1155,7 @@ fn print_stream_stats(
         reads.bytes as f64 / reads.calls as f64
     };
     println!(
-        "bench_stream bench=live_compare mode={mode} streams={streams} read_calls={} read_bytes={} messages_per_read={:.3} bytes_per_read={:.1}",
+        "bench_stream bench=live_compare mode={mode} streams={streams} redundancy={redundancy} read_calls={} read_bytes={} messages_per_read={:.3} bytes_per_read={:.1}",
         common::fmt_int(reads.calls),
         common::fmt_int(reads.bytes),
         messages_per_read,
@@ -949,6 +1175,7 @@ fn print_usage() {
            --port PORT                  websocket TLS port\n\
            --symbols a,b,c,d            symbols used to build combined streams\n\
            --stream-counts A,B,C        number of symbols per scenario\n\
+           --redundancy-counts A,B,C    identical connections per client and scenario\n\
            --seconds N                  run duration per scenario\n\
            --sample-bps N               talaris observability sample rate, 0..10000\n\
            --buf-size N                 talaris io_uring provided buffer slot size\n\
