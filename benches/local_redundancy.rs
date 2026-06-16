@@ -32,18 +32,77 @@ fn main() {
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 #[cfg(target_os = "linux")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use talaris::connection::IngressStats;
+use talaris::observability::DataEventMeta;
 use talaris::ws::frame::{MAX_HEADER_LEN, OpCode, encode_header};
 
 const SEQ_WIDTH: usize = 20;
 const SEQ_MARKER: &[u8] = b"\"u\":\"";
 const BBO_SEQ_TEMPLATE: &[u8] = b"{\"e\":\"bookTicker\",\"u\":\"00000000000000000000\",\"s\":\"BNBUSDT\",\"ps\":\"BNBUSDT\",\"E\":1568014460893,\"T\":1568014460891,\"b\":\"25.35190000\",\"B\":\"31.21000000\",\"a\":\"25.36520000\",\"A\":\"40.66000000\",\"st\":1}";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mode {
+    Unmarked,
+    MarkedNoHist0,
+    MarkedNoHist100,
+    Hist1Pct,
+    Hist10Pct,
+    Hist100Pct,
+}
+
+impl Mode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unmarked => "unmarked",
+            Self::MarkedNoHist0 => "marked_0_nohist",
+            Self::MarkedNoHist100 => "marked_100_nohist",
+            Self::Hist1Pct => "hist_1pct",
+            Self::Hist10Pct => "hist_10pct",
+            Self::Hist100Pct => "hist_100pct",
+        }
+    }
+
+    const fn marked(self) -> bool {
+        !matches!(self, Self::Unmarked)
+    }
+
+    const fn histograms(self) -> bool {
+        matches!(self, Self::Hist1Pct | Self::Hist10Pct | Self::Hist100Pct)
+    }
+
+    const fn sample_bps(self) -> u16 {
+        match self {
+            Self::Unmarked | Self::MarkedNoHist0 => 0,
+            Self::Hist1Pct => 100,
+            Self::Hist10Pct => 1_000,
+            Self::MarkedNoHist100 | Self::Hist100Pct => common::FULL_SAMPLE_BPS,
+        }
+    }
+}
+
+impl std::str::FromStr for Mode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "unmarked" | "baseline" => Ok(Self::Unmarked),
+            "marked_0_nohist" => Ok(Self::MarkedNoHist0),
+            "marked_100_nohist" => Ok(Self::MarkedNoHist100),
+            "hist_1pct" => Ok(Self::Hist1Pct),
+            "hist_10pct" => Ok(Self::Hist10Pct),
+            "hist_100pct" => Ok(Self::Hist100Pct),
+            other => Err(format!("unknown --mode {other:?}")),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Config {
+    mode: Mode,
     connections: Vec<usize>,
     seconds: u64,
     messages: u64,
@@ -57,12 +116,15 @@ struct Config {
     spin_iters: usize,
     post_progress_spin_iters: usize,
     copy_batch_bytes: usize,
+    metrics_interval: Duration,
+    prom_out: Option<String>,
     user_cpu: Option<usize>,
     server_cpus: Vec<usize>,
 }
 
 impl Config {
     fn from_args() -> Result<Self, String> {
+        let mode = common::arg_or("--mode", Mode::Hist100Pct);
         let connections =
             nonzero_list("--connections", common::arg_list("--connections", "1,2,4")?)?;
         let seconds = common::arg_or("--seconds", 8_u64);
@@ -81,6 +143,7 @@ impl Config {
         common::validate_power_of_two_u32("--cq-entries", cq_entries)?;
 
         Ok(Self {
+            mode,
             connections,
             seconds,
             messages,
@@ -94,6 +157,11 @@ impl Config {
             spin_iters: common::arg_or("--spin-iters", 256_usize),
             post_progress_spin_iters: common::arg_or("--post-progress-spin-iters", 0_usize),
             copy_batch_bytes: common::arg_or("--copy-batch-bytes", 0_usize),
+            metrics_interval: Duration::from_millis(common::arg_or(
+                "--metrics-interval-ms",
+                1000_u64,
+            )),
+            prom_out: common::optional_string("--prom-out"),
             user_cpu: common::optional_arg("--user-cpu"),
             server_cpus: optional_cpu_list("--server-cpus")?,
         })
@@ -101,7 +169,8 @@ impl Config {
 
     fn print(&self) {
         println!(
-            "bench_config bench=local_redundancy connections={:?} seconds={} messages={} warmup_events={} payload_profile=binance-bbo-seq actual_payload={} frames_per_write={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} post_progress_spin_iters={} copy_batch_bytes={} server_cpus={:?}",
+            "bench_config bench=local_redundancy mode={} connections={:?} seconds={} messages={} warmup_events={} payload_profile=binance-bbo-seq actual_payload={} frames_per_write={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} post_progress_spin_iters={} copy_batch_bytes={} sample_bps={} histograms={} metrics_interval_ms={} prom_out={} server_cpus={:?}",
+            self.mode.as_str(),
             self.connections,
             self.seconds,
             self.messages,
@@ -116,6 +185,10 @@ impl Config {
             self.spin_iters,
             self.post_progress_spin_iters,
             self.copy_batch_bytes,
+            self.mode.sample_bps(),
+            self.mode.histograms(),
+            self.metrics_interval.as_millis(),
+            self.prom_out.as_deref().unwrap_or("-"),
             self.server_cpus
         );
     }
@@ -138,14 +211,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = Config::from_args()?;
     cfg.print();
+    let mut prom = common::PromWriter::from_arg(cfg.prom_out.clone())?;
     for &connections in &cfg.connections {
-        run_case(&cfg, connections)?;
+        run_case(&cfg, connections, &mut prom)?;
     }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn run_case(cfg: &Config, connections: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn run_case(
+    cfg: &Config,
+    connections: usize,
+    prom: &mut Option<common::PromWriter>,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("bench_redundancy_start connections={connections}");
     let mut servers = Vec::with_capacity(connections);
     for index in 0..connections {
@@ -163,6 +241,7 @@ fn run_case(cfg: &Config, connections: usize) -> Result<(), Box<dyn std::error::
     let proactor_cfg = conn_config(cfg, first_addr).proactor;
     let mut pool = talaris::Pool::new(
         talaris::PoolConfig::new(proactor_cfg)
+            .with_initial_conn_capacity(connections)
             .with_completion_batch_capacity(cfg.completion_batch)
             .with_post_progress_spin_iters(cfg.post_progress_spin_iters),
     )?;
@@ -181,6 +260,7 @@ fn run_case(cfg: &Config, connections: usize) -> Result<(), Box<dyn std::error::
     let mut warmup = RedundancyStats::new(connections);
     while warmup.input_events < cfg.warmup_events {
         pump_redundancy(
+            cfg.mode,
             &mut pool,
             cfg.spin_iters,
             &handle_index,
@@ -193,19 +273,27 @@ fn run_case(cfg: &Config, connections: usize) -> Result<(), Box<dyn std::error::
     let mut stats = RedundancyStats::new(connections);
     let cpu = common::ThreadCpuTimer::start();
     let started = Instant::now();
+    let bench_label = format!("local_redundancy_r{connections}");
+    let mut metrics_schedule = common::MetricsSchedule::new(started, cfg.metrics_interval);
     while should_continue(cfg, &stats, started.elapsed()) {
         pump_redundancy(
+            cfg.mode,
             &mut pool,
             cfg.spin_iters,
             &handle_index,
             &mut dedup,
             &mut stats,
         )?;
+        metrics_schedule.write_due(prom, &bench_label, &mut pool, started)?;
     }
     let elapsed = started.elapsed();
     let cpu_elapsed = cpu.elapsed();
+    common::MetricsSchedule::write_final(prom, &bench_label, &mut pool, elapsed)?;
 
     print_redundancy_result(connections, &stats, elapsed, cpu_elapsed);
+    if cfg.mode.marked() {
+        print_redundancy_marked(connections, &stats);
+    }
     print_redundancy_ingress(
         connections,
         aggregate_ingress_delta(&pool, &handles, &ingress_before),
@@ -228,8 +316,8 @@ fn conn_config(cfg: &Config, addr: SocketAddr) -> talaris::connection::Connectio
         .with_ws_limits(BBO_SEQ_TEMPLATE.len(), BBO_SEQ_TEMPLATE.len() as u64)
         .with_plain_recv_batch_copy_max_bytes(cfg.copy_batch_bytes)
         .with_ingress_stats(true)
-        .with_observability_sample_rate_bps(0)
-        .with_observability_histograms(false)
+        .with_observability_sample_rate_bps(cfg.mode.sample_bps())
+        .with_observability_histograms(cfg.mode.histograms())
 }
 
 fn nonzero_list<T>(flag: &str, values: Vec<T>) -> Result<Vec<T>, String>
@@ -270,12 +358,28 @@ fn should_continue(cfg: &Config, stats: &RedundancyStats, elapsed: Duration) -> 
 
 #[cfg(target_os = "linux")]
 fn pump_redundancy(
+    mode: Mode,
     pool: &mut talaris::Pool,
     spin_iters: usize,
     handle_index: &[usize],
     dedup: &mut DedupState,
     stats: &mut RedundancyStats,
 ) -> Result<(), talaris::connection::ConnectionError> {
+    if mode.marked() {
+        return if spin_iters == 0 {
+            pool.pump_data_marked(|handle, ev| {
+                let conn_index = conn_index(handle_index, handle);
+                record_marked_event(conn_index, &ev, dedup, stats);
+            })
+        } else {
+            pool.pump_data_spin_marked(spin_iters, |handle, ev| {
+                let conn_index = conn_index(handle_index, handle);
+                record_marked_event(conn_index, &ev, dedup, stats);
+            })
+            .map(|_| ())
+        };
+    }
+
     if spin_iters == 0 {
         pool.pump_data(|handle, ev| {
             let conn_index = conn_index(handle_index, handle);
@@ -327,6 +431,24 @@ fn record_event(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn record_marked_event(
+    conn_index: usize,
+    ev: &talaris::ws::MarkedDataEvent<'_>,
+    dedup: &mut DedupState,
+    stats: &mut RedundancyStats,
+) {
+    stats.record_meta(ev.meta());
+    match ev {
+        talaris::ws::MarkedDataEvent::Text { payload, .. } => {
+            stats.record_text(conn_index, payload, dedup);
+        }
+        talaris::ws::MarkedDataEvent::Binary { payload, .. } => {
+            stats.record_binary(conn_index, payload);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct DedupState {
     high_water: Option<u64>,
@@ -346,6 +468,12 @@ struct RedundancyStats {
     last_unique_seq: Option<u64>,
     per_conn_events: Vec<u64>,
     per_conn_unique: Vec<u64>,
+    sampled_events: u64,
+    chunk_first_events: u64,
+    chunk_queued_events: u64,
+    max_chunk_message_index: u16,
+    first_recv_sequence: Option<u64>,
+    last_recv_sequence: Option<u64>,
     checksum: u64,
 }
 
@@ -364,6 +492,12 @@ impl RedundancyStats {
             last_unique_seq: None,
             per_conn_events: vec![0; connections],
             per_conn_unique: vec![0; connections],
+            sampled_events: 0,
+            chunk_first_events: 0,
+            chunk_queued_events: 0,
+            max_chunk_message_index: 0,
+            first_recv_sequence: None,
+            last_recv_sequence: None,
             checksum: 0,
         }
     }
@@ -397,6 +531,20 @@ impl RedundancyStats {
         self.binary_events = self.binary_events.saturating_add(1);
         self.record_payload(conn_index, payload);
         self.parse_failures = self.parse_failures.saturating_add(1);
+    }
+
+    fn record_meta(&mut self, meta: DataEventMeta) {
+        if meta.sampled {
+            self.sampled_events = self.sampled_events.saturating_add(1);
+        }
+        if meta.chunk_message_index == 0 {
+            self.chunk_first_events = self.chunk_first_events.saturating_add(1);
+        } else {
+            self.chunk_queued_events = self.chunk_queued_events.saturating_add(1);
+        }
+        self.max_chunk_message_index = self.max_chunk_message_index.max(meta.chunk_message_index);
+        self.first_recv_sequence.get_or_insert(meta.recv_sequence);
+        self.last_recv_sequence = Some(meta.recv_sequence);
     }
 
     fn record_payload(&mut self, conn_index: usize, payload: &[u8]) {
@@ -485,6 +633,25 @@ fn print_redundancy_result(
         common::fmt_int(stats.seq_gaps),
         stats.per_conn_events,
         stats.per_conn_unique
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn print_redundancy_marked(connections: usize, stats: &RedundancyStats) {
+    println!(
+        "bench_redundancy_marked connections={} input_events={} sampled={} chunk_first={} chunk_queued={} max_chunk_message_index={} recv_sequence={}..{}",
+        connections,
+        common::fmt_int(stats.input_events),
+        common::fmt_int(stats.sampled_events),
+        common::fmt_int(stats.chunk_first_events),
+        common::fmt_int(stats.chunk_queued_events),
+        stats.max_chunk_message_index,
+        stats
+            .first_recv_sequence
+            .map_or_else(|| "-".to_owned(), |seq| seq.to_string()),
+        stats
+            .last_recv_sequence
+            .map_or_else(|| "-".to_owned(), |seq| seq.to_string())
     );
 }
 
@@ -693,6 +860,7 @@ fn print_usage() {
          only messages whose u sequence advances the global high-water mark.\n\
          \n\
          Args:\n\
+           --mode unmarked|marked_0_nohist|marked_100_nohist|hist_1pct|hist_10pct|hist_100pct\n\
            --connections A,B,C        redundant connection counts to run\n\
            --seconds N                wall-clock run limit, 0 disables time limit\n\
            --messages N               unique-message limit, 0 disables message limit\n\
@@ -706,6 +874,8 @@ fn print_usage() {
            --spin-iters N             talaris spin count; 0 uses blocking pump_data\n\
            --post-progress-spin-iters N  extra spin/drain budget after first progress\n\
            --copy-batch-bytes N       max bytes copied across a plain recv CQE batch; 0 disables\n\
+           --metrics-interval-ms N     write interval Prometheus snapshots every N ms; 0 disables interval snapshots\n\
+           --prom-out PATH|-           write talaris Prometheus latency/ingress snapshots\n\
            --user-cpu N               pin benchmark thread\n\
            --server-cpus A,B,C        pin server threads round-robin"
     );

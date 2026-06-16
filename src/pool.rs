@@ -567,19 +567,15 @@ impl Pool {
             );
             if cqes > 0 {
                 progressed = true;
-                for _ in 0..post_progress_spin_iters {
-                    std::hint::spin_loop();
+                drain_post_progress(post_progress_spin_iters, &mut first_err, |first_err| {
                     let _ = drain_conn_completions_data(
                         conns,
                         proactor,
                         completions_buf,
                         &mut sink,
-                        &mut first_err,
+                        first_err,
                     );
-                    if first_err.is_some() {
-                        break;
-                    }
-                }
+                });
             }
 
             if progressed || first_err.is_some() {
@@ -605,6 +601,7 @@ impl Pool {
     where
         F: for<'a> FnMut(ConnHandle, WsMarkedDataEvent<'a>),
     {
+        let post_progress_spin_iters = self.post_progress_spin_iters;
         let Self {
             proactor,
             conns,
@@ -627,7 +624,18 @@ impl Pool {
                 &mut sink,
                 &mut first_err,
             );
-            progressed |= cqes > 0;
+            if cqes > 0 {
+                progressed = true;
+                drain_post_progress(post_progress_spin_iters, &mut first_err, |first_err| {
+                    let _ = drain_conn_completions_data_marked(
+                        conns,
+                        proactor,
+                        completions_buf,
+                        &mut sink,
+                        first_err,
+                    );
+                });
+            }
 
             if progressed || first_err.is_some() {
                 break;
@@ -989,21 +997,85 @@ where
 {
     completions_buf.clear();
     let count = proactor.drain_completions(|c| completions_buf.push(c));
-    for &c in completions_buf.iter() {
-        let conn_id =
-            u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
-        if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
-            let handle = ConnHandle(conn.conn_id());
-            match conn.handle_completion_data_marked(proactor, c, |ev| sink(handle, ev)) {
-                Ok(_) => {
-                    conn.sync_ws_open_state();
-                    conn.sync_ws_close_state();
+    dispatch_conn_completions_data_marked(conns, proactor, completions_buf, sink, first_err);
+    count
+}
+
+fn dispatch_conn_completions_data_marked<F>(
+    conns: &mut [Option<ConnectionState>],
+    proactor: &mut Proactor,
+    completions_buf: &[Completion],
+    sink: &mut F,
+    first_err: &mut Option<ConnectionError>,
+) where
+    F: for<'a> FnMut(ConnHandle, WsMarkedDataEvent<'a>),
+{
+    let mut i = 0_usize;
+    while i < completions_buf.len() {
+        let c = completions_buf[i];
+        let conn_id = completion_conn_id(c);
+        let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) else {
+            i += 1;
+            continue;
+        };
+
+        let handle = ConnHandle(conn.conn_id());
+        if conn.can_handle_plain_recv_data_batch(c) {
+            let mut end = i + 1;
+            while end < completions_buf.len() {
+                let next = completions_buf[end];
+                if completion_conn_id(next) != conn_id
+                    || !conn.can_handle_plain_recv_data_batch(next)
+                {
+                    break;
                 }
-                Err(e) => fail_conn(conn, e, first_err),
+                end += 1;
+            }
+
+            if end > i + 1 {
+                match conn.handle_plain_recv_data_batch_marked(
+                    &completions_buf[i..end],
+                    &mut |ev| {
+                        sink(handle, ev);
+                    },
+                ) {
+                    Ok(_) => {
+                        conn.sync_ws_open_state();
+                        conn.sync_ws_close_state();
+                    }
+                    Err(e) => fail_conn(conn, e, first_err),
+                }
+                i = end;
+                continue;
             }
         }
+
+        match conn.handle_completion_data_marked(proactor, c, |ev| sink(handle, ev)) {
+            Ok(_) => {
+                conn.sync_ws_open_state();
+                conn.sync_ws_close_state();
+            }
+            Err(e) => fail_conn(conn, e, first_err),
+        }
+        i += 1;
     }
-    count
+}
+
+#[inline]
+fn drain_post_progress<E, F>(
+    post_progress_spin_iters: usize,
+    first_err: &mut Option<E>,
+    mut drain: F,
+) where
+    F: FnMut(&mut Option<E>),
+{
+    for _ in 0..post_progress_spin_iters {
+        std::hint::spin_loop();
+        drain(first_err);
+        if first_err.is_some() {
+            break;
+        }
+    }
 }
 
 fn write_ingress_prometheus_help<W: fmt::Write>(out: &mut W) -> fmt::Result {
@@ -1147,6 +1219,53 @@ impl Drop for Pool {
                 let _ = ring.unregister(&mut self.proactor);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod post_progress_tests {
+    use super::drain_post_progress;
+
+    #[test]
+    fn drain_post_progress_is_noop_without_budget() {
+        let mut calls = 0_u32;
+        let mut first_err = None::<()>;
+
+        drain_post_progress(0, &mut first_err, |_| {
+            calls += 1;
+        });
+
+        assert_eq!(calls, 0);
+        assert!(first_err.is_none());
+    }
+
+    #[test]
+    fn drain_post_progress_uses_full_budget_without_error() {
+        let mut calls = 0_u32;
+        let mut first_err = None::<()>;
+
+        drain_post_progress(4, &mut first_err, |_| {
+            calls += 1;
+        });
+
+        assert_eq!(calls, 4);
+        assert!(first_err.is_none());
+    }
+
+    #[test]
+    fn drain_post_progress_stops_after_first_error() {
+        let mut calls = 0_u32;
+        let mut first_err = None::<()>;
+
+        drain_post_progress(8, &mut first_err, |err| {
+            calls += 1;
+            if calls == 3 {
+                *err = Some(());
+            }
+        });
+
+        assert_eq!(calls, 3);
+        assert_eq!(first_err, Some(()));
     }
 }
 

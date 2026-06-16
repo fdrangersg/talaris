@@ -652,6 +652,141 @@ impl ConnectionState {
         first_err.map_or(Ok(drained_events), Err)
     }
 
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn handle_plain_recv_data_batch_marked<F>(
+        &mut self,
+        completions: &[Completion],
+        sink: &mut F,
+    ) -> Result<usize, ConnectionError>
+    where
+        F: for<'a> FnMut(MarkedDataEvent<'a>),
+    {
+        debug_assert!(self.tls.is_none());
+        let batch_cqes = u64::try_from(completions.len()).unwrap_or(u64::MAX);
+        self.record_plain_recv_batch(batch_cqes, None);
+
+        let mut drained_events = 0_usize;
+        let mut plaintext_chunks = 0_u64;
+        let mut plaintext_bytes = 0_u64;
+        let mut text_events = 0_u64;
+        let mut binary_events = 0_u64;
+        let mut first_err = None;
+
+        for &c in completions {
+            if !c.has_more() {
+                self.multishot_armed = false;
+            }
+
+            let Some(bid) = c.buffer_id() else {
+                if first_err.is_none() {
+                    first_err = Some(match c.to_result() {
+                        Ok(0) => {
+                            self.state = State::Closed;
+                            ConnectionError::PeerClosed
+                        }
+                        Ok(_) => ConnectionError::InvalidState(self.state),
+                        Err(e) if is_recv_buffer_ring_exhausted(&e) => {
+                            self.record_recv_ring_exhaustion();
+                            self.multishot_armed = false;
+                            continue;
+                        }
+                        Err(e) => ConnectionError::RecvFailed(e),
+                    });
+                }
+                continue;
+            };
+
+            let n = match c.to_result() {
+                Ok(0) => {
+                    self.buf_ring.as_mut().expect("buf_ring").recycle(bid);
+                    self.state = State::Closed;
+                    if first_err.is_none() {
+                        first_err = Some(ConnectionError::PeerClosed);
+                    }
+                    continue;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    self.buf_ring.as_mut().expect("buf_ring").recycle(bid);
+                    if first_err.is_none() {
+                        first_err = Some(ConnectionError::RecvFailed(e));
+                    }
+                    continue;
+                }
+            };
+
+            let recv_sequence = self.marked_recv_sequence;
+            let sampled = self
+                .cfg
+                .observability_sample_rate
+                .should_sample_sequence(recv_sequence);
+            let recv_meta = DataEventMeta::recv_observed_now(recv_sequence, sampled);
+            self.marked_recv_sequence = self.marked_recv_sequence.saturating_add(1);
+            self.record_recv_data(n);
+
+            if first_err.is_none() {
+                plaintext_chunks = plaintext_chunks.saturating_add(1);
+                plaintext_bytes = plaintext_bytes.saturating_add(n as u64);
+                let bytes_ptr = self
+                    .buf_ring
+                    .as_ref()
+                    .expect("buf_ring")
+                    .buffer(bid)
+                    .as_ptr();
+                // SAFETY: the selected provided buffer remains owned by this
+                // connection until it is recycled below, after the sink returns.
+                let bytes: &[u8] = unsafe { std::slice::from_raw_parts(bytes_ptr, n) };
+                let base_meta =
+                    recv_meta.plaintext_ready_at(recv_meta.transport_recv_mono_nanos, 0);
+                let marked_message_sequence = &mut self.marked_message_sequence;
+                let observability_histograms = &mut self.observability_histograms;
+                let chunk_events_before = drained_events;
+                let result = self
+                    .ws
+                    .drain_data_events_from_ingress_marked_with_message_sequence(
+                        bytes,
+                        base_meta,
+                        marked_message_sequence,
+                        |ev| {
+                            let meta = ev.meta();
+                            if let Some(histograms) = observability_histograms.as_mut() {
+                                histograms.record_message(meta);
+                            }
+                            drained_events = drained_events.saturating_add(1);
+                            match ev {
+                                MarkedDataEvent::Text { .. } => {
+                                    text_events = text_events.saturating_add(1);
+                                }
+                                MarkedDataEvent::Binary { .. } => {
+                                    binary_events = binary_events.saturating_add(1);
+                                }
+                            }
+                            sink(ev);
+                        },
+                    )
+                    .map_err(ConnectionError::Ws);
+                if drained_events > chunk_events_before
+                    && let Some(histograms) = observability_histograms.as_mut()
+                {
+                    histograms.record_plaintext_chunk(base_meta);
+                }
+                if let Err(e) = result
+                    && first_err.is_none()
+                {
+                    first_err = Some(e);
+                }
+            }
+
+            self.buf_ring.as_mut().expect("buf_ring").recycle(bid);
+        }
+
+        self.record_plaintext(plaintext_chunks, plaintext_bytes);
+        self.record_ws_data_drains(plaintext_chunks, 0);
+        self.record_ws_data_events(text_events, binary_events);
+
+        first_err.map_or(Ok(drained_events), Err)
+    }
+
     pub(crate) fn handle_completion_data_marked<F>(
         &mut self,
         proactor: &mut Proactor,
