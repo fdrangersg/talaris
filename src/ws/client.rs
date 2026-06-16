@@ -33,7 +33,7 @@ use super::mask::mask_inplace;
 use super::parser::{FeedOutcome, FrameEvent, FrameParser};
 use crate::cursor_buf::CursorBuf;
 use crate::http::{HttpError, parse_response};
-use crate::observability::{DataEventMeta, MarkedDataEvent};
+use crate::observability::{DataEventMeta, MarkedDataEvent, monotonic_nanos_now};
 use thiserror::Error;
 
 /// 默认单条 message 最大长度（fragmented 累计）：8 MiB。
@@ -288,11 +288,82 @@ fn next_marked_meta(
     base_meta: DataEventMeta,
     chunk_message_index: &mut u16,
     message_sequence: &mut u64,
+    chunk_prior_sink_service_nanos: u64,
 ) -> DataEventMeta {
-    let meta = base_meta.ws_payload_ready_now(*chunk_message_index, *message_sequence);
+    let meta = base_meta
+        .ws_payload_ready_now(*chunk_message_index, *message_sequence)
+        .with_chunk_prior_sink_service_nanos(chunk_prior_sink_service_nanos);
     *chunk_message_index = (*chunk_message_index).saturating_add(1);
     *message_sequence = (*message_sequence).saturating_add(1);
     meta
+}
+
+#[inline]
+fn emit_marked_event<'a, F>(
+    sink: &mut F,
+    event: MarkedDataEvent<'a>,
+    sampled: bool,
+    chunk_prior_sink_service_nanos: &mut u64,
+) where
+    F: FnMut(MarkedDataEvent<'a>),
+{
+    let sink_started = sampled.then(monotonic_nanos_now);
+    sink(event);
+    if let Some(sink_started) = sink_started {
+        let service_nanos = monotonic_nanos_now().saturating_sub(sink_started);
+        *chunk_prior_sink_service_nanos =
+            chunk_prior_sink_service_nanos.saturating_add(service_nanos);
+    }
+}
+
+#[inline]
+fn emit_marked_text<'a, F>(
+    payload: &'a str,
+    base_meta: DataEventMeta,
+    message_index: &mut u16,
+    message_sequence: &mut u64,
+    chunk_prior_sink_service_nanos: &mut u64,
+    sink: &mut F,
+) where
+    F: FnMut(MarkedDataEvent<'a>),
+{
+    let meta = next_marked_meta(
+        base_meta,
+        message_index,
+        message_sequence,
+        *chunk_prior_sink_service_nanos,
+    );
+    emit_marked_event(
+        sink,
+        MarkedDataEvent::Text { payload, meta },
+        meta.sampled,
+        chunk_prior_sink_service_nanos,
+    );
+}
+
+#[inline]
+fn emit_marked_binary<'a, F>(
+    payload: &'a [u8],
+    base_meta: DataEventMeta,
+    message_index: &mut u16,
+    message_sequence: &mut u64,
+    chunk_prior_sink_service_nanos: &mut u64,
+    sink: &mut F,
+) where
+    F: FnMut(MarkedDataEvent<'a>),
+{
+    let meta = next_marked_meta(
+        base_meta,
+        message_index,
+        message_sequence,
+        *chunk_prior_sink_service_nanos,
+    );
+    emit_marked_event(
+        sink,
+        MarkedDataEvent::Binary { payload, meta },
+        meta.sampled,
+        chunk_prior_sink_service_nanos,
+    );
 }
 
 impl WsClient {
@@ -594,10 +665,12 @@ impl WsClient {
     {
         let mut message_index = 0_u16;
         let mut message_sequence = base_meta.message_sequence;
+        let mut chunk_prior_sink_service_nanos = 0_u64;
         self.drain_data_events_marked_from_index(
             base_meta,
             &mut message_index,
             &mut message_sequence,
+            &mut chunk_prior_sink_service_nanos,
             &mut sink,
         )
     }
@@ -607,6 +680,7 @@ impl WsClient {
         base_meta: DataEventMeta,
         message_index: &mut u16,
         message_sequence: &mut u64,
+        chunk_prior_sink_service_nanos: &mut u64,
         mut sink: F,
     ) -> Result<usize, WsError>
     where
@@ -619,6 +693,7 @@ impl WsClient {
                 base_meta,
                 message_index,
                 message_sequence,
+                chunk_prior_sink_service_nanos,
                 &mut sink,
             )?;
             events += direct_events;
@@ -635,12 +710,24 @@ impl WsClient {
             events += 1;
             match ev {
                 Event::Text(payload) => {
-                    let meta = next_marked_meta(base_meta, message_index, message_sequence);
-                    sink(MarkedDataEvent::Text { payload, meta });
+                    emit_marked_text(
+                        payload,
+                        base_meta,
+                        message_index,
+                        message_sequence,
+                        chunk_prior_sink_service_nanos,
+                        &mut sink,
+                    );
                 }
                 Event::Binary(payload) => {
-                    let meta = next_marked_meta(base_meta, message_index, message_sequence);
-                    sink(MarkedDataEvent::Binary { payload, meta });
+                    emit_marked_binary(
+                        payload,
+                        base_meta,
+                        message_index,
+                        message_sequence,
+                        chunk_prior_sink_service_nanos,
+                        &mut sink,
+                    );
                 }
                 Event::HandshakeComplete
                 | Event::Ping(_)
@@ -685,21 +772,25 @@ impl WsClient {
         self.clear_after_emit();
         if bytes.is_empty() {
             let mut message_index = 0_u16;
+            let mut chunk_prior_sink_service_nanos = 0_u64;
             return self.drain_data_events_marked_from_index(
                 base_meta,
                 &mut message_index,
                 message_sequence,
+                &mut chunk_prior_sink_service_nanos,
                 &mut sink,
             );
         }
 
         if self.can_drain_ingress_directly() {
             let mut message_index = 0_u16;
+            let mut chunk_prior_sink_service_nanos = 0_u64;
             let (events, consumed, result) = self.try_drain_ingress_data_events_marked(
                 bytes,
                 base_meta,
                 &mut message_index,
                 message_sequence,
+                &mut chunk_prior_sink_service_nanos,
                 &mut sink,
             )?;
             match result {
@@ -715,6 +806,7 @@ impl WsClient {
                             base_meta,
                             &mut message_index,
                             message_sequence,
+                            &mut chunk_prior_sink_service_nanos,
                             &mut sink,
                         )
                         .map(|fallback_events| events + fallback_events);
@@ -724,10 +816,12 @@ impl WsClient {
 
         self.feed_recv(bytes);
         let mut message_index = 0_u16;
+        let mut chunk_prior_sink_service_nanos = 0_u64;
         self.drain_data_events_marked_from_index(
             base_meta,
             &mut message_index,
             message_sequence,
+            &mut chunk_prior_sink_service_nanos,
             sink,
         )
     }
@@ -831,6 +925,7 @@ impl WsClient {
         base_meta: DataEventMeta,
         message_index: &mut u16,
         message_sequence: &mut u64,
+        chunk_prior_sink_service_nanos: &mut u64,
         sink: &mut F,
     ) -> Result<(usize, DirectDataResult), WsError>
     where
@@ -910,15 +1005,24 @@ impl WsClient {
                         self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
                         return Err(WsError::Utf8Invalid);
                     };
-                    let meta = next_marked_meta(base_meta, message_index, message_sequence);
-                    sink(MarkedDataEvent::Text {
-                        payload: text,
-                        meta,
-                    });
+                    emit_marked_text(
+                        text,
+                        base_meta,
+                        message_index,
+                        message_sequence,
+                        chunk_prior_sink_service_nanos,
+                        sink,
+                    );
                 }
                 OpCode::Binary => {
-                    let meta = next_marked_meta(base_meta, message_index, message_sequence);
-                    sink(MarkedDataEvent::Binary { payload, meta });
+                    emit_marked_binary(
+                        payload,
+                        base_meta,
+                        message_index,
+                        message_sequence,
+                        chunk_prior_sink_service_nanos,
+                        sink,
+                    );
                 }
                 _ => unreachable!("guarded above"),
             }
@@ -1030,6 +1134,7 @@ impl WsClient {
         base_meta: DataEventMeta,
         message_index: &mut u16,
         message_sequence: &mut u64,
+        chunk_prior_sink_service_nanos: &mut u64,
         sink: &mut F,
     ) -> Result<(usize, usize, DirectDataResult), WsError>
     where
@@ -1103,15 +1208,24 @@ impl WsClient {
                             WsError::Utf8Invalid
                         })?
                     };
-                    let meta = next_marked_meta(base_meta, message_index, message_sequence);
-                    sink(MarkedDataEvent::Text {
-                        payload: text,
-                        meta,
-                    });
+                    emit_marked_text(
+                        text,
+                        base_meta,
+                        message_index,
+                        message_sequence,
+                        chunk_prior_sink_service_nanos,
+                        sink,
+                    );
                 }
                 OpCode::Binary => {
-                    let meta = next_marked_meta(base_meta, message_index, message_sequence);
-                    sink(MarkedDataEvent::Binary { payload, meta });
+                    emit_marked_binary(
+                        payload,
+                        base_meta,
+                        message_index,
+                        message_sequence,
+                        chunk_prior_sink_service_nanos,
+                        sink,
+                    );
                 }
                 _ => unreachable!("guarded above"),
             }
@@ -1955,6 +2069,7 @@ mod tests {
             message_sequence: 17,
             tls_plaintext_chunk_index: 3,
             chunk_message_index: 0,
+            chunk_prior_sink_service_nanos: 0,
         };
 
         let mut data = Vec::new();
@@ -2051,6 +2166,7 @@ mod tests {
             message_sequence: 0,
             tls_plaintext_chunk_index: 5,
             chunk_message_index: 0,
+            chunk_prior_sink_service_nanos: 0,
         };
 
         let mut data = Vec::new();
@@ -2120,10 +2236,12 @@ mod tests {
             message_sequence: 0,
             tls_plaintext_chunk_index: 8,
             chunk_message_index: 0,
+            chunk_prior_sink_service_nanos: 0,
         };
 
         let mut message_sequence = 41;
         let mut data = Vec::new();
+        let mut first_sink_returned = false;
         let events = c
             .drain_data_events_from_ingress_marked_with_message_sequence(
                 &wire,
@@ -2131,6 +2249,14 @@ mod tests {
                 &mut message_sequence,
                 |ev| match ev {
                     MarkedDataEvent::Text { payload, meta } => {
+                        if payload == "before" {
+                            let until =
+                                std::time::Instant::now() + std::time::Duration::from_micros(50);
+                            while std::time::Instant::now() < until {
+                                std::hint::spin_loop();
+                            }
+                            first_sink_returned = true;
+                        }
                         data.push((payload.to_owned(), meta));
                     }
                     MarkedDataEvent::Binary { .. } => panic!("unexpected binary"),
@@ -2152,6 +2278,11 @@ mod tests {
         assert_eq!(data[1].1.message_sequence, 42);
         assert_eq!(data[1].1.tls_plaintext_chunk_index, 8);
         assert_eq!(data[1].1.chunk_message_index, 1);
+        assert!(first_sink_returned);
+        assert!(
+            data[1].1.chunk_prior_sink_service_nanos > 0,
+            "fallback message should carry prior sink service accumulated before control frame"
+        );
         assert!(
             !c.pending_tx().is_empty(),
             "Ping fallback should still queue auto-pong"

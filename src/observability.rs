@@ -179,9 +179,16 @@ struct LatencyHistogramSet {
     plaintext_to_ws_all: StageHistogram,
     plaintext_to_ws_first: StageHistogram,
     plaintext_to_ws_queued: StageHistogram,
+    plaintext_to_ws_excluding_prior_sink_all: StageHistogram,
+    plaintext_to_ws_excluding_prior_sink_first: StageHistogram,
+    plaintext_to_ws_excluding_prior_sink_queued: StageHistogram,
     recv_to_ws_all: StageHistogram,
     recv_to_ws_first: StageHistogram,
     recv_to_ws_queued: StageHistogram,
+    recv_to_ws_excluding_prior_sink_all: StageHistogram,
+    recv_to_ws_excluding_prior_sink_first: StageHistogram,
+    recv_to_ws_excluding_prior_sink_queued: StageHistogram,
+    chunk_prior_sink_service_queued: StageHistogram,
 }
 
 impl LatencyHistogramSet {
@@ -191,9 +198,16 @@ impl LatencyHistogramSet {
             plaintext_to_ws_all: StageHistogram::new()?,
             plaintext_to_ws_first: StageHistogram::new()?,
             plaintext_to_ws_queued: StageHistogram::new()?,
+            plaintext_to_ws_excluding_prior_sink_all: StageHistogram::new()?,
+            plaintext_to_ws_excluding_prior_sink_first: StageHistogram::new()?,
+            plaintext_to_ws_excluding_prior_sink_queued: StageHistogram::new()?,
             recv_to_ws_all: StageHistogram::new()?,
             recv_to_ws_first: StageHistogram::new()?,
             recv_to_ws_queued: StageHistogram::new()?,
+            recv_to_ws_excluding_prior_sink_all: StageHistogram::new()?,
+            recv_to_ws_excluding_prior_sink_first: StageHistogram::new()?,
+            recv_to_ws_excluding_prior_sink_queued: StageHistogram::new()?,
+            chunk_prior_sink_service_queued: StageHistogram::new()?,
         })
     }
 
@@ -214,12 +228,39 @@ impl LatencyHistogramSet {
                 MessageChunkPosition::Queued => self.plaintext_to_ws_queued.record(nanos),
             }
         }
+        if let Some(nanos) = meta.plaintext_to_ws_excluding_prior_sink_nanos() {
+            self.plaintext_to_ws_excluding_prior_sink_all.record(nanos);
+            match position {
+                MessageChunkPosition::First => self
+                    .plaintext_to_ws_excluding_prior_sink_first
+                    .record(nanos),
+                MessageChunkPosition::Queued => self
+                    .plaintext_to_ws_excluding_prior_sink_queued
+                    .record(nanos),
+            }
+        }
         if let Some(nanos) = meta.recv_to_ws_nanos() {
             self.recv_to_ws_all.record(nanos);
             match position {
                 MessageChunkPosition::First => self.recv_to_ws_first.record(nanos),
                 MessageChunkPosition::Queued => self.recv_to_ws_queued.record(nanos),
             }
+        }
+        if let Some(nanos) = meta.recv_to_ws_excluding_prior_sink_nanos() {
+            self.recv_to_ws_excluding_prior_sink_all.record(nanos);
+            match position {
+                MessageChunkPosition::First => {
+                    self.recv_to_ws_excluding_prior_sink_first.record(nanos);
+                }
+                MessageChunkPosition::Queued => {
+                    self.recv_to_ws_excluding_prior_sink_queued.record(nanos);
+                }
+            }
+        }
+        if let (MessageChunkPosition::Queued, Some(nanos)) =
+            (position, meta.chunk_prior_sink_service_nanos())
+        {
+            self.chunk_prior_sink_service_queued.record(nanos);
         }
     }
 
@@ -228,9 +269,16 @@ impl LatencyHistogramSet {
         self.plaintext_to_ws_all.reset();
         self.plaintext_to_ws_first.reset();
         self.plaintext_to_ws_queued.reset();
+        self.plaintext_to_ws_excluding_prior_sink_all.reset();
+        self.plaintext_to_ws_excluding_prior_sink_first.reset();
+        self.plaintext_to_ws_excluding_prior_sink_queued.reset();
         self.recv_to_ws_all.reset();
         self.recv_to_ws_first.reset();
         self.recv_to_ws_queued.reset();
+        self.recv_to_ws_excluding_prior_sink_all.reset();
+        self.recv_to_ws_excluding_prior_sink_first.reset();
+        self.recv_to_ws_excluding_prior_sink_queued.reset();
+        self.chunk_prior_sink_service_queued.reset();
     }
 
     fn write_prometheus<W: fmt::Write>(
@@ -247,54 +295,71 @@ impl LatencyHistogramSet {
             "chunk",
             out,
         )?;
-        self.plaintext_to_ws_all.write_prometheus(
+        Self::write_message_position_stage(
             conn_id,
             window,
-            "message",
             "plaintext_to_ws",
-            "all",
+            [
+                &self.plaintext_to_ws_all,
+                &self.plaintext_to_ws_first,
+                &self.plaintext_to_ws_queued,
+            ],
             out,
         )?;
-        self.plaintext_to_ws_first.write_prometheus(
+        Self::write_message_position_stage(
             conn_id,
             window,
-            "message",
-            "plaintext_to_ws",
-            "first",
+            "plaintext_to_ws_excluding_prior_sink",
+            [
+                &self.plaintext_to_ws_excluding_prior_sink_all,
+                &self.plaintext_to_ws_excluding_prior_sink_first,
+                &self.plaintext_to_ws_excluding_prior_sink_queued,
+            ],
             out,
         )?;
-        self.plaintext_to_ws_queued.write_prometheus(
+        Self::write_message_position_stage(
             conn_id,
             window,
-            "message",
-            "plaintext_to_ws",
-            "queued",
-            out,
-        )?;
-        self.recv_to_ws_all.write_prometheus(
-            conn_id,
-            window,
-            "message",
             "recv_to_ws",
-            "all",
+            [
+                &self.recv_to_ws_all,
+                &self.recv_to_ws_first,
+                &self.recv_to_ws_queued,
+            ],
             out,
         )?;
-        self.recv_to_ws_first.write_prometheus(
+        Self::write_message_position_stage(
+            conn_id,
+            window,
+            "recv_to_ws_excluding_prior_sink",
+            [
+                &self.recv_to_ws_excluding_prior_sink_all,
+                &self.recv_to_ws_excluding_prior_sink_first,
+                &self.recv_to_ws_excluding_prior_sink_queued,
+            ],
+            out,
+        )?;
+        self.chunk_prior_sink_service_queued.write_prometheus(
             conn_id,
             window,
             "message",
-            "recv_to_ws",
-            "first",
-            out,
-        )?;
-        self.recv_to_ws_queued.write_prometheus(
-            conn_id,
-            window,
-            "message",
-            "recv_to_ws",
+            "chunk_prior_sink_service",
             "queued",
             out,
         )
+    }
+
+    fn write_message_position_stage<W: fmt::Write>(
+        conn_id: u32,
+        window: &str,
+        stage: &str,
+        histograms: [&StageHistogram; 3],
+        out: &mut W,
+    ) -> fmt::Result {
+        for (chunk_position, histogram) in ["all", "first", "queued"].into_iter().zip(histograms) {
+            histogram.write_prometheus(conn_id, window, "message", stage, chunk_position, out)?;
+        }
+        Ok(())
     }
 }
 
@@ -422,6 +487,13 @@ pub struct DataEventMeta {
     /// at `u16::MAX` if a single plaintext chunk yields more data messages than
     /// fit in `u16`.
     pub chunk_message_index: u16,
+    /// Accumulated wall-clock time spent inside prior user sink callbacks for
+    /// earlier data messages in this same plaintext chunk.
+    ///
+    /// This field is zero for the first message in a chunk and when this recv
+    /// sequence is not sampled. Subtract it from `*_to_ws` deltas to estimate the
+    /// parser/dispatch portion that is not caused by synchronous sink backpressure.
+    pub chunk_prior_sink_service_nanos: u64,
 }
 
 impl DataEventMeta {
@@ -438,6 +510,7 @@ impl DataEventMeta {
             message_sequence: 0,
             tls_plaintext_chunk_index: 0,
             chunk_message_index: 0,
+            chunk_prior_sink_service_nanos: 0,
         }
     }
 
@@ -447,6 +520,7 @@ impl DataEventMeta {
         self.tls_plaintext_ready_mono_nanos = if self.sampled { mono_nanos } else { 0 };
         self.tls_plaintext_chunk_index = chunk_index;
         self.chunk_message_index = 0;
+        self.chunk_prior_sink_service_nanos = 0;
         self
     }
 
@@ -480,6 +554,13 @@ impl DataEventMeta {
 
     #[inline]
     #[must_use]
+    pub(crate) const fn with_chunk_prior_sink_service_nanos(mut self, nanos: u64) -> Self {
+        self.chunk_prior_sink_service_nanos = if self.sampled { nanos } else { 0 };
+        self
+    }
+
+    #[inline]
+    #[must_use]
     pub fn recv_to_plaintext_nanos(self) -> Option<u64> {
         if !self.sampled {
             return None;
@@ -506,6 +587,30 @@ impl DataEventMeta {
         }
         self.ws_payload_ready_mono_nanos
             .checked_sub(self.transport_recv_mono_nanos)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn chunk_prior_sink_service_nanos(self) -> Option<u64> {
+        if self.sampled {
+            Some(self.chunk_prior_sink_service_nanos)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn plaintext_to_ws_excluding_prior_sink_nanos(self) -> Option<u64> {
+        self.plaintext_to_ws_nanos()?
+            .checked_sub(self.chunk_prior_sink_service_nanos()?)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn recv_to_ws_excluding_prior_sink_nanos(self) -> Option<u64> {
+        self.recv_to_ws_nanos()?
+            .checked_sub(self.chunk_prior_sink_service_nanos()?)
     }
 }
 
@@ -600,11 +705,13 @@ mod tests {
             message_sequence: 3,
             tls_plaintext_chunk_index: 0,
             chunk_message_index: 0,
+            chunk_prior_sink_service_nanos: 0,
         };
         let queued = DataEventMeta {
             chunk_message_index: 1,
             message_sequence: 4,
             ws_payload_ready_mono_nanos: 330,
+            chunk_prior_sink_service_nanos: 80,
             ..first
         };
         histograms.record_plaintext_chunk(first);
@@ -628,9 +735,15 @@ mod tests {
         assert!(
             out.contains("talaris_ws_latency_sum_ns{conn_id=\"7\",window=\"cumulative\",scope=\"message\",stage=\"plaintext_to_ws\",chunk_position=\"queued\"} 170")
         );
+        assert!(out.contains(
+            "talaris_ws_latency_sum_ns{conn_id=\"7\",window=\"cumulative\",scope=\"message\",stage=\"plaintext_to_ws_excluding_prior_sink\",chunk_position=\"queued\"} 90"
+        ));
         assert!(
             out.contains("talaris_ws_latency_max_ns{conn_id=\"7\",window=\"cumulative\",scope=\"message\",stage=\"recv_to_ws\",chunk_position=\"all\"} 230")
         );
+        assert!(out.contains(
+            "talaris_ws_latency_sum_ns{conn_id=\"7\",window=\"cumulative\",scope=\"message\",stage=\"chunk_prior_sink_service\",chunk_position=\"queued\"} 80"
+        ));
         Ok(())
     }
 
@@ -647,6 +760,7 @@ mod tests {
             message_sequence: 3,
             tls_plaintext_chunk_index: 0,
             chunk_message_index: 0,
+            chunk_prior_sink_service_nanos: 0,
         };
         histograms.record_plaintext_chunk(meta);
         histograms.record_message(meta);

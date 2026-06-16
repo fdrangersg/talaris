@@ -484,7 +484,10 @@ fn print_stream_stats(mode: &str, messages: &common::MessageStats, reads: Stream
 struct TalarisLatencyStats {
     recv_to_plaintext: StageLatencyStats,
     plaintext_to_ws: StageLatencyStats,
+    plaintext_to_ws_excluding_prior_sink: StageLatencyStats,
     recv_to_ws: StageLatencyStats,
+    recv_to_ws_excluding_prior_sink: StageLatencyStats,
+    chunk_prior_sink_service: StageLatencyStats,
 }
 
 impl TalarisLatencyStats {
@@ -492,7 +495,10 @@ impl TalarisLatencyStats {
         Ok(Self {
             recv_to_plaintext: StageLatencyStats::new()?,
             plaintext_to_ws: StageLatencyStats::new()?,
+            plaintext_to_ws_excluding_prior_sink: StageLatencyStats::new()?,
             recv_to_ws: StageLatencyStats::new()?,
+            recv_to_ws_excluding_prior_sink: StageLatencyStats::new()?,
+            chunk_prior_sink_service: StageLatencyStats::new()?,
         })
     }
 
@@ -504,8 +510,20 @@ impl TalarisLatencyStats {
         if let Some(nanos) = meta.plaintext_to_ws_nanos() {
             self.plaintext_to_ws.record(position, nanos);
         }
+        if let Some(nanos) = meta.plaintext_to_ws_excluding_prior_sink_nanos() {
+            self.plaintext_to_ws_excluding_prior_sink
+                .record(position, nanos);
+        }
         if let Some(nanos) = meta.recv_to_ws_nanos() {
             self.recv_to_ws.record(position, nanos);
+        }
+        if let Some(nanos) = meta.recv_to_ws_excluding_prior_sink_nanos() {
+            self.recv_to_ws_excluding_prior_sink.record(position, nanos);
+        }
+        if meta.chunk_message_index > 0
+            && let Some(nanos) = meta.chunk_prior_sink_service_nanos()
+        {
+            self.chunk_prior_sink_service.record(position, nanos);
         }
     }
 
@@ -514,7 +532,19 @@ impl TalarisLatencyStats {
             .print(mode, "recv_to_plaintext", "chunk_message");
         self.plaintext_to_ws
             .print(mode, "plaintext_to_ws", "chunk_message");
+        self.plaintext_to_ws_excluding_prior_sink.print(
+            mode,
+            "plaintext_to_ws_excluding_prior_sink",
+            "chunk_message",
+        );
         self.recv_to_ws.print(mode, "recv_to_ws", "chunk_message");
+        self.recv_to_ws_excluding_prior_sink.print(
+            mode,
+            "recv_to_ws_excluding_prior_sink",
+            "chunk_message",
+        );
+        self.chunk_prior_sink_service
+            .print(mode, "chunk_prior_sink_service", "chunk_message");
     }
 }
 

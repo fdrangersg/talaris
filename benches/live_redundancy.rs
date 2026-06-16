@@ -477,7 +477,10 @@ impl LiveRedundancyStats {
 struct LatencyStages {
     recv_to_plaintext: BenchHistogram,
     plaintext_to_ws: BenchHistogram,
+    plaintext_to_ws_excluding_prior_sink: BenchHistogram,
     recv_to_ws: BenchHistogram,
+    recv_to_ws_excluding_prior_sink: BenchHistogram,
+    chunk_prior_sink_service: BenchHistogram,
 }
 
 impl LatencyStages {
@@ -485,7 +488,10 @@ impl LatencyStages {
         Ok(Self {
             recv_to_plaintext: BenchHistogram::new()?,
             plaintext_to_ws: BenchHistogram::new()?,
+            plaintext_to_ws_excluding_prior_sink: BenchHistogram::new()?,
             recv_to_ws: BenchHistogram::new()?,
+            recv_to_ws_excluding_prior_sink: BenchHistogram::new()?,
+            chunk_prior_sink_service: BenchHistogram::new()?,
         })
     }
 
@@ -496,8 +502,19 @@ impl LatencyStages {
         if let Some(nanos) = meta.plaintext_to_ws_nanos() {
             self.plaintext_to_ws.record(nanos);
         }
+        if let Some(nanos) = meta.plaintext_to_ws_excluding_prior_sink_nanos() {
+            self.plaintext_to_ws_excluding_prior_sink.record(nanos);
+        }
         if let Some(nanos) = meta.recv_to_ws_nanos() {
             self.recv_to_ws.record(nanos);
+        }
+        if let Some(nanos) = meta.recv_to_ws_excluding_prior_sink_nanos() {
+            self.recv_to_ws_excluding_prior_sink.record(nanos);
+        }
+        if meta.chunk_message_index > 0
+            && let Some(nanos) = meta.chunk_prior_sink_service_nanos()
+        {
+            self.chunk_prior_sink_service.record(nanos);
         }
     }
 
@@ -506,8 +523,23 @@ impl LatencyStages {
             .print("live_redundancy_latency", outcome, "recv_to_plaintext");
         self.plaintext_to_ws
             .print("live_redundancy_latency", outcome, "plaintext_to_ws");
+        self.plaintext_to_ws_excluding_prior_sink.print(
+            "live_redundancy_latency",
+            outcome,
+            "plaintext_to_ws_excluding_prior_sink",
+        );
         self.recv_to_ws
             .print("live_redundancy_latency", outcome, "recv_to_ws");
+        self.recv_to_ws_excluding_prior_sink.print(
+            "live_redundancy_latency",
+            outcome,
+            "recv_to_ws_excluding_prior_sink",
+        );
+        self.chunk_prior_sink_service.print(
+            "live_redundancy_latency",
+            outcome,
+            "chunk_prior_sink_service",
+        );
     }
 }
 
