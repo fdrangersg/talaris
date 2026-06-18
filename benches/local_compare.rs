@@ -83,6 +83,7 @@ struct Config {
     completion_batch: usize,
     spin_iters: usize,
     post_progress_spin_iters: usize,
+    recv_mode: talaris::connection::RecvMode,
     copy_batch_bytes: usize,
     timestamps: bool,
     user_cpu: Option<usize>,
@@ -126,6 +127,7 @@ impl Config {
             completion_batch: common::arg_or("--completion-batch", 64_usize).max(1),
             spin_iters: common::arg_or("--spin-iters", 256_usize),
             post_progress_spin_iters: common::arg_or("--post-progress-spin-iters", 0_usize),
+            recv_mode: common::arg_or("--recv-mode", talaris::connection::RecvMode::Multishot),
             copy_batch_bytes: common::arg_or("--copy-batch-bytes", 0_usize),
             timestamps: common::flag_present("--timestamps"),
             user_cpu: common::optional_arg("--user-cpu"),
@@ -135,7 +137,7 @@ impl Config {
 
     fn print(&self) {
         println!(
-            "bench_config bench=local_compare transport={} seconds={} messages={} warmup_messages={} payload_profile={} payload={} actual_payload={} frames_per_write={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} post_progress_spin_iters={} copy_batch_bytes={} timestamps={}",
+            "bench_config bench=local_compare transport={} seconds={} messages={} warmup_messages={} payload_profile={} payload={} actual_payload={} frames_per_write={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} post_progress_spin_iters={} recv_mode={} copy_batch_bytes={} timestamps={}",
             self.transport.as_str(),
             self.seconds,
             self.messages,
@@ -151,6 +153,7 @@ impl Config {
             self.completion_batch,
             self.spin_iters,
             self.post_progress_spin_iters,
+            self.recv_mode,
             self.copy_batch_bytes,
             self.timestamps,
         );
@@ -193,6 +196,7 @@ fn run_talaris_once(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .with_sq_entries(cfg.sq_entries)
         .with_cq_entries(cfg.cq_entries)
         .with_buf_ring(cfg.buf_size, cfg.buf_entries)
+        .with_recv_mode(cfg.recv_mode)
         .with_ws_limits(cfg.actual_payload_len, cfg.actual_payload_len as u64)
         .with_plain_recv_batch_copy_max_bytes(cfg.copy_batch_bytes)
         .with_ingress_stats(true)
@@ -738,6 +742,7 @@ fn print_usage() {
            --completion-batch N      talaris Pool CQE scratch buffer capacity\n\
            --spin-iters N            talaris spin count; 0 uses blocking pump_data\n\
            --post-progress-spin-iters N  extra spin/drain budget after first progress\n\
+           --recv-mode MODE          multishot|multishot-bundle\n\
            --copy-batch-bytes N      max bytes copied across a plain recv CQE batch; 0 disables\n\
            --timestamps              record comparable talaris/tungstenite local latency histograms\n\
            --user-cpu N              pin benchmark thread\n\
