@@ -1376,17 +1376,23 @@ fn wait_tungstenite_epoll(
     spin_iters: usize,
     deadline: Instant,
 ) -> std::io::Result<(usize, Instant)> {
-    for _ in 0..spin_iters {
+    if spin_iters == 0 {
+        let ready = epoll.wait(events, epoll_timeout_ms(deadline))?;
+        return Ok((ready, Instant::now()));
+    }
+
+    for iter in 0..=spin_iters {
         let ready = epoll.wait(events, 0)?;
         let ready_at = Instant::now();
         if ready != 0 || ready_at >= deadline {
             return Ok((ready, ready_at));
         }
-        std::hint::spin_loop();
+        if iter < spin_iters {
+            std::hint::spin_loop();
+        }
     }
 
-    let ready = epoll.wait(events, epoll_timeout_ms(deadline))?;
-    Ok((ready, Instant::now()))
+    Ok((0, Instant::now()))
 }
 
 fn build_combined_path(cfg: &Config, stream_count: usize) -> BenchResult<String> {
@@ -1552,7 +1558,7 @@ fn print_usage() {
            --tls-provider PROVIDER      ring|aws-lc\n\
            --tls-cipher PREF            default|aes128|aes256|chacha\n\
            --tungstenite-io MODE        blocking|epoll\n\
-           --tungstenite-spin-iters N   epoll mode: timeout=0 polls before blocking\n\
+           --tungstenite-spin-iters N   epoll mode: 0 blocks, >0 busy-polls timeout=0\n\
            --talaris-cpu N              pin talaris thread\n\
            --tungstenite-cpu N          pin tungstenite thread"
     );
