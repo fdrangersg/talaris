@@ -605,6 +605,7 @@ fn run_tungstenite_worker(
                             &mut stats,
                             &mut latency,
                             message,
+                            None,
                         )?;
                     }
                     Err(tungstenite::Error::Io(e)) if is_timeout(&e) => {}
@@ -616,12 +617,15 @@ fn run_tungstenite_worker(
             socket.get_mut().set_nonblocking(true)?;
             let epoll = EpollWaiter::new(socket.get_ref().as_raw_fd())?;
             let mut events = [BenchEpollEvent { events: 0, u64: 0 }; 8];
+            let mut epoll_generation = 0_u64;
             while Instant::now() < deadline {
                 let timeout_ms = epoll_timeout_ms(deadline);
                 let ready = epoll.wait(&mut events, timeout_ms)?;
+                let epoll_ready_at = Instant::now();
                 if ready == 0 {
                     continue;
                 }
+                epoll_generation = epoll_generation.saturating_add(1);
                 for event in events.iter().take(ready) {
                     if event.events & epoll_error_events() != 0 {
                         // Let tungstenite/rustls surface the concrete EOF/error.
@@ -634,6 +638,7 @@ fn run_tungstenite_worker(
                                     &mut stats,
                                     &mut latency,
                                     message,
+                                    Some((epoll_generation, epoll_ready_at)),
                                 )?;
                             }
                             Err(tungstenite::Error::Io(e)) if is_timeout(&e) => break,
@@ -664,11 +669,15 @@ fn record_tungstenite_ready_message(
     stats: &mut common::MessageStats,
     latency: &mut TungsteniteLatencyStats,
     message: tungstenite::Message,
+    epoll_marker: Option<(u64, Instant)>,
 ) -> Result<(), tungstenite::Error> {
     let ready_at = Instant::now();
     let marker = socket.get_ref().last_read_marker();
     if record_tungstenite_message(stats, message)? {
         latency.record_message(marker, ready_at);
+        if let Some((epoll_generation, epoll_ready_at)) = epoll_marker {
+            latency.record_epoll_message(epoll_generation, epoll_ready_at, ready_at);
+        }
     }
     Ok(())
 }
@@ -878,8 +887,11 @@ impl TalarisLatencyStats {
 #[derive(Debug)]
 struct TungsteniteLatencyStats {
     read_to_ws: StageLatencyStats,
+    epoll_to_ws: StageLatencyStats,
     last_generation: Option<u64>,
     current_read_message_index: u16,
+    last_epoll_generation: Option<u64>,
+    current_epoll_message_index: u16,
     missing_markers: u64,
 }
 
@@ -887,8 +899,11 @@ impl TungsteniteLatencyStats {
     fn new() -> Result<Self, hdrhistogram::CreationError> {
         Ok(Self {
             read_to_ws: StageLatencyStats::new()?,
+            epoll_to_ws: StageLatencyStats::new()?,
             last_generation: None,
             current_read_message_index: 0,
+            last_epoll_generation: None,
+            current_epoll_message_index: 0,
             missing_markers: 0,
         })
     }
@@ -911,8 +926,28 @@ impl TungsteniteLatencyStats {
             .record(MessagePosition::from_index(index), nanos);
     }
 
+    fn record_epoll_message(
+        &mut self,
+        epoll_generation: u64,
+        epoll_ready_at: Instant,
+        ready_at: Instant,
+    ) {
+        let index = if self.last_epoll_generation == Some(epoll_generation) {
+            self.current_epoll_message_index = self.current_epoll_message_index.saturating_add(1);
+            self.current_epoll_message_index
+        } else {
+            self.last_epoll_generation = Some(epoll_generation);
+            self.current_epoll_message_index = 0;
+            0
+        };
+        let nanos = duration_nanos(ready_at.saturating_duration_since(epoll_ready_at));
+        self.epoll_to_ws
+            .record(MessagePosition::from_index(index), nanos);
+    }
+
     fn merge_from(&mut self, other: &Self) {
         self.read_to_ws.merge_from(&other.read_to_ws);
+        self.epoll_to_ws.merge_from(&other.epoll_to_ws);
         self.missing_markers = self.missing_markers.saturating_add(other.missing_markers);
     }
 
@@ -924,6 +959,8 @@ impl TungsteniteLatencyStats {
             "socket_read_to_ws",
             "read_message",
         );
+        self.epoll_to_ws
+            .print(streams, redundancy, mode, "epoll_to_ws", "epoll_message");
         println!(
             "bench_latency_marker bench=live_compare mode={mode} streams={streams} redundancy={redundancy} missing_markers={}",
             common::fmt_int(self.missing_markers)
