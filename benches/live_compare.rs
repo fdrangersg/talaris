@@ -23,6 +23,7 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::{Arc, Barrier, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -71,6 +72,36 @@ impl std::str::FromStr for Transport {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TungsteniteIoMode {
+    #[default]
+    Blocking,
+    Epoll,
+}
+
+impl TungsteniteIoMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocking => "blocking",
+            Self::Epoll => "epoll",
+        }
+    }
+}
+
+impl std::str::FromStr for TungsteniteIoMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "blocking" | "block" | "recv" => Ok(Self::Blocking),
+            "epoll" | "epoll-recv" => Ok(Self::Epoll),
+            other => Err(format!(
+                "unknown --tungstenite-io {other:?}; expected blocking or epoll"
+            )),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Config {
     transport: Transport,
@@ -93,6 +124,7 @@ struct Config {
     setup_flags: talaris::proactor::ProactorSetupFlags,
     tls_provider: talaris::tls::TlsCryptoProvider,
     tls_cipher: talaris::tls::TlsCipherPreference,
+    tungstenite_io: TungsteniteIoMode,
     talaris_cpu: Option<usize>,
     tungstenite_cpu: Option<usize>,
 }
@@ -167,6 +199,7 @@ impl Config {
                 "--tls-cipher",
                 talaris::tls::TlsCipherPreference::ProviderDefault,
             ),
+            tungstenite_io: common::arg_or("--tungstenite-io", TungsteniteIoMode::Blocking),
             talaris_cpu: common::optional_arg("--talaris-cpu"),
             tungstenite_cpu: common::optional_arg("--tungstenite-cpu"),
         })
@@ -174,7 +207,7 @@ impl Config {
 
     fn print(&self) {
         println!(
-            "bench_config bench=live_compare transport={} endpoint={}:{} feed={} symbols={} stream_counts={:?} depth_speed={} redundancy_counts={:?} seconds={} sample_bps={} buf={}x{} sq_entries={} cq_entries={} setup_flags={:?} completion_batch={} spin_iters={} recv_mode={} tls_provider={} tls_cipher={} talaris_cpu={} tungstenite_cpu={}",
+            "bench_config bench=live_compare transport={} endpoint={}:{} feed={} symbols={} stream_counts={:?} depth_speed={} redundancy_counts={:?} seconds={} sample_bps={} buf={}x{} sq_entries={} cq_entries={} setup_flags={:?} completion_batch={} spin_iters={} recv_mode={} tls_provider={} tls_cipher={} tungstenite_io={} talaris_cpu={} tungstenite_cpu={}",
             self.transport.as_str(),
             self.host,
             self.port,
@@ -195,6 +228,7 @@ impl Config {
             self.recv_mode,
             self.tls_provider,
             self.tls_cipher,
+            self.tungstenite_io.as_str(),
             self.talaris_cpu
                 .map_or_else(|| "-".to_owned(), |cpu| cpu.to_string()),
             self.tungstenite_cpu
@@ -560,17 +594,55 @@ fn run_tungstenite_worker(
     let mut stats = common::MessageStats::default();
     let mut latency = TungsteniteLatencyStats::new()?;
     let cpu = common::ThreadCpuTimer::start();
-    while Instant::now() < deadline {
-        match socket.read() {
-            Ok(message) => {
-                let ready_at = Instant::now();
-                let marker = socket.get_ref().last_read_marker();
-                if record_tungstenite_message(&mut stats, message)? {
-                    latency.record_message(marker, ready_at);
+
+    match cfg.tungstenite_io {
+        TungsteniteIoMode::Blocking => {
+            while Instant::now() < deadline {
+                match socket.read() {
+                    Ok(message) => {
+                        record_tungstenite_ready_message(
+                            &mut socket,
+                            &mut stats,
+                            &mut latency,
+                            message,
+                        )?;
+                    }
+                    Err(tungstenite::Error::Io(e)) if is_timeout(&e) => {}
+                    Err(e) => return Err(Box::new(e)),
                 }
             }
-            Err(tungstenite::Error::Io(e)) if is_timeout(&e) => {}
-            Err(e) => return Err(Box::new(e)),
+        }
+        TungsteniteIoMode::Epoll => {
+            socket.get_mut().set_nonblocking(true)?;
+            let epoll = EpollWaiter::new(socket.get_ref().as_raw_fd())?;
+            let mut events = [BenchEpollEvent { events: 0, u64: 0 }; 8];
+            while Instant::now() < deadline {
+                let timeout_ms = epoll_timeout_ms(deadline);
+                let ready = epoll.wait(&mut events, timeout_ms)?;
+                if ready == 0 {
+                    continue;
+                }
+                for event in events.iter().take(ready) {
+                    if event.events & epoll_error_events() != 0 {
+                        // Let tungstenite/rustls surface the concrete EOF/error.
+                    }
+                    loop {
+                        match socket.read() {
+                            Ok(message) => {
+                                record_tungstenite_ready_message(
+                                    &mut socket,
+                                    &mut stats,
+                                    &mut latency,
+                                    message,
+                                )?;
+                            }
+                            Err(tungstenite::Error::Io(e)) if is_timeout(&e) => break,
+                            Err(e) => return Err(Box::new(e)),
+                        }
+                    }
+                }
+            }
+            socket.get_mut().set_nonblocking(false)?;
         }
     }
 
@@ -585,6 +657,20 @@ fn run_tungstenite_worker(
         elapsed,
         cpu: cpu_elapsed,
     })
+}
+
+fn record_tungstenite_ready_message(
+    socket: &mut tungstenite::WebSocket<TlsCountingStream>,
+    stats: &mut common::MessageStats,
+    latency: &mut TungsteniteLatencyStats,
+    message: tungstenite::Message,
+) -> Result<(), tungstenite::Error> {
+    let ready_at = Instant::now();
+    let marker = socket.get_ref().last_read_marker();
+    if record_tungstenite_message(stats, message)? {
+        latency.record_message(marker, ready_at);
+    }
+    Ok(())
 }
 
 fn record_tungstenite_message(
@@ -998,6 +1084,10 @@ impl CountingTcpStream {
         self.inner.set_write_timeout(timeout)
     }
 
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        self.inner.set_nonblocking(nonblocking)
+    }
+
     const fn read_stats(&self) -> StreamReadStats {
         StreamReadStats {
             calls: self.read_calls,
@@ -1020,6 +1110,12 @@ impl CountingTcpStream {
             }),
             None => None,
         }
+    }
+}
+
+impl AsRawFd for CountingTcpStream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.inner.as_raw_fd()
     }
 }
 
@@ -1068,6 +1164,16 @@ impl TlsCountingStream {
     const fn reset_read_stats(&mut self) {
         self.stream.reset_read_stats();
     }
+
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        self.stream.set_nonblocking(nonblocking)
+    }
+}
+
+impl AsRawFd for TlsCountingStream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
+    }
 }
 
 impl Read for TlsCountingStream {
@@ -1103,6 +1209,122 @@ impl StreamReadStats {
 struct ReadMarker {
     generation: u64,
     read_at: Instant,
+}
+
+#[cfg(target_os = "linux")]
+type BenchEpollEvent = libc::epoll_event;
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Copy, Debug)]
+#[allow(non_camel_case_types)]
+struct BenchEpollEvent {
+    events: u32,
+    u64: u64,
+}
+
+#[derive(Debug)]
+struct EpollWaiter {
+    fd: RawFd,
+}
+
+impl EpollWaiter {
+    fn new(socket_fd: RawFd) -> std::io::Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = socket_fd;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "epoll is only available on Linux",
+            ));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: epoll_create1 has no Rust aliasing requirements.
+            let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut event = libc::epoll_event {
+                events: epoll_read_events(),
+                u64: u64::try_from(socket_fd).unwrap_or(0),
+            };
+            // SAFETY: fd and socket_fd are valid file descriptors; event points
+            // to initialized memory for the duration of the syscall.
+            let rc = unsafe { libc::epoll_ctl(fd, libc::EPOLL_CTL_ADD, socket_fd, &raw mut event) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                // SAFETY: fd was returned by epoll_create1 above.
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(err);
+            }
+            Ok(Self { fd })
+        }
+    }
+
+    fn wait(&self, events: &mut [BenchEpollEvent], timeout_ms: i32) -> std::io::Result<usize> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (events, timeout_ms);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "epoll is only available on Linux",
+            ));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let maxevents = i32::try_from(events.len()).unwrap_or(i32::MAX);
+            // SAFETY: events points to writable memory for maxevents entries.
+            let rc =
+                unsafe { libc::epoll_wait(self.fd, events.as_mut_ptr(), maxevents, timeout_ms) };
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(usize::try_from(rc).unwrap_or(usize::MAX))
+        }
+    }
+}
+
+impl Drop for EpollWaiter {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        // SAFETY: fd is owned by this wrapper.
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn epoll_read_events() -> u32 {
+    u32::try_from(libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP).unwrap_or(u32::MAX)
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn epoll_read_events() -> u32 {
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn epoll_error_events() -> u32 {
+    u32::try_from(libc::EPOLLERR | libc::EPOLLHUP).unwrap_or(0)
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn epoll_error_events() -> u32 {
+    0
+}
+
+fn epoll_timeout_ms(deadline: Instant) -> i32 {
+    let now = Instant::now();
+    if now >= deadline {
+        return 0;
+    }
+    let millis = deadline.duration_since(now).as_millis().max(1);
+    i32::try_from(millis).unwrap_or(i32::MAX)
 }
 
 fn build_combined_path(cfg: &Config, stream_count: usize) -> BenchResult<String> {
@@ -1267,6 +1489,7 @@ fn print_usage() {
            --recv-mode MODE             multishot|multishot-bundle\n\
            --tls-provider PROVIDER      ring|aws-lc\n\
            --tls-cipher PREF            default|aes128|aes256|chacha\n\
+           --tungstenite-io MODE        blocking|epoll\n\
            --talaris-cpu N              pin talaris thread\n\
            --tungstenite-cpu N          pin tungstenite thread"
     );
