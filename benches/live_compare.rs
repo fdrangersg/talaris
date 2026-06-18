@@ -125,6 +125,7 @@ struct Config {
     tls_provider: talaris::tls::TlsCryptoProvider,
     tls_cipher: talaris::tls::TlsCipherPreference,
     tungstenite_io: TungsteniteIoMode,
+    tungstenite_spin_iters: usize,
     talaris_cpu: Option<usize>,
     tungstenite_cpu: Option<usize>,
 }
@@ -200,6 +201,7 @@ impl Config {
                 talaris::tls::TlsCipherPreference::ProviderDefault,
             ),
             tungstenite_io: common::arg_or("--tungstenite-io", TungsteniteIoMode::Blocking),
+            tungstenite_spin_iters: common::arg_or("--tungstenite-spin-iters", 0_usize),
             talaris_cpu: common::optional_arg("--talaris-cpu"),
             tungstenite_cpu: common::optional_arg("--tungstenite-cpu"),
         })
@@ -207,7 +209,7 @@ impl Config {
 
     fn print(&self) {
         println!(
-            "bench_config bench=live_compare transport={} endpoint={}:{} feed={} symbols={} stream_counts={:?} depth_speed={} redundancy_counts={:?} seconds={} sample_bps={} buf={}x{} sq_entries={} cq_entries={} setup_flags={:?} completion_batch={} spin_iters={} recv_mode={} tls_provider={} tls_cipher={} tungstenite_io={} talaris_cpu={} tungstenite_cpu={}",
+            "bench_config bench=live_compare transport={} endpoint={}:{} feed={} symbols={} stream_counts={:?} depth_speed={} redundancy_counts={:?} seconds={} sample_bps={} buf={}x{} sq_entries={} cq_entries={} setup_flags={:?} completion_batch={} spin_iters={} recv_mode={} tls_provider={} tls_cipher={} tungstenite_io={} tungstenite_spin_iters={} talaris_cpu={} tungstenite_cpu={}",
             self.transport.as_str(),
             self.host,
             self.port,
@@ -229,6 +231,7 @@ impl Config {
             self.tls_provider,
             self.tls_cipher,
             self.tungstenite_io.as_str(),
+            self.tungstenite_spin_iters,
             self.talaris_cpu
                 .map_or_else(|| "-".to_owned(), |cpu| cpu.to_string()),
             self.tungstenite_cpu
@@ -619,9 +622,12 @@ fn run_tungstenite_worker(
             let mut events = [BenchEpollEvent { events: 0, u64: 0 }; 8];
             let mut epoll_generation = 0_u64;
             while Instant::now() < deadline {
-                let timeout_ms = epoll_timeout_ms(deadline);
-                let ready = epoll.wait(&mut events, timeout_ms)?;
-                let epoll_ready_at = Instant::now();
+                let (ready, epoll_ready_at) = wait_tungstenite_epoll(
+                    &epoll,
+                    &mut events,
+                    cfg.tungstenite_spin_iters,
+                    deadline,
+                )?;
                 if ready == 0 {
                     continue;
                 }
@@ -1364,6 +1370,25 @@ fn epoll_timeout_ms(deadline: Instant) -> i32 {
     i32::try_from(millis).unwrap_or(i32::MAX)
 }
 
+fn wait_tungstenite_epoll(
+    epoll: &EpollWaiter,
+    events: &mut [BenchEpollEvent],
+    spin_iters: usize,
+    deadline: Instant,
+) -> std::io::Result<(usize, Instant)> {
+    for _ in 0..spin_iters {
+        let ready = epoll.wait(events, 0)?;
+        let ready_at = Instant::now();
+        if ready != 0 || ready_at >= deadline {
+            return Ok((ready, ready_at));
+        }
+        std::hint::spin_loop();
+    }
+
+    let ready = epoll.wait(events, epoll_timeout_ms(deadline))?;
+    Ok((ready, Instant::now()))
+}
+
 fn build_combined_path(cfg: &Config, stream_count: usize) -> BenchResult<String> {
     let paths =
         common::build_binance_paths(cfg.feed, &cfg.symbols, stream_count, &cfg.depth_speed)?;
@@ -1527,6 +1552,7 @@ fn print_usage() {
            --tls-provider PROVIDER      ring|aws-lc\n\
            --tls-cipher PREF            default|aes128|aes256|chacha\n\
            --tungstenite-io MODE        blocking|epoll\n\
+           --tungstenite-spin-iters N   epoll mode: timeout=0 polls before blocking\n\
            --talaris-cpu N              pin talaris thread\n\
            --tungstenite-cpu N          pin tungstenite thread"
     );
