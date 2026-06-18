@@ -202,6 +202,11 @@ impl Proactor {
         Ok(Self { ring })
     }
 
+    #[must_use]
+    pub fn supports_recvsend_bundle(&self) -> bool {
+        self.ring.params().is_feature_recvsend_bundle()
+    }
+
     /// 提交 connect。
     ///
     /// `flags` 用于 chain：传 [`SqeFlags::IO_LINK`] 让下一个 SQE 依赖本 op
@@ -372,6 +377,31 @@ impl Proactor {
             .build()
             .user_data(user_data.raw());
         // SAFETY: caller 保证 fd 有效；entry 自带 BUFFER_SELECT 标志
+        unsafe {
+            self.ring
+                .submission()
+                .push(&entry)
+                .map_err(|_| ProactorError::SqFull)?;
+        }
+        Ok(())
+    }
+
+    /// 提交 Linux 6.10+ multishot recv bundle。每个 CQE 可能覆盖从 CQE
+    /// `buffer_id` 开始的多个 provided buffers；`result` 是总字节数。
+    ///
+    /// # Safety
+    ///
+    /// `fd` 必须有效；`buf_group` 必须先用 [`Self::register_buf_ring`] 注册。
+    pub unsafe fn submit_recv_multishot_bundle(
+        &mut self,
+        fd: RawFd,
+        buf_group: u16,
+        user_data: UserData,
+    ) -> Result<(), ProactorError> {
+        let entry = opcode::RecvMultiBundle::new(Fd(fd), buf_group)
+            .build()
+            .user_data(user_data.raw());
+        // SAFETY: caller 保证 fd 有效；entry 自带 BUFFER_SELECT + bundle 标志
         unsafe {
             self.ring
                 .submission()

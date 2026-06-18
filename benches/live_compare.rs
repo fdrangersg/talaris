@@ -76,8 +76,10 @@ struct Config {
     transport: Transport,
     host: String,
     port: u16,
+    feed: common::BinanceFeed,
     symbols: Vec<String>,
     stream_counts: Vec<usize>,
+    depth_speed: String,
     redundancy_counts: Vec<usize>,
     seconds: u64,
     sample_bps: u16,
@@ -87,6 +89,10 @@ struct Config {
     cq_entries: u32,
     completion_batch: usize,
     spin_iters: usize,
+    recv_mode: talaris::connection::RecvMode,
+    setup_flags: talaris::proactor::ProactorSetupFlags,
+    tls_provider: talaris::tls::TlsCryptoProvider,
+    tls_cipher: talaris::tls::TlsCipherPreference,
     talaris_cpu: Option<usize>,
     tungstenite_cpu: Option<usize>,
 }
@@ -103,13 +109,10 @@ impl Config {
         common::validate_power_of_two_u32("--sq-entries", sq_entries)?;
         common::validate_power_of_two_u32("--cq-entries", cq_entries)?;
 
-        let symbols = common::arg_string("--symbols", "btcusdt,ethusdt,bnbusdt,solusdt")
-            .split(',')
-            .filter_map(|s| {
-                let symbol = s.trim().to_ascii_lowercase();
-                (!symbol.is_empty()).then_some(symbol)
-            })
-            .collect::<Vec<_>>();
+        let symbols = common::parse_symbols(&common::arg_string(
+            "--symbols",
+            "btcusdt,ethusdt,bnbusdt,solusdt",
+        ));
         if symbols.is_empty() {
             return Err("--symbols must contain at least one symbol".to_owned());
         }
@@ -138,8 +141,10 @@ impl Config {
             transport: common::arg_or("--transport", Transport::Both),
             host: common::arg_string("--host", "fstream.binance.com"),
             port: common::arg_or("--port", 443_u16),
+            feed: common::arg_or("--feed", common::BinanceFeed::Bbo),
             symbols,
             stream_counts,
+            depth_speed: common::arg_string("--depth-speed", "100ms"),
             redundancy_counts,
             seconds: common::arg_or("--seconds", 45_u64).max(1),
             sample_bps,
@@ -149,6 +154,19 @@ impl Config {
             cq_entries,
             completion_batch: common::arg_or("--completion-batch", 64_usize).max(1),
             spin_iters: common::arg_or("--spin-iters", 256_usize),
+            recv_mode: common::arg_or("--recv-mode", talaris::connection::RecvMode::Multishot),
+            setup_flags: common::parse_proactor_setup_flags(&common::arg_string(
+                "--setup-flags",
+                "none",
+            ))?,
+            tls_provider: common::arg_or(
+                "--tls-provider",
+                talaris::tls::TlsCryptoProvider::default(),
+            ),
+            tls_cipher: common::arg_or(
+                "--tls-cipher",
+                talaris::tls::TlsCipherPreference::ProviderDefault,
+            ),
             talaris_cpu: common::optional_arg("--talaris-cpu"),
             tungstenite_cpu: common::optional_arg("--tungstenite-cpu"),
         })
@@ -156,12 +174,14 @@ impl Config {
 
     fn print(&self) {
         println!(
-            "bench_config bench=live_compare transport={} endpoint={}:{} symbols={} stream_counts={:?} redundancy_counts={:?} seconds={} sample_bps={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} talaris_cpu={} tungstenite_cpu={}",
+            "bench_config bench=live_compare transport={} endpoint={}:{} feed={} symbols={} stream_counts={:?} depth_speed={} redundancy_counts={:?} seconds={} sample_bps={} buf={}x{} sq_entries={} cq_entries={} setup_flags={:?} completion_batch={} spin_iters={} recv_mode={} tls_provider={} tls_cipher={} talaris_cpu={} tungstenite_cpu={}",
             self.transport.as_str(),
             self.host,
             self.port,
+            self.feed.as_str(),
             self.symbols.join(","),
             self.stream_counts,
+            self.depth_speed,
             self.redundancy_counts,
             self.seconds,
             self.sample_bps,
@@ -169,8 +189,12 @@ impl Config {
             self.buf_size,
             self.sq_entries,
             self.cq_entries,
+            self.setup_flags,
             self.completion_batch,
             self.spin_iters,
+            self.recv_mode,
+            self.tls_provider,
+            self.tls_cipher,
             self.talaris_cpu
                 .map_or_else(|| "-".to_owned(), |cpu| cpu.to_string()),
             self.tungstenite_cpu
@@ -191,7 +215,7 @@ fn run() -> BenchResult<()> {
 
     for &stream_count in &cfg.stream_counts {
         for &redundancy_count in &cfg.redundancy_counts {
-            let path = build_combined_path(&cfg.symbols, stream_count);
+            let path = build_combined_path(&cfg, stream_count)?;
             println!(
                 "bench_live_compare_start streams={stream_count} redundancy={redundancy_count} path={path}"
             );
@@ -273,7 +297,7 @@ fn run_talaris(
         .talaris_cpu
         .map(|cpu| common::PinGuard::pin("talaris", cpu));
 
-    let conn_cfg = talaris_conn_config(&cfg, path);
+    let conn_cfg = talaris_conn_config(&cfg, path)?;
     let proactor_cfg = conn_cfg.proactor;
     let mut pool = talaris::Pool::new(
         talaris::PoolConfig::new(proactor_cfg).with_completion_batch_capacity(cfg.completion_batch),
@@ -281,7 +305,7 @@ fn run_talaris(
     let mut handles = Vec::with_capacity(redundancy_count);
     let mut ingress_before = Vec::with_capacity(redundancy_count);
     for _ in 0..redundancy_count {
-        let handle = pool.connect_blocking(talaris_conn_config(&cfg, path))?;
+        let handle = pool.connect_blocking(talaris_conn_config(&cfg, path)?)?;
         assert_eq!(pool.state(handle), Some(talaris::connection::State::Open));
         ingress_before.push(pool.ingress_stats(handle).unwrap_or_default());
         handles.push(handle);
@@ -316,16 +340,30 @@ fn run_talaris(
     })
 }
 
-fn talaris_conn_config(cfg: &Config, path: &str) -> talaris::connection::ConnectionConfig {
-    talaris::connection::ConnectionConfig::new(&cfg.host, cfg.port, path)
-        .with_sq_entries(cfg.sq_entries)
-        .with_cq_entries(cfg.cq_entries)
-        .with_buf_ring(cfg.buf_size, cfg.buf_entries)
-        .with_ws_limits(8 * 1024 * 1024, 16 * 1024 * 1024)
-        .with_ws_buffer_capacities(128 * 1024, 128 * 1024, 16 * 1024)
-        .with_ingress_stats(true)
-        .with_observability_sample_rate_bps(cfg.sample_bps)
-        .with_observability_histograms(false)
+fn talaris_conn_config(
+    cfg: &Config,
+    path: &str,
+) -> BenchResult<talaris::connection::ConnectionConfig> {
+    let tls_config = Arc::new(
+        talaris::tls::TlsAdapter::client_config_with_cipher_preference(
+            cfg.tls_provider,
+            cfg.tls_cipher,
+        )?,
+    );
+    Ok(
+        talaris::connection::ConnectionConfig::new(&cfg.host, cfg.port, path)
+            .with_tls_config(tls_config)
+            .with_sq_entries(cfg.sq_entries)
+            .with_cq_entries(cfg.cq_entries)
+            .with_proactor_setup_flags(cfg.setup_flags)
+            .with_recv_mode(cfg.recv_mode)
+            .with_buf_ring(cfg.buf_size, cfg.buf_entries)
+            .with_ws_limits(8 * 1024 * 1024, 16 * 1024 * 1024)
+            .with_ws_buffer_capacities(128 * 1024, 128 * 1024, 16 * 1024)
+            .with_ingress_stats(true)
+            .with_observability_sample_rate_bps(cfg.sample_bps)
+            .with_observability_histograms(false),
+    )
 }
 
 fn aggregate_ingress_delta(
@@ -477,9 +515,12 @@ fn connect_tungstenite_socket(
     tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(5)))?;
 
-    let tls_config = Arc::new(talaris::tls::TlsAdapter::client_config(
-        talaris::tls::TlsCryptoProvider::default(),
-    )?);
+    let tls_config = Arc::new(
+        talaris::tls::TlsAdapter::client_config_with_cipher_preference(
+            cfg.tls_provider,
+            cfg.tls_cipher,
+        )?,
+    );
     let server_name = rustls::pki_types::ServerName::try_from(cfg.host.clone())
         .map_err(|_| format!("invalid server name {:?}", cfg.host))?;
     let mut tls_conn = rustls::ClientConnection::new(tls_config, server_name)?;
@@ -1064,16 +1105,13 @@ struct ReadMarker {
     read_at: Instant,
 }
 
-fn build_combined_path(symbols: &[String], stream_count: usize) -> String {
-    let mut path = String::from("/stream?streams=");
-    for (index, symbol) in symbols.iter().take(stream_count).enumerate() {
-        if index > 0 {
-            path.push('/');
-        }
-        path.push_str(symbol);
-        path.push_str("@bookTicker");
+fn build_combined_path(cfg: &Config, stream_count: usize) -> BenchResult<String> {
+    let paths =
+        common::build_binance_paths(cfg.feed, &cfg.symbols, stream_count, &cfg.depth_speed)?;
+    match paths.as_slice() {
+        [path] => Ok(path.clone()),
+        _ => Err("--feed depth-trade builds multiple routed paths; use live_pipeline for mixed-feed Pool/io_uring runs".into()),
     }
-    path
 }
 
 fn verify_alpn(conn: &rustls::ClientConnection) -> BenchResult<()> {
@@ -1206,14 +1244,16 @@ fn print_usage() {
     println!(
         "live_compare bench\n\
          \n\
-         Runs talaris and tungstenite concurrently against Binance USD-M futures combined BBO streams.\n\
+         Runs talaris and tungstenite concurrently against Binance USD-M futures combined streams.\n\
          \n\
          Args:\n\
            --transport talaris|tungstenite|both\n\
            --host HOST                  websocket host\n\
            --port PORT                  websocket TLS port\n\
+           --feed bbo|depth|trade       Binance feed class; depth-trade belongs in live_pipeline\n\
            --symbols a,b,c,d            symbols used to build combined streams\n\
            --stream-counts A,B,C        number of symbols per scenario\n\
+           --depth-speed default|100ms|250ms|500ms\n\
            --redundancy-counts A,B,C    identical connections per client and scenario\n\
            --seconds N                  run duration per scenario\n\
            --sample-bps N               talaris observability sample rate, 0..10000\n\
@@ -1221,8 +1261,12 @@ fn print_usage() {
            --buf-entries N              provided buffer entries, power of two\n\
            --sq-entries N               io_uring SQ entries, power of two\n\
            --cq-entries N               io_uring CQ entries, power of two\n\
+           --setup-flags LIST           none|coop|taskrun|single|defer, comma or + separated\n\
            --completion-batch N         Pool CQE scratch buffer capacity\n\
            --spin-iters N               0 uses blocking talaris pump_data_marked\n\
+           --recv-mode MODE             multishot|multishot-bundle\n\
+           --tls-provider PROVIDER      ring|aws-lc\n\
+           --tls-cipher PREF            default|aes128|aes256|chacha\n\
            --talaris-cpu N              pin talaris thread\n\
            --tungstenite-cpu N          pin tungstenite thread"
     );
