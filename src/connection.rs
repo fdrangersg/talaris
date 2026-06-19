@@ -196,6 +196,9 @@ pub struct ConnectionConfig {
     /// io_uring recv opcode variant. Default is classic multishot recv; bundle
     /// is Linux 6.10+ and should be A/B tested per feed.
     pub recv_mode: RecvMode,
+    /// Per-socket Linux `SO_BUSY_POLL` budget in microseconds. `None` leaves the
+    /// socket default untouched; this is an opt-in low-latency experiment.
+    pub socket_busy_poll_usecs: Option<u32>,
     /// `send_buf` 初始容量。`None` 表示沿用 `buf_ring_slot_size`。
     ///
     /// 这是 socket/TLS outbound staging buffer；真实 pending 字节仍会按需 grow。
@@ -234,6 +237,7 @@ impl ConnectionConfig {
             buf_ring_entries: DEFAULT_BUF_RING_ENTRIES,
             ws_config: None,
             recv_mode: RecvMode::Multishot,
+            socket_busy_poll_usecs: None,
             send_buffer_initial_capacity: None,
             tls_pending_out_initial_capacity: None,
             plain_recv_batch_copy_max_bytes: 0,
@@ -338,6 +342,12 @@ impl ConnectionConfig {
     #[must_use]
     pub const fn with_recv_mode(mut self, mode: RecvMode) -> Self {
         self.recv_mode = mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_socket_busy_poll_usecs(mut self, usecs: u32) -> Self {
+        self.socket_busy_poll_usecs = Some(usecs);
         self
     }
 

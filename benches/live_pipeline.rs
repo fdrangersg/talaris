@@ -50,6 +50,7 @@ struct Config {
     completion_batch: usize,
     spin_iters: usize,
     recv_mode: talaris::connection::RecvMode,
+    socket_busy_poll_usecs: Option<u32>,
     setup_flags: talaris::proactor::ProactorSetupFlags,
     tls_provider: talaris::tls::TlsCryptoProvider,
     tls_cipher: talaris::tls::TlsCipherPreference,
@@ -112,6 +113,7 @@ impl Config {
             completion_batch: common::arg_or("--completion-batch", 64_usize).max(1),
             spin_iters: common::arg_or("--spin-iters", 256_usize),
             recv_mode: common::arg_or("--recv-mode", talaris::connection::RecvMode::Multishot),
+            socket_busy_poll_usecs: common::optional_arg("--socket-busy-poll-usecs"),
             setup_flags: common::parse_proactor_setup_flags(&common::arg_string(
                 "--setup-flags",
                 "none",
@@ -136,7 +138,7 @@ impl Config {
 
     fn print(&self) {
         println!(
-            "bench_config bench=live_pipeline endpoint={}:{} paths={} feed={} symbols={} stream_count={} depth_speed={} seconds={} sample_bps={} histograms={} buf={}x{} sq_entries={} cq_entries={} setup_flags={:?} completion_batch={} spin_iters={} recv_mode={} tls_provider={} tls_cipher={} metrics_interval_ms={} subscribe={} prom_out={}",
+            "bench_config bench=live_pipeline endpoint={}:{} paths={} feed={} symbols={} stream_count={} depth_speed={} seconds={} sample_bps={} histograms={} buf={}x{} sq_entries={} cq_entries={} setup_flags={:?} completion_batch={} spin_iters={} recv_mode={} socket_busy_poll_usecs={} tls_provider={} tls_cipher={} metrics_interval_ms={} subscribe={} prom_out={}",
             self.host,
             self.port,
             self.paths.join(","),
@@ -155,6 +157,8 @@ impl Config {
             self.completion_batch,
             self.spin_iters,
             self.recv_mode,
+            self.socket_busy_poll_usecs
+                .map_or_else(|| "-".to_owned(), |usecs| usecs.to_string()),
             self.tls_provider,
             self.tls_cipher,
             self.metrics_interval.as_millis(),
@@ -231,7 +235,7 @@ fn conn_config(
     path: &str,
     tls_config: Arc<rustls::ClientConfig>,
 ) -> talaris::connection::ConnectionConfig {
-    talaris::connection::ConnectionConfig::new(&cfg.host, cfg.port, path)
+    let mut conn_cfg = talaris::connection::ConnectionConfig::new(&cfg.host, cfg.port, path)
         .with_tls_config(tls_config)
         .with_sq_entries(cfg.sq_entries)
         .with_cq_entries(cfg.cq_entries)
@@ -242,7 +246,11 @@ fn conn_config(
         .with_ws_buffer_capacities(128 * 1024, 128 * 1024, 16 * 1024)
         .with_ingress_stats(true)
         .with_observability_sample_rate_bps(cfg.sample_bps)
-        .with_observability_histograms(cfg.histograms)
+        .with_observability_histograms(cfg.histograms);
+    if let Some(usecs) = cfg.socket_busy_poll_usecs {
+        conn_cfg = conn_cfg.with_socket_busy_poll_usecs(usecs);
+    }
+    conn_cfg
 }
 
 fn pump_marked(
@@ -299,6 +307,7 @@ fn print_usage() {
            --completion-batch N      Pool CQE scratch buffer capacity\n\
            --spin-iters N            0 uses blocking pump_data_marked\n\
            --recv-mode MODE          multishot|multishot-bundle\n\
+           --socket-busy-poll-usecs N  set Linux SO_BUSY_POLL on talaris sockets\n\
            --tls-provider PROVIDER   ring|aws-lc\n\
            --tls-cipher PREF         default|aes128|aes256|chacha\n\
            --metrics-interval-ms N   write interval Prometheus snapshots, 0 disables periodic snapshots\n\

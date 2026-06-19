@@ -89,6 +89,9 @@ impl ConnectionState {
         };
         let socket = TcpSocket::new(domain)?;
         socket.set_nodelay(true)?;
+        if let Some(usecs) = cfg.socket_busy_poll_usecs {
+            socket.set_busy_poll(usecs)?;
+        }
 
         let tls = if cfg.use_tls {
             Some(match cfg.tls_config.clone() {

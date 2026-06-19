@@ -121,6 +121,7 @@ struct Config {
     completion_batch: usize,
     spin_iters: usize,
     recv_mode: talaris::connection::RecvMode,
+    socket_busy_poll_usecs: Option<u32>,
     setup_flags: talaris::proactor::ProactorSetupFlags,
     tls_provider: talaris::tls::TlsCryptoProvider,
     tls_cipher: talaris::tls::TlsCipherPreference,
@@ -188,6 +189,7 @@ impl Config {
             completion_batch: common::arg_or("--completion-batch", 64_usize).max(1),
             spin_iters: common::arg_or("--spin-iters", 256_usize),
             recv_mode: common::arg_or("--recv-mode", talaris::connection::RecvMode::Multishot),
+            socket_busy_poll_usecs: common::optional_arg("--socket-busy-poll-usecs"),
             setup_flags: common::parse_proactor_setup_flags(&common::arg_string(
                 "--setup-flags",
                 "none",
@@ -209,7 +211,7 @@ impl Config {
 
     fn print(&self) {
         println!(
-            "bench_config bench=live_compare transport={} endpoint={}:{} feed={} symbols={} stream_counts={:?} depth_speed={} redundancy_counts={:?} seconds={} sample_bps={} buf={}x{} sq_entries={} cq_entries={} setup_flags={:?} completion_batch={} spin_iters={} recv_mode={} tls_provider={} tls_cipher={} tungstenite_io={} tungstenite_spin_iters={} talaris_cpu={} tungstenite_cpu={}",
+            "bench_config bench=live_compare transport={} endpoint={}:{} feed={} symbols={} stream_counts={:?} depth_speed={} redundancy_counts={:?} seconds={} sample_bps={} buf={}x{} sq_entries={} cq_entries={} setup_flags={:?} completion_batch={} spin_iters={} recv_mode={} socket_busy_poll_usecs={} tls_provider={} tls_cipher={} tungstenite_io={} tungstenite_spin_iters={} talaris_cpu={} tungstenite_cpu={}",
             self.transport.as_str(),
             self.host,
             self.port,
@@ -228,6 +230,8 @@ impl Config {
             self.completion_batch,
             self.spin_iters,
             self.recv_mode,
+            self.socket_busy_poll_usecs
+                .map_or_else(|| "-".to_owned(), |usecs| usecs.to_string()),
             self.tls_provider,
             self.tls_cipher,
             self.tungstenite_io.as_str(),
@@ -387,20 +391,22 @@ fn talaris_conn_config(
             cfg.tls_cipher,
         )?,
     );
-    Ok(
-        talaris::connection::ConnectionConfig::new(&cfg.host, cfg.port, path)
-            .with_tls_config(tls_config)
-            .with_sq_entries(cfg.sq_entries)
-            .with_cq_entries(cfg.cq_entries)
-            .with_proactor_setup_flags(cfg.setup_flags)
-            .with_recv_mode(cfg.recv_mode)
-            .with_buf_ring(cfg.buf_size, cfg.buf_entries)
-            .with_ws_limits(8 * 1024 * 1024, 16 * 1024 * 1024)
-            .with_ws_buffer_capacities(128 * 1024, 128 * 1024, 16 * 1024)
-            .with_ingress_stats(true)
-            .with_observability_sample_rate_bps(cfg.sample_bps)
-            .with_observability_histograms(false),
-    )
+    let mut conn_cfg = talaris::connection::ConnectionConfig::new(&cfg.host, cfg.port, path)
+        .with_tls_config(tls_config)
+        .with_sq_entries(cfg.sq_entries)
+        .with_cq_entries(cfg.cq_entries)
+        .with_proactor_setup_flags(cfg.setup_flags)
+        .with_recv_mode(cfg.recv_mode)
+        .with_buf_ring(cfg.buf_size, cfg.buf_entries)
+        .with_ws_limits(8 * 1024 * 1024, 16 * 1024 * 1024)
+        .with_ws_buffer_capacities(128 * 1024, 128 * 1024, 16 * 1024)
+        .with_ingress_stats(true)
+        .with_observability_sample_rate_bps(cfg.sample_bps)
+        .with_observability_histograms(false);
+    if let Some(usecs) = cfg.socket_busy_poll_usecs {
+        conn_cfg = conn_cfg.with_socket_busy_poll_usecs(usecs);
+    }
+    Ok(conn_cfg)
 }
 
 fn aggregate_ingress_delta(
@@ -1555,6 +1561,7 @@ fn print_usage() {
            --completion-batch N         Pool CQE scratch buffer capacity\n\
            --spin-iters N               0 uses blocking talaris pump_data_marked\n\
            --recv-mode MODE             multishot|multishot-bundle\n\
+           --socket-busy-poll-usecs N   set Linux SO_BUSY_POLL on talaris sockets\n\
            --tls-provider PROVIDER      ring|aws-lc\n\
            --tls-cipher PREF            default|aes128|aes256|chacha\n\
            --tungstenite-io MODE        blocking|epoll\n\

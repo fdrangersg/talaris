@@ -234,6 +234,10 @@ impl TcpSocket {
         unimplemented!("{STUB_PANIC}")
     }
 
+    pub fn set_busy_poll(&self, _usecs: u32) -> io::Result<()> {
+        unimplemented!("{STUB_PANIC}")
+    }
+
     pub fn set_reuseaddr(&self, _on: bool) -> io::Result<()> {
         unimplemented!("{STUB_PANIC}")
     }
