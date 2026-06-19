@@ -100,6 +100,7 @@ struct Config {
     cq_entries: u32,
     completion_batch: usize,
     spin_iters: usize,
+    batch_sink: bool,
     metrics_interval: std::time::Duration,
     prom_out: Option<String>,
     user_cpu: Option<usize>,
@@ -141,6 +142,7 @@ impl Config {
             cq_entries,
             completion_batch: common::arg_or("--completion-batch", 64_usize).max(1),
             spin_iters: common::arg_or("--spin-iters", 256_usize),
+            batch_sink: common::flag_present("--batch-sink"),
             metrics_interval: std::time::Duration::from_millis(common::arg_or(
                 "--metrics-interval-ms",
                 1000_u64,
@@ -153,7 +155,7 @@ impl Config {
 
     fn print(&self) {
         println!(
-            "bench_config bench=local_pipeline mode={} seconds={} messages={} payload_profile={} payload={} actual_payload={} frames_per_write={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} sample_bps={} histograms={} metrics_interval_ms={} prom_out={}",
+            "bench_config bench=local_pipeline mode={} seconds={} messages={} payload_profile={} payload={} actual_payload={} frames_per_write={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} batch_sink={} sample_bps={} histograms={} metrics_interval_ms={} prom_out={}",
             self.mode.as_str(),
             self.seconds,
             self.messages,
@@ -167,6 +169,7 @@ impl Config {
             self.cq_entries,
             self.completion_batch,
             self.spin_iters,
+            self.batch_sink,
             self.mode.sample_bps(),
             self.mode.histograms(),
             self.metrics_interval.as_millis(),
@@ -217,7 +220,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     while should_continue(&cfg, &stats, started.elapsed()) {
         if cfg.mode.marked() {
-            pump_marked(&mut pool, cfg.spin_iters, &mut stats)?;
+            if cfg.batch_sink {
+                pump_marked_batches(&mut pool, cfg.spin_iters, &mut stats)?;
+            } else {
+                pump_marked(&mut pool, cfg.spin_iters, &mut stats)?;
+            }
+        } else if cfg.batch_sink {
+            pump_unmarked_batches(&mut pool, cfg.spin_iters, &mut stats)?;
         } else {
             pump_unmarked(&mut pool, cfg.spin_iters, &mut stats)?;
         }
@@ -280,10 +289,49 @@ fn pump_marked(
     }
 }
 
+fn pump_unmarked_batches(
+    pool: &mut talaris::Pool,
+    spin_iters: usize,
+    stats: &mut common::MessageStats,
+) -> Result<(), talaris::connection::ConnectionError> {
+    if spin_iters == 0 {
+        pool.pump_data_batches(|_, batch| record_unmarked_batch(stats, &batch))
+    } else {
+        pool.pump_data_spin_batches(spin_iters, |_, batch| {
+            record_unmarked_batch(stats, &batch);
+        })
+        .map(|_| ())
+    }
+}
+
+fn pump_marked_batches(
+    pool: &mut talaris::Pool,
+    spin_iters: usize,
+    stats: &mut common::MessageStats,
+) -> Result<(), talaris::connection::ConnectionError> {
+    if spin_iters == 0 {
+        pool.pump_data_marked_batches(|_, batch| record_marked_batch(stats, &batch))
+    } else {
+        pool.pump_data_spin_marked_batches(spin_iters, |_, batch| {
+            record_marked_batch(stats, &batch);
+        })
+        .map(|_| ())
+    }
+}
+
 fn record_unmarked_event(stats: &mut common::MessageStats, ev: &talaris::ws::DataEvent<'_>) {
     match ev {
         talaris::ws::DataEvent::Text(payload) => stats.record_text(payload),
         talaris::ws::DataEvent::Binary(payload) => stats.record_binary(payload),
+    }
+}
+
+fn record_unmarked_batch(
+    stats: &mut common::MessageStats,
+    batch: &talaris::ws::DataEventBatch<'_>,
+) {
+    for ev in batch.iter() {
+        record_unmarked_event(stats, &ev);
     }
 }
 
@@ -297,6 +345,15 @@ fn record_marked_event(stats: &mut common::MessageStats, ev: &talaris::ws::Marke
             stats.record_meta(*meta);
             stats.record_binary(payload);
         }
+    }
+}
+
+fn record_marked_batch(
+    stats: &mut common::MessageStats,
+    batch: &talaris::ws::MarkedDataEventBatch<'_>,
+) {
+    for ev in batch.iter() {
+        record_marked_event(stats, &ev);
     }
 }
 
@@ -324,6 +381,7 @@ fn print_usage() {
            --cq-entries N            io_uring CQ entries, power of two\n\
            --completion-batch N      Pool CQE scratch buffer capacity\n\
            --spin-iters N            0 uses blocking pump_data(_marked)\n\
+           --batch-sink              use experimental chunk/batch sink API\n\
            --metrics-interval-ms N   write interval Prometheus snapshots, 0 disables periodic snapshots\n\
            --prom-out PATH|-         write Prometheus snapshots to file or stdout\n\
            --user-cpu N              pin benchmark thread\n\

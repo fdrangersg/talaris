@@ -49,6 +49,7 @@ struct Config {
     cq_entries: u32,
     completion_batch: usize,
     spin_iters: usize,
+    batch_sink: bool,
     recv_mode: talaris::connection::RecvMode,
     socket_busy_poll_usecs: Option<u32>,
     setup_flags: talaris::proactor::ProactorSetupFlags,
@@ -112,6 +113,7 @@ impl Config {
             cq_entries,
             completion_batch: common::arg_or("--completion-batch", 64_usize).max(1),
             spin_iters: common::arg_or("--spin-iters", 256_usize),
+            batch_sink: common::flag_present("--batch-sink"),
             recv_mode: common::arg_or("--recv-mode", talaris::connection::RecvMode::Multishot),
             socket_busy_poll_usecs: common::optional_arg("--socket-busy-poll-usecs"),
             setup_flags: common::parse_proactor_setup_flags(&common::arg_string(
@@ -138,7 +140,7 @@ impl Config {
 
     fn print(&self) {
         println!(
-            "bench_config bench=live_pipeline endpoint={}:{} paths={} feed={} symbols={} stream_count={} depth_speed={} seconds={} sample_bps={} histograms={} buf={}x{} sq_entries={} cq_entries={} setup_flags={:?} completion_batch={} spin_iters={} recv_mode={} socket_busy_poll_usecs={} tls_provider={} tls_cipher={} metrics_interval_ms={} subscribe={} prom_out={}",
+            "bench_config bench=live_pipeline endpoint={}:{} paths={} feed={} symbols={} stream_count={} depth_speed={} seconds={} sample_bps={} histograms={} buf={}x{} sq_entries={} cq_entries={} setup_flags={:?} completion_batch={} spin_iters={} batch_sink={} recv_mode={} socket_busy_poll_usecs={} tls_provider={} tls_cipher={} metrics_interval_ms={} subscribe={} prom_out={}",
             self.host,
             self.port,
             self.paths.join(","),
@@ -156,6 +158,7 @@ impl Config {
             self.setup_flags,
             self.completion_batch,
             self.spin_iters,
+            self.batch_sink,
             self.recv_mode,
             self.socket_busy_poll_usecs
                 .map_or_else(|| "-".to_owned(), |usecs| usecs.to_string()),
@@ -215,14 +218,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut metrics_schedule = common::MetricsSchedule::new(started, cfg.metrics_interval);
 
     while std::time::Instant::now() < deadline {
-        pump_marked(&mut pool, cfg.spin_iters, &mut stats)?;
+        if cfg.batch_sink {
+            pump_marked_batches(&mut pool, cfg.spin_iters, &mut stats)?;
+        } else {
+            pump_marked(&mut pool, cfg.spin_iters, &mut stats)?;
+        }
         metrics_schedule.write_due(&mut prom, "live_pipeline", &mut pool, started)?;
     }
 
     let elapsed = started.elapsed();
     let cpu_elapsed = cpu.elapsed();
     common::MetricsSchedule::write_final(&mut prom, "live_pipeline", &mut pool, elapsed)?;
-    common::print_result("live_pipeline", "marked", &stats, elapsed, cpu_elapsed);
+    let mode = if cfg.batch_sink {
+        "marked_batch"
+    } else {
+        "marked"
+    };
+    common::print_result("live_pipeline", mode, &stats, elapsed, cpu_elapsed);
     common::print_marked_summary(&stats);
     for &handle in &handles {
         common::print_ingress_stats(handle, pool.ingress_stats(handle));
@@ -266,6 +278,21 @@ fn pump_marked(
     }
 }
 
+fn pump_marked_batches(
+    pool: &mut talaris::Pool,
+    spin_iters: usize,
+    stats: &mut common::MessageStats,
+) -> Result<(), talaris::connection::ConnectionError> {
+    if spin_iters == 0 {
+        pool.pump_data_marked_batches(|_, batch| record_marked_batch(stats, &batch))
+    } else {
+        pool.pump_data_spin_marked_batches(spin_iters, |_, batch| {
+            record_marked_batch(stats, &batch);
+        })
+        .map(|_| ())
+    }
+}
+
 fn record_marked_event(stats: &mut common::MessageStats, ev: &talaris::ws::MarkedDataEvent<'_>) {
     match ev {
         talaris::ws::MarkedDataEvent::Text { payload, meta } => {
@@ -276,6 +303,15 @@ fn record_marked_event(stats: &mut common::MessageStats, ev: &talaris::ws::Marke
             stats.record_meta(*meta);
             stats.record_binary(payload);
         }
+    }
+}
+
+fn record_marked_batch(
+    stats: &mut common::MessageStats,
+    batch: &talaris::ws::MarkedDataEventBatch<'_>,
+) {
+    for ev in batch.iter() {
+        record_marked_event(stats, &ev);
     }
 }
 
@@ -306,6 +342,7 @@ fn print_usage() {
            --setup-flags LIST        none|coop|taskrun|single|defer, comma or + separated\n\
            --completion-batch N      Pool CQE scratch buffer capacity\n\
            --spin-iters N            0 uses blocking pump_data_marked\n\
+           --batch-sink              use experimental chunk/batch sink API\n\
            --recv-mode MODE          multishot|multishot-bundle\n\
            --socket-busy-poll-usecs N  set Linux SO_BUSY_POLL on talaris sockets\n\
            --tls-provider PROVIDER   ring|aws-lc\n\

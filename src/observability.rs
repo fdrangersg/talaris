@@ -614,8 +614,11 @@ impl DataEventMeta {
     }
 }
 
+/// Maximum number of marked events delivered in one batch sink call.
+pub const MARKED_DATA_EVENT_BATCH_CAPACITY: usize = 32;
+
 /// Data-only WebSocket event carrying transport timing metadata.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum MarkedDataEvent<'a> {
     Text {
         payload: &'a str,
@@ -634,6 +637,88 @@ impl MarkedDataEvent<'_> {
         match self {
             Self::Text { meta, .. } | Self::Binary { meta, .. } => *meta,
         }
+    }
+}
+
+/// Fixed-capacity view of marked WebSocket data events delivered together.
+#[derive(Debug)]
+pub struct MarkedDataEventBatch<'a> {
+    events: [Option<MarkedDataEvent<'a>>; MARKED_DATA_EVENT_BATCH_CAPACITY],
+    len: usize,
+}
+
+impl<'a> MarkedDataEventBatch<'a> {
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self {
+            events: [None; MARKED_DATA_EVENT_BATCH_CAPACITY],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn single(event: MarkedDataEvent<'a>) -> Self {
+        let mut batch = Self::new();
+        let pushed = batch.push(event);
+        debug_assert!(pushed);
+        batch
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, event: MarkedDataEvent<'a>) -> bool {
+        if self.is_full() {
+            return false;
+        }
+        self.events[self.len] = Some(event);
+        self.len += 1;
+        true
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_full(&self) -> bool {
+        self.len == MARKED_DATA_EVENT_BATCH_CAPACITY
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        MARKED_DATA_EVENT_BATCH_CAPACITY
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = MarkedDataEvent<'a>> + '_ {
+        self.events[..self.len].iter().map(|event| match event {
+            Some(event) => *event,
+            None => unreachable!("marked data event batch contains only initialized slots"),
+        })
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn text_count(&self) -> usize {
+        self.iter()
+            .filter(|event| matches!(event, MarkedDataEvent::Text { .. }))
+            .count()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn binary_count(&self) -> usize {
+        self.len() - self.text_count()
     }
 }
 

@@ -33,7 +33,9 @@ use super::mask::mask_inplace;
 use super::parser::{FeedOutcome, FrameEvent, FrameParser};
 use crate::cursor_buf::CursorBuf;
 use crate::http::{HttpError, parse_response};
-use crate::observability::{DataEventMeta, MarkedDataEvent, monotonic_nanos_now};
+use crate::observability::{
+    DataEventMeta, MarkedDataEvent, MarkedDataEventBatch, monotonic_nanos_now,
+};
 use thiserror::Error;
 
 /// 默认单条 message 最大长度（fragmented 累计）：8 MiB。
@@ -188,12 +190,97 @@ pub enum Event<'a> {
 }
 
 /// 只包含业务 data message 的轻量事件。
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum DataEvent<'a> {
     /// 完整 text 消息（UTF-8 已校验，或由 unsafe config 显式承诺）
     Text(&'a str),
     /// 完整 binary 消息
     Binary(&'a [u8]),
+}
+
+/// Maximum number of events delivered in one batch sink call.
+pub const DATA_EVENT_BATCH_CAPACITY: usize = 32;
+
+/// Fixed-capacity view of WebSocket data events delivered together.
+#[derive(Debug)]
+pub struct DataEventBatch<'a> {
+    events: [Option<DataEvent<'a>>; DATA_EVENT_BATCH_CAPACITY],
+    len: usize,
+}
+
+impl<'a> DataEventBatch<'a> {
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self {
+            events: [None; DATA_EVENT_BATCH_CAPACITY],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn single(event: DataEvent<'a>) -> Self {
+        let mut batch = Self::new();
+        let pushed = batch.push(event);
+        debug_assert!(pushed);
+        batch
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, event: DataEvent<'a>) -> bool {
+        if self.is_full() {
+            return false;
+        }
+        self.events[self.len] = Some(event);
+        self.len += 1;
+        true
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_full(&self) -> bool {
+        self.len == DATA_EVENT_BATCH_CAPACITY
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        DATA_EVENT_BATCH_CAPACITY
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = DataEvent<'a>> + '_ {
+        self.events[..self.len].iter().map(|event| match event {
+            Some(event) => *event,
+            None => unreachable!("data event batch contains only initialized slots"),
+        })
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn text_count(&self) -> usize {
+        self.iter()
+            .filter(|event| matches!(event, DataEvent::Text(_)))
+            .count()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn binary_count(&self) -> usize {
+        self.len() - self.text_count()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -364,6 +451,52 @@ fn emit_marked_binary<'a, F>(
         meta.sampled,
         chunk_prior_sink_service_nanos,
     );
+}
+
+#[inline]
+fn emit_marked_event_batch<'a, F>(
+    sink: &mut F,
+    batch: MarkedDataEventBatch<'a>,
+    sampled: bool,
+    chunk_prior_sink_service_nanos: &mut u64,
+) where
+    F: FnMut(MarkedDataEventBatch<'a>),
+{
+    let sink_started = sampled.then(monotonic_nanos_now);
+    sink(batch);
+    if let Some(sink_started) = sink_started {
+        let service_nanos = monotonic_nanos_now().saturating_sub(sink_started);
+        *chunk_prior_sink_service_nanos =
+            chunk_prior_sink_service_nanos.saturating_add(service_nanos);
+    }
+}
+
+#[inline]
+fn flush_data_event_batch<'a, F>(batch: &mut DataEventBatch<'a>, sink: &mut F)
+where
+    F: FnMut(DataEventBatch<'a>),
+{
+    if batch.is_empty() {
+        return;
+    }
+    let ready = std::mem::replace(batch, DataEventBatch::new());
+    sink(ready);
+}
+
+#[inline]
+fn flush_marked_data_event_batch<'a, F>(
+    batch: &mut MarkedDataEventBatch<'a>,
+    sink: &mut F,
+    sampled: bool,
+    chunk_prior_sink_service_nanos: &mut u64,
+) where
+    F: FnMut(MarkedDataEventBatch<'a>),
+{
+    if batch.is_empty() {
+        return;
+    }
+    let ready = std::mem::replace(batch, MarkedDataEventBatch::new());
+    emit_marked_event_batch(sink, ready, sampled, chunk_prior_sink_service_nanos);
 }
 
 impl WsClient {
@@ -650,6 +783,55 @@ impl WsClient {
         self.drain_data_events(sink)
     }
 
+    /// Drain WS data messages in fixed-capacity batches.
+    ///
+    /// This experimental API preserves the same protocol behavior as
+    /// [`Self::drain_data_events`], but surfaces data payloads through fewer
+    /// sink calls. Non-direct fallback paths may still produce one-event
+    /// batches.
+    pub fn drain_data_event_batches<F>(&mut self, mut sink: F) -> Result<usize, WsError>
+    where
+        F: for<'a> FnMut(DataEventBatch<'a>),
+    {
+        self.drain_data_events(|ev| sink(DataEventBatch::single(ev)))
+    }
+
+    /// Feed a newly-arrived plaintext chunk and drain data messages in batches.
+    pub fn drain_data_event_batches_from_ingress<F>(
+        &mut self,
+        bytes: &[u8],
+        mut sink: F,
+    ) -> Result<usize, WsError>
+    where
+        F: for<'a> FnMut(DataEventBatch<'a>),
+    {
+        self.clear_after_emit();
+        if bytes.is_empty() {
+            return self.drain_data_event_batches(sink);
+        }
+
+        if self.can_drain_ingress_directly() {
+            let (events, consumed, result) =
+                self.try_drain_ingress_data_event_batches(bytes, &mut sink)?;
+            match result {
+                DirectDataResult::Drained => return Ok(events),
+                DirectDataResult::WaitForMore => {
+                    self.recv_buf.extend_from_slice(&bytes[consumed..]);
+                    return Ok(events);
+                }
+                DirectDataResult::Fallback => {
+                    self.recv_buf.extend_from_slice(&bytes[consumed..]);
+                    return self
+                        .drain_data_event_batches(&mut sink)
+                        .map(|fallback_events| events + fallback_events);
+                }
+            }
+        }
+
+        self.feed_recv(bytes);
+        self.drain_data_event_batches(sink)
+    }
+
     /// Same as [`Self::drain_data_events`], but each Text/Binary payload carries
     /// caller-supplied transport timing metadata.
     ///
@@ -672,6 +854,53 @@ impl WsClient {
             &mut message_sequence,
             &mut chunk_prior_sink_service_nanos,
             &mut sink,
+        )
+    }
+
+    /// Marked variant of [`Self::drain_data_event_batches`].
+    ///
+    /// Batch delivery shifts the sink boundary from one callback per message to
+    /// one callback per batch. `chunk_prior_sink_service_nanos` is therefore
+    /// accumulated between batch callbacks; messages in the same batch share
+    /// the same prior sink service value. Use the per-message marked API when
+    /// measuring strict intra-batch per-message sink queuing.
+    pub fn drain_data_event_batches_marked<F>(
+        &mut self,
+        base_meta: DataEventMeta,
+        mut sink: F,
+    ) -> Result<usize, WsError>
+    where
+        F: for<'a> FnMut(MarkedDataEventBatch<'a>),
+    {
+        let mut message_index = 0_u16;
+        let mut message_sequence = base_meta.message_sequence;
+        let mut chunk_prior_sink_service_nanos = 0_u64;
+        self.drain_data_event_batches_marked_from_index(
+            base_meta,
+            &mut message_index,
+            &mut message_sequence,
+            &mut chunk_prior_sink_service_nanos,
+            &mut sink,
+        )
+    }
+
+    fn drain_data_event_batches_marked_from_index<F>(
+        &mut self,
+        base_meta: DataEventMeta,
+        message_index: &mut u16,
+        message_sequence: &mut u64,
+        chunk_prior_sink_service_nanos: &mut u64,
+        mut sink: F,
+    ) -> Result<usize, WsError>
+    where
+        F: FnMut(MarkedDataEventBatch<'_>),
+    {
+        self.drain_data_events_marked_from_index(
+            base_meta,
+            message_index,
+            message_sequence,
+            chunk_prior_sink_service_nanos,
+            |ev| sink(MarkedDataEventBatch::single(ev)),
         )
     }
 
@@ -818,6 +1047,95 @@ impl WsClient {
         let mut message_index = 0_u16;
         let mut chunk_prior_sink_service_nanos = 0_u64;
         self.drain_data_events_marked_from_index(
+            base_meta,
+            &mut message_index,
+            message_sequence,
+            &mut chunk_prior_sink_service_nanos,
+            sink,
+        )
+    }
+
+    /// Marked variant of [`Self::drain_data_event_batches_from_ingress`].
+    ///
+    /// See [`Self::drain_data_event_batches_marked`] for batch observability
+    /// semantics.
+    pub fn drain_data_event_batches_from_ingress_marked<F>(
+        &mut self,
+        bytes: &[u8],
+        base_meta: DataEventMeta,
+        mut sink: F,
+    ) -> Result<usize, WsError>
+    where
+        F: for<'a> FnMut(MarkedDataEventBatch<'a>),
+    {
+        let mut message_sequence = base_meta.message_sequence;
+        self.drain_data_event_batches_from_ingress_marked_with_message_sequence(
+            bytes,
+            base_meta,
+            &mut message_sequence,
+            &mut sink,
+        )
+    }
+
+    pub(crate) fn drain_data_event_batches_from_ingress_marked_with_message_sequence<F>(
+        &mut self,
+        bytes: &[u8],
+        base_meta: DataEventMeta,
+        message_sequence: &mut u64,
+        mut sink: F,
+    ) -> Result<usize, WsError>
+    where
+        F: for<'a> FnMut(MarkedDataEventBatch<'a>),
+    {
+        self.clear_after_emit();
+        if bytes.is_empty() {
+            let mut message_index = 0_u16;
+            let mut chunk_prior_sink_service_nanos = 0_u64;
+            return self.drain_data_event_batches_marked_from_index(
+                base_meta,
+                &mut message_index,
+                message_sequence,
+                &mut chunk_prior_sink_service_nanos,
+                &mut sink,
+            );
+        }
+
+        if self.can_drain_ingress_directly() {
+            let mut message_index = 0_u16;
+            let mut chunk_prior_sink_service_nanos = 0_u64;
+            let (events, consumed, result) = self.try_drain_ingress_data_event_batches_marked(
+                bytes,
+                base_meta,
+                &mut message_index,
+                message_sequence,
+                &mut chunk_prior_sink_service_nanos,
+                &mut sink,
+            )?;
+            match result {
+                DirectDataResult::Drained => return Ok(events),
+                DirectDataResult::WaitForMore => {
+                    self.recv_buf.extend_from_slice(&bytes[consumed..]);
+                    return Ok(events);
+                }
+                DirectDataResult::Fallback => {
+                    self.recv_buf.extend_from_slice(&bytes[consumed..]);
+                    return self
+                        .drain_data_event_batches_marked_from_index(
+                            base_meta,
+                            &mut message_index,
+                            message_sequence,
+                            &mut chunk_prior_sink_service_nanos,
+                            &mut sink,
+                        )
+                        .map(|fallback_events| events + fallback_events);
+                }
+            }
+        }
+
+        self.feed_recv(bytes);
+        let mut message_index = 0_u16;
+        let mut chunk_prior_sink_service_nanos = 0_u64;
+        self.drain_data_event_batches_marked_from_index(
             base_meta,
             &mut message_index,
             message_sequence,
@@ -1128,6 +1446,108 @@ impl WsClient {
         }
     }
 
+    fn try_drain_ingress_data_event_batches<F>(
+        &mut self,
+        mut bytes: &[u8],
+        sink: &mut F,
+    ) -> Result<(usize, usize, DirectDataResult), WsError>
+    where
+        F: for<'a> FnMut(DataEventBatch<'a>),
+    {
+        let original_len = bytes.len();
+        let mut events = 0_usize;
+        let mut batch = DataEventBatch::new();
+        loop {
+            if bytes.is_empty() {
+                flush_data_event_batch(&mut batch, sink);
+                return Ok((events, original_len, DirectDataResult::Drained));
+            }
+
+            let header = match parse_server_data_header_fast(bytes) {
+                Ok(FastDataHeaderResult::Parsed(header)) => header,
+                Ok(FastDataHeaderResult::NeedMore) => {
+                    flush_data_event_batch(&mut batch, sink);
+                    return Ok((
+                        events,
+                        original_len - bytes.len(),
+                        DirectDataResult::WaitForMore,
+                    ));
+                }
+                Ok(FastDataHeaderResult::Fallback) => {
+                    flush_data_event_batch(&mut batch, sink);
+                    return Ok((
+                        events,
+                        original_len - bytes.len(),
+                        DirectDataResult::Fallback,
+                    ));
+                }
+                Err(e) => {
+                    flush_data_event_batch(&mut batch, sink);
+                    self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
+                    return Err(WsError::Frame(e));
+                }
+            };
+
+            if header.payload_len_u64 > self.config.max_frame_payload {
+                flush_data_event_batch(&mut batch, sink);
+                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                return Err(WsError::MessageTooLarge);
+            }
+
+            let payload_len = header.payload_len;
+            if payload_len > self.config.max_message_size {
+                flush_data_event_batch(&mut batch, sink);
+                self.queue_close(
+                    CloseCode::MessageTooBig.as_u16(),
+                    "message exceeds max_message_size",
+                );
+                return Err(WsError::MessageTooLarge);
+            }
+            let Some(frame_len) = header.header_len.checked_add(payload_len) else {
+                flush_data_event_batch(&mut batch, sink);
+                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                return Err(WsError::MessageTooLarge);
+            };
+            if bytes.len() < frame_len {
+                flush_data_event_batch(&mut batch, sink);
+                return Ok((
+                    events,
+                    original_len - bytes.len(),
+                    DirectDataResult::WaitForMore,
+                ));
+            }
+
+            if batch.is_full() {
+                flush_data_event_batch(&mut batch, sink);
+            }
+
+            let payload = &bytes[header.header_len..frame_len];
+            let event = match header.opcode {
+                OpCode::Text => {
+                    let text = if self.config.assume_text_utf8 {
+                        // SAFETY: Enabled only through `unsafe`
+                        // `WsConfig::with_assume_text_utf8_unchecked`, whose
+                        // caller promises all server text payloads are UTF-8.
+                        unsafe { std::str::from_utf8_unchecked(payload) }
+                    } else if let Ok(text) = std::str::from_utf8(payload) {
+                        text
+                    } else {
+                        flush_data_event_batch(&mut batch, sink);
+                        self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
+                        return Err(WsError::Utf8Invalid);
+                    };
+                    DataEvent::Text(text)
+                }
+                OpCode::Binary => DataEvent::Binary(payload),
+                _ => unreachable!("guarded above"),
+            };
+            let pushed = batch.push(event);
+            debug_assert!(pushed);
+            events += 1;
+            bytes = &bytes[frame_len..];
+        }
+    }
+
     fn try_drain_ingress_data_events_marked<F>(
         &mut self,
         mut bytes: &[u8],
@@ -1229,6 +1649,180 @@ impl WsClient {
                 }
                 _ => unreachable!("guarded above"),
             }
+            events += 1;
+            bytes = &bytes[frame_len..];
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn try_drain_ingress_data_event_batches_marked<F>(
+        &mut self,
+        mut bytes: &[u8],
+        base_meta: DataEventMeta,
+        message_index: &mut u16,
+        message_sequence: &mut u64,
+        chunk_prior_sink_service_nanos: &mut u64,
+        sink: &mut F,
+    ) -> Result<(usize, usize, DirectDataResult), WsError>
+    where
+        F: for<'a> FnMut(MarkedDataEventBatch<'a>),
+    {
+        let original_len = bytes.len();
+        let mut events = 0_usize;
+        let mut batch = MarkedDataEventBatch::new();
+        loop {
+            if bytes.is_empty() {
+                flush_marked_data_event_batch(
+                    &mut batch,
+                    sink,
+                    base_meta.sampled,
+                    chunk_prior_sink_service_nanos,
+                );
+                return Ok((events, original_len, DirectDataResult::Drained));
+            }
+
+            let header = match parse_server_data_header_fast(bytes) {
+                Ok(FastDataHeaderResult::Parsed(header)) => header,
+                Ok(FastDataHeaderResult::NeedMore) => {
+                    flush_marked_data_event_batch(
+                        &mut batch,
+                        sink,
+                        base_meta.sampled,
+                        chunk_prior_sink_service_nanos,
+                    );
+                    return Ok((
+                        events,
+                        original_len - bytes.len(),
+                        DirectDataResult::WaitForMore,
+                    ));
+                }
+                Ok(FastDataHeaderResult::Fallback) => {
+                    flush_marked_data_event_batch(
+                        &mut batch,
+                        sink,
+                        base_meta.sampled,
+                        chunk_prior_sink_service_nanos,
+                    );
+                    return Ok((
+                        events,
+                        original_len - bytes.len(),
+                        DirectDataResult::Fallback,
+                    ));
+                }
+                Err(e) => {
+                    flush_marked_data_event_batch(
+                        &mut batch,
+                        sink,
+                        base_meta.sampled,
+                        chunk_prior_sink_service_nanos,
+                    );
+                    self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
+                    return Err(WsError::Frame(e));
+                }
+            };
+
+            if header.payload_len_u64 > self.config.max_frame_payload {
+                flush_marked_data_event_batch(
+                    &mut batch,
+                    sink,
+                    base_meta.sampled,
+                    chunk_prior_sink_service_nanos,
+                );
+                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                return Err(WsError::MessageTooLarge);
+            }
+
+            let payload_len = header.payload_len;
+            if payload_len > self.config.max_message_size {
+                flush_marked_data_event_batch(
+                    &mut batch,
+                    sink,
+                    base_meta.sampled,
+                    chunk_prior_sink_service_nanos,
+                );
+                self.queue_close(
+                    CloseCode::MessageTooBig.as_u16(),
+                    "message exceeds max_message_size",
+                );
+                return Err(WsError::MessageTooLarge);
+            }
+            let Some(frame_len) = header.header_len.checked_add(payload_len) else {
+                flush_marked_data_event_batch(
+                    &mut batch,
+                    sink,
+                    base_meta.sampled,
+                    chunk_prior_sink_service_nanos,
+                );
+                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                return Err(WsError::MessageTooLarge);
+            };
+            if bytes.len() < frame_len {
+                flush_marked_data_event_batch(
+                    &mut batch,
+                    sink,
+                    base_meta.sampled,
+                    chunk_prior_sink_service_nanos,
+                );
+                return Ok((
+                    events,
+                    original_len - bytes.len(),
+                    DirectDataResult::WaitForMore,
+                ));
+            }
+
+            if batch.is_full() {
+                flush_marked_data_event_batch(
+                    &mut batch,
+                    sink,
+                    base_meta.sampled,
+                    chunk_prior_sink_service_nanos,
+                );
+            }
+
+            let payload = &bytes[header.header_len..frame_len];
+            let event = match header.opcode {
+                OpCode::Text => {
+                    let text = if self.config.assume_text_utf8 {
+                        // SAFETY: Enabled only through `unsafe`
+                        // `WsConfig::with_assume_text_utf8_unchecked`, whose
+                        // caller promises all server text payloads are UTF-8.
+                        unsafe { std::str::from_utf8_unchecked(payload) }
+                    } else if let Ok(text) = std::str::from_utf8(payload) {
+                        text
+                    } else {
+                        flush_marked_data_event_batch(
+                            &mut batch,
+                            sink,
+                            base_meta.sampled,
+                            chunk_prior_sink_service_nanos,
+                        );
+                        self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
+                        return Err(WsError::Utf8Invalid);
+                    };
+                    let meta = next_marked_meta(
+                        base_meta,
+                        message_index,
+                        message_sequence,
+                        *chunk_prior_sink_service_nanos,
+                    );
+                    MarkedDataEvent::Text {
+                        payload: text,
+                        meta,
+                    }
+                }
+                OpCode::Binary => {
+                    let meta = next_marked_meta(
+                        base_meta,
+                        message_index,
+                        message_sequence,
+                        *chunk_prior_sink_service_nanos,
+                    );
+                    MarkedDataEvent::Binary { payload, meta }
+                }
+                _ => unreachable!("guarded above"),
+            };
+            let pushed = batch.push(event);
+            debug_assert!(pushed);
             events += 1;
             bytes = &bytes[frame_len..];
         }
@@ -2101,6 +2695,114 @@ mod tests {
         assert_eq!(data[1].1.tls_plaintext_chunk_index, 3);
         assert_eq!(data[1].1.chunk_message_index, 1);
         assert!(c.recv_buf.is_empty());
+    }
+
+    #[test]
+    fn drain_data_event_batches_from_ingress_dispatches_one_batch() {
+        let mut c = mk_open_client();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&server_text(b"alpha"));
+        wire.extend_from_slice(&server_binary(b"bravo"));
+
+        let mut batches = Vec::new();
+        let events = c
+            .drain_data_event_batches_from_ingress(&wire, |batch| {
+                batches.push(
+                    batch
+                        .iter()
+                        .map(|ev| match ev {
+                            DataEvent::Text(s) => format!("text:{s}"),
+                            DataEvent::Binary(bytes) => {
+                                format!("binary:{}", std::str::from_utf8(bytes).unwrap())
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            })
+            .unwrap();
+
+        assert_eq!(events, 2);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0],
+            vec!["text:alpha".to_owned(), "binary:bravo".to_owned()]
+        );
+        assert!(c.recv_buf.is_empty());
+    }
+
+    #[test]
+    fn drain_data_event_batches_marked_preserves_index_after_control_fallback() {
+        let mut c = mk_open_client();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&server_text(b"before"));
+        wire.extend_from_slice(&server_control(OpCode::Ping, b"hb"));
+        wire.extend_from_slice(&server_text(b"after"));
+
+        let base_meta = DataEventMeta {
+            sampled: true,
+            source_recv_time_nanos: 99,
+            recv_sequence: 6,
+            transport_recv_mono_nanos: 1,
+            tls_plaintext_ready_mono_nanos: 2,
+            ws_payload_ready_mono_nanos: 0,
+            message_sequence: 0,
+            tls_plaintext_chunk_index: 8,
+            chunk_message_index: 0,
+            chunk_prior_sink_service_nanos: 0,
+        };
+
+        let mut message_sequence = 41;
+        let mut data = Vec::new();
+        let mut first_sink_returned = false;
+        let events = c
+            .drain_data_event_batches_from_ingress_marked_with_message_sequence(
+                &wire,
+                base_meta,
+                &mut message_sequence,
+                |batch| {
+                    for ev in batch.iter() {
+                        match ev {
+                            MarkedDataEvent::Text { payload, meta } => {
+                                if payload == "before" {
+                                    let until = std::time::Instant::now()
+                                        + std::time::Duration::from_micros(50);
+                                    while std::time::Instant::now() < until {
+                                        std::hint::spin_loop();
+                                    }
+                                    first_sink_returned = true;
+                                }
+                                data.push((payload.to_owned(), meta));
+                            }
+                            MarkedDataEvent::Binary { .. } => panic!("unexpected binary"),
+                        }
+                    }
+                },
+            )
+            .unwrap();
+
+        assert_eq!(events, 3);
+        assert_eq!(message_sequence, 43);
+        assert_eq!(data[0].0, "before");
+        assert_eq!(data[0].1.source_recv_time_nanos, 99);
+        assert_eq!(data[0].1.recv_sequence, 6);
+        assert_eq!(data[0].1.message_sequence, 41);
+        assert_eq!(data[0].1.tls_plaintext_chunk_index, 8);
+        assert_eq!(data[0].1.chunk_message_index, 0);
+        assert_eq!(data[1].0, "after");
+        assert_eq!(data[1].1.source_recv_time_nanos, 99);
+        assert_eq!(data[1].1.recv_sequence, 6);
+        assert_eq!(data[1].1.message_sequence, 42);
+        assert_eq!(data[1].1.tls_plaintext_chunk_index, 8);
+        assert_eq!(data[1].1.chunk_message_index, 1);
+        assert!(first_sink_returned);
+        assert!(
+            data[1].1.chunk_prior_sink_service_nanos > 0,
+            "fallback message should carry prior batch sink service"
+        );
+        assert!(
+            !c.pending_tx().is_empty(),
+            "Ping fallback should still queue auto-pong"
+        );
     }
 
     #[test]
