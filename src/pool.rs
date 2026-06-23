@@ -419,7 +419,9 @@ impl Pool {
     ///
     /// The callback receives fixed-capacity batches of data messages. Direct
     /// plaintext chunks can produce multi-message batches; fallback protocol
-    /// paths may still produce one-message batches.
+    /// paths may still produce one-message batches. Use
+    /// [`WsDataEventBatch::is_chunk_end`] to know when all data messages from
+    /// the current plaintext chunk have been delivered.
     pub fn pump_data_batches<F>(&mut self, sink: F) -> Result<(), ConnectionError>
     where
         F: for<'a> FnMut(ConnHandle, WsDataEventBatch<'a>),
@@ -440,6 +442,9 @@ impl Pool {
     /// Batch delivery measures sink service at the batch boundary. Messages in
     /// one emitted batch share the same `chunk_prior_sink_service_nanos`; use
     /// [`Self::pump_data_marked`] for strict per-message sink queuing metrics.
+    /// Use [`WsMarkedDataEventBatch::is_chunk_end`] to coalesce all data
+    /// messages from the current plaintext chunk without waiting for the next
+    /// chunk.
     pub fn pump_data_marked_batches<F>(&mut self, sink: F) -> Result<(), ConnectionError>
     where
         F: for<'a> FnMut(ConnHandle, WsMarkedDataEventBatch<'a>),

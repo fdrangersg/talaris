@@ -206,6 +206,7 @@ pub const DATA_EVENT_BATCH_CAPACITY: usize = 32;
 pub struct DataEventBatch<'a> {
     events: [Option<DataEvent<'a>>; DATA_EVENT_BATCH_CAPACITY],
     len: usize,
+    chunk_end: bool,
 }
 
 impl<'a> DataEventBatch<'a> {
@@ -214,6 +215,7 @@ impl<'a> DataEventBatch<'a> {
         Self {
             events: [None; DATA_EVENT_BATCH_CAPACITY],
             len: 0,
+            chunk_end: false,
         }
     }
 
@@ -222,6 +224,7 @@ impl<'a> DataEventBatch<'a> {
         let mut batch = Self::new();
         let pushed = batch.push(event);
         debug_assert!(pushed);
+        batch.chunk_end = true;
         batch
     }
 
@@ -251,6 +254,22 @@ impl<'a> DataEventBatch<'a> {
     #[must_use]
     pub const fn is_full(&self) -> bool {
         self.len == DATA_EVENT_BATCH_CAPACITY
+    }
+
+    /// Whether this is the last data batch emitted for the current plaintext
+    /// chunk.
+    ///
+    /// A large chunk may produce multiple fixed-capacity batches. Callers that
+    /// coalesce by chunk should accumulate until this returns `true`.
+    #[inline]
+    #[must_use]
+    pub const fn is_chunk_end(&self) -> bool {
+        self.chunk_end
+    }
+
+    #[inline]
+    pub(crate) const fn set_chunk_end(&mut self, chunk_end: bool) {
+        self.chunk_end = chunk_end;
     }
 
     #[inline]
@@ -472,13 +491,14 @@ fn emit_marked_event_batch<'a, F>(
 }
 
 #[inline]
-fn flush_data_event_batch<'a, F>(batch: &mut DataEventBatch<'a>, sink: &mut F)
+fn flush_data_event_batch<'a, F>(batch: &mut DataEventBatch<'a>, sink: &mut F, chunk_end: bool)
 where
     F: FnMut(DataEventBatch<'a>),
 {
     if batch.is_empty() {
         return;
     }
+    batch.set_chunk_end(chunk_end);
     let ready = std::mem::replace(batch, DataEventBatch::new());
     sink(ready);
 }
@@ -487,6 +507,7 @@ where
 fn flush_marked_data_event_batch<'a, F>(
     batch: &mut MarkedDataEventBatch<'a>,
     sink: &mut F,
+    chunk_end: bool,
     sampled: bool,
     chunk_prior_sink_service_nanos: &mut u64,
 ) where
@@ -495,6 +516,7 @@ fn flush_marked_data_event_batch<'a, F>(
     if batch.is_empty() {
         return;
     }
+    batch.set_chunk_end(chunk_end);
     let ready = std::mem::replace(batch, MarkedDataEventBatch::new());
     emit_marked_event_batch(sink, ready, sampled, chunk_prior_sink_service_nanos);
 }
@@ -785,10 +807,14 @@ impl WsClient {
 
     /// Drain WS data messages in fixed-capacity batches.
     ///
-    /// This experimental API preserves the same protocol behavior as
-    /// [`Self::drain_data_events`], but surfaces data payloads through fewer
-    /// sink calls. Non-direct fallback paths may still produce one-event
-    /// batches.
+    /// This preserves the same protocol behavior as [`Self::drain_data_events`],
+    /// but surfaces data payloads through fewer sink calls. Direct plaintext
+    /// chunks can produce multi-message batches. If one chunk exceeds
+    /// [`DATA_EVENT_BATCH_CAPACITY`], all non-final splits have
+    /// [`DataEventBatch::is_chunk_end`] set to `false` and the last split is
+    /// marked `true`.
+    ///
+    /// Non-direct fallback paths may still produce one-event batches.
     pub fn drain_data_event_batches<F>(&mut self, mut sink: F) -> Result<usize, WsError>
     where
         F: for<'a> FnMut(DataEventBatch<'a>),
@@ -864,6 +890,9 @@ impl WsClient {
     /// accumulated between batch callbacks; messages in the same batch share
     /// the same prior sink service value. Use the per-message marked API when
     /// measuring strict intra-batch per-message sink queuing.
+    ///
+    /// Use [`MarkedDataEventBatch::is_chunk_end`] to identify the final batch
+    /// for a plaintext chunk when coalescing redundant messages by sequence.
     pub fn drain_data_event_batches_marked<F>(
         &mut self,
         base_meta: DataEventMeta,
@@ -1459,14 +1488,14 @@ impl WsClient {
         let mut batch = DataEventBatch::new();
         loop {
             if bytes.is_empty() {
-                flush_data_event_batch(&mut batch, sink);
+                flush_data_event_batch(&mut batch, sink, true);
                 return Ok((events, original_len, DirectDataResult::Drained));
             }
 
             let header = match parse_server_data_header_fast(bytes) {
                 Ok(FastDataHeaderResult::Parsed(header)) => header,
                 Ok(FastDataHeaderResult::NeedMore) => {
-                    flush_data_event_batch(&mut batch, sink);
+                    flush_data_event_batch(&mut batch, sink, true);
                     return Ok((
                         events,
                         original_len - bytes.len(),
@@ -1474,7 +1503,7 @@ impl WsClient {
                     ));
                 }
                 Ok(FastDataHeaderResult::Fallback) => {
-                    flush_data_event_batch(&mut batch, sink);
+                    flush_data_event_batch(&mut batch, sink, false);
                     return Ok((
                         events,
                         original_len - bytes.len(),
@@ -1482,21 +1511,21 @@ impl WsClient {
                     ));
                 }
                 Err(e) => {
-                    flush_data_event_batch(&mut batch, sink);
+                    flush_data_event_batch(&mut batch, sink, true);
                     self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
                     return Err(WsError::Frame(e));
                 }
             };
 
             if header.payload_len_u64 > self.config.max_frame_payload {
-                flush_data_event_batch(&mut batch, sink);
+                flush_data_event_batch(&mut batch, sink, true);
                 self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
                 return Err(WsError::MessageTooLarge);
             }
 
             let payload_len = header.payload_len;
             if payload_len > self.config.max_message_size {
-                flush_data_event_batch(&mut batch, sink);
+                flush_data_event_batch(&mut batch, sink, true);
                 self.queue_close(
                     CloseCode::MessageTooBig.as_u16(),
                     "message exceeds max_message_size",
@@ -1504,12 +1533,12 @@ impl WsClient {
                 return Err(WsError::MessageTooLarge);
             }
             let Some(frame_len) = header.header_len.checked_add(payload_len) else {
-                flush_data_event_batch(&mut batch, sink);
+                flush_data_event_batch(&mut batch, sink, true);
                 self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
                 return Err(WsError::MessageTooLarge);
             };
             if bytes.len() < frame_len {
-                flush_data_event_batch(&mut batch, sink);
+                flush_data_event_batch(&mut batch, sink, true);
                 return Ok((
                     events,
                     original_len - bytes.len(),
@@ -1518,7 +1547,7 @@ impl WsClient {
             }
 
             if batch.is_full() {
-                flush_data_event_batch(&mut batch, sink);
+                flush_data_event_batch(&mut batch, sink, false);
             }
 
             let payload = &bytes[header.header_len..frame_len];
@@ -1532,7 +1561,7 @@ impl WsClient {
                     } else if let Ok(text) = std::str::from_utf8(payload) {
                         text
                     } else {
-                        flush_data_event_batch(&mut batch, sink);
+                        flush_data_event_batch(&mut batch, sink, true);
                         self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
                         return Err(WsError::Utf8Invalid);
                     };
@@ -1675,6 +1704,7 @@ impl WsClient {
                 flush_marked_data_event_batch(
                     &mut batch,
                     sink,
+                    true,
                     base_meta.sampled,
                     chunk_prior_sink_service_nanos,
                 );
@@ -1687,6 +1717,7 @@ impl WsClient {
                     flush_marked_data_event_batch(
                         &mut batch,
                         sink,
+                        true,
                         base_meta.sampled,
                         chunk_prior_sink_service_nanos,
                     );
@@ -1700,6 +1731,7 @@ impl WsClient {
                     flush_marked_data_event_batch(
                         &mut batch,
                         sink,
+                        false,
                         base_meta.sampled,
                         chunk_prior_sink_service_nanos,
                     );
@@ -1713,6 +1745,7 @@ impl WsClient {
                     flush_marked_data_event_batch(
                         &mut batch,
                         sink,
+                        true,
                         base_meta.sampled,
                         chunk_prior_sink_service_nanos,
                     );
@@ -1725,6 +1758,7 @@ impl WsClient {
                 flush_marked_data_event_batch(
                     &mut batch,
                     sink,
+                    true,
                     base_meta.sampled,
                     chunk_prior_sink_service_nanos,
                 );
@@ -1737,6 +1771,7 @@ impl WsClient {
                 flush_marked_data_event_batch(
                     &mut batch,
                     sink,
+                    true,
                     base_meta.sampled,
                     chunk_prior_sink_service_nanos,
                 );
@@ -1750,6 +1785,7 @@ impl WsClient {
                 flush_marked_data_event_batch(
                     &mut batch,
                     sink,
+                    true,
                     base_meta.sampled,
                     chunk_prior_sink_service_nanos,
                 );
@@ -1760,6 +1796,7 @@ impl WsClient {
                 flush_marked_data_event_batch(
                     &mut batch,
                     sink,
+                    true,
                     base_meta.sampled,
                     chunk_prior_sink_service_nanos,
                 );
@@ -1774,6 +1811,7 @@ impl WsClient {
                 flush_marked_data_event_batch(
                     &mut batch,
                     sink,
+                    false,
                     base_meta.sampled,
                     chunk_prior_sink_service_nanos,
                 );
@@ -1793,6 +1831,7 @@ impl WsClient {
                         flush_marked_data_event_batch(
                             &mut batch,
                             sink,
+                            true,
                             base_meta.sampled,
                             chunk_prior_sink_service_nanos,
                         );
@@ -2707,7 +2746,7 @@ mod tests {
         let mut batches = Vec::new();
         let events = c
             .drain_data_event_batches_from_ingress(&wire, |batch| {
-                batches.push(
+                batches.push((
                     batch
                         .iter()
                         .map(|ev| match ev {
@@ -2717,17 +2756,146 @@ mod tests {
                             }
                         })
                         .collect::<Vec<_>>(),
-                );
+                    batch.is_chunk_end(),
+                ));
             })
             .unwrap();
 
         assert_eq!(events, 2);
         assert_eq!(batches.len(), 1);
+        assert!(batches[0].1, "single chunk batch must be marked complete");
         assert_eq!(
-            batches[0],
+            batches[0].0,
             vec!["text:alpha".to_owned(), "binary:bravo".to_owned()]
         );
         assert!(c.recv_buf.is_empty());
+    }
+
+    #[test]
+    fn drain_data_event_batches_marks_capacity_split_before_chunk_end() {
+        let mut c = mk_open_client();
+        let mut wire = Vec::new();
+        for i in 0..=DATA_EVENT_BATCH_CAPACITY {
+            wire.extend_from_slice(&server_text(format!("msg-{i}").as_bytes()));
+        }
+
+        let mut batches = Vec::new();
+        let events = c
+            .drain_data_event_batches_from_ingress(&wire, |batch| {
+                batches.push((
+                    batch.len(),
+                    batch.is_chunk_end(),
+                    batch
+                        .iter()
+                        .map(|ev| match ev {
+                            DataEvent::Text(s) => s.to_owned(),
+                            DataEvent::Binary(_) => panic!("unexpected binary"),
+                        })
+                        .collect::<Vec<_>>(),
+                ));
+            })
+            .unwrap();
+
+        assert_eq!(events, DATA_EVENT_BATCH_CAPACITY + 1);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].0, DATA_EVENT_BATCH_CAPACITY);
+        assert!(
+            !batches[0].1,
+            "capacity split is not the end of the plaintext chunk"
+        );
+        assert_eq!(batches[0].2[0], "msg-0");
+        assert_eq!(batches[0].2[DATA_EVENT_BATCH_CAPACITY - 1], "msg-31");
+        assert_eq!(batches[1].0, 1);
+        assert!(batches[1].1, "last split must mark chunk end");
+        assert_eq!(batches[1].2[0], "msg-32");
+    }
+
+    #[test]
+    fn drain_data_event_batches_marked_flushes_complete_events_before_partial_next_frame() {
+        let mut c = mk_open_client();
+        let mut wire = server_text(b"ready");
+        let next = server_text(b"next");
+        let split_at = 1;
+        wire.extend_from_slice(&next[..split_at]);
+
+        let base_meta = DataEventMeta {
+            sampled: true,
+            source_recv_time_nanos: 99,
+            recv_sequence: 6,
+            transport_recv_mono_nanos: 1,
+            tls_plaintext_ready_mono_nanos: 2,
+            ws_payload_ready_mono_nanos: 0,
+            message_sequence: 0,
+            tls_plaintext_chunk_index: 8,
+            chunk_message_index: 0,
+            chunk_prior_sink_service_nanos: 0,
+        };
+
+        let mut message_sequence = 41;
+        let mut batches = Vec::new();
+        let events = c
+            .drain_data_event_batches_from_ingress_marked_with_message_sequence(
+                &wire,
+                base_meta,
+                &mut message_sequence,
+                |batch| {
+                    batches.push((
+                        batch.is_chunk_end(),
+                        batch
+                            .iter()
+                            .map(|ev| match ev {
+                                MarkedDataEvent::Text { payload, meta } => {
+                                    (payload.to_owned(), meta.chunk_message_index)
+                                }
+                                MarkedDataEvent::Binary { .. } => panic!("unexpected binary"),
+                            })
+                            .collect::<Vec<_>>(),
+                    ));
+                },
+            )
+            .unwrap();
+
+        assert_eq!(events, 1);
+        assert_eq!(message_sequence, 42);
+        assert_eq!(batches.len(), 1);
+        assert!(
+            batches[0].0,
+            "complete events must flush at this plaintext chunk boundary"
+        );
+        assert_eq!(batches[0].1, vec![("ready".to_owned(), 0)]);
+        assert!(
+            !c.recv_buf.is_empty(),
+            "partial next frame must be buffered"
+        );
+
+        let mut next_batches = Vec::new();
+        let events = c
+            .drain_data_event_batches_from_ingress_marked_with_message_sequence(
+                &next[split_at..],
+                base_meta.plaintext_ready_at(3, 9),
+                &mut message_sequence,
+                |batch| {
+                    next_batches.push((
+                        batch.is_chunk_end(),
+                        batch
+                            .iter()
+                            .map(|ev| match ev {
+                                MarkedDataEvent::Text { payload, meta } => {
+                                    (payload.to_owned(), meta.chunk_message_index)
+                                }
+                                MarkedDataEvent::Binary { .. } => panic!("unexpected binary"),
+                            })
+                            .collect::<Vec<_>>(),
+                    ));
+                },
+            )
+            .unwrap();
+
+        assert_eq!(events, 1);
+        assert_eq!(message_sequence, 43);
+        assert_eq!(next_batches.len(), 1);
+        assert!(next_batches[0].0);
+        assert_eq!(next_batches[0].1, vec![("next".to_owned(), 0)]);
     }
 
     #[test]
@@ -2753,6 +2921,7 @@ mod tests {
 
         let mut message_sequence = 41;
         let mut data = Vec::new();
+        let mut chunk_ends = Vec::new();
         let mut first_sink_returned = false;
         let events = c
             .drain_data_event_batches_from_ingress_marked_with_message_sequence(
@@ -2760,6 +2929,7 @@ mod tests {
                 base_meta,
                 &mut message_sequence,
                 |batch| {
+                    chunk_ends.push(batch.is_chunk_end());
                     for ev in batch.iter() {
                         match ev {
                             MarkedDataEvent::Text { payload, meta } => {
@@ -2782,6 +2952,7 @@ mod tests {
 
         assert_eq!(events, 3);
         assert_eq!(message_sequence, 43);
+        assert_eq!(chunk_ends, vec![false, true]);
         assert_eq!(data[0].0, "before");
         assert_eq!(data[0].1.source_recv_time_nanos, 99);
         assert_eq!(data[0].1.recv_sequence, 6);

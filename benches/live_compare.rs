@@ -610,7 +610,7 @@ fn run_tungstenite_worker(
                 match socket.read() {
                     Ok(message) => {
                         record_tungstenite_ready_message(
-                            &mut socket,
+                            &socket,
                             &mut stats,
                             &mut latency,
                             message,
@@ -646,7 +646,7 @@ fn run_tungstenite_worker(
                         match socket.read() {
                             Ok(message) => {
                                 record_tungstenite_ready_message(
-                                    &mut socket,
+                                    &socket,
                                     &mut stats,
                                     &mut latency,
                                     message,
@@ -677,7 +677,7 @@ fn run_tungstenite_worker(
 }
 
 fn record_tungstenite_ready_message(
-    socket: &mut tungstenite::WebSocket<TlsCountingStream>,
+    socket: &tungstenite::WebSocket<TlsCountingStream>,
     stats: &mut common::MessageStats,
     latency: &mut TungsteniteLatencyStats,
     message: tungstenite::Message,
@@ -1281,10 +1281,10 @@ impl EpollWaiter {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = socket_fd;
-            return Err(std::io::Error::new(
+            Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "epoll is only available on Linux",
-            ));
+            ))
         }
 
         #[cfg(target_os = "linux")]
@@ -1316,11 +1316,11 @@ impl EpollWaiter {
     fn wait(&self, events: &mut [BenchEpollEvent], timeout_ms: i32) -> std::io::Result<usize> {
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (events, timeout_ms);
-            return Err(std::io::Error::new(
+            let _ = (self, events, timeout_ms);
+            Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "epoll is only available on Linux",
-            ));
+            ))
         }
 
         #[cfg(target_os = "linux")]

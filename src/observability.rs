@@ -645,6 +645,7 @@ impl MarkedDataEvent<'_> {
 pub struct MarkedDataEventBatch<'a> {
     events: [Option<MarkedDataEvent<'a>>; MARKED_DATA_EVENT_BATCH_CAPACITY],
     len: usize,
+    chunk_end: bool,
 }
 
 impl<'a> MarkedDataEventBatch<'a> {
@@ -653,6 +654,7 @@ impl<'a> MarkedDataEventBatch<'a> {
         Self {
             events: [None; MARKED_DATA_EVENT_BATCH_CAPACITY],
             len: 0,
+            chunk_end: false,
         }
     }
 
@@ -661,6 +663,7 @@ impl<'a> MarkedDataEventBatch<'a> {
         let mut batch = Self::new();
         let pushed = batch.push(event);
         debug_assert!(pushed);
+        batch.chunk_end = true;
         batch
     }
 
@@ -690,6 +693,22 @@ impl<'a> MarkedDataEventBatch<'a> {
     #[must_use]
     pub const fn is_full(&self) -> bool {
         self.len == MARKED_DATA_EVENT_BATCH_CAPACITY
+    }
+
+    /// Whether this is the last marked data batch emitted for the current
+    /// plaintext chunk.
+    ///
+    /// A large chunk may produce multiple fixed-capacity batches. Callers that
+    /// coalesce by chunk should accumulate until this returns `true`.
+    #[inline]
+    #[must_use]
+    pub const fn is_chunk_end(&self) -> bool {
+        self.chunk_end
+    }
+
+    #[inline]
+    pub(crate) const fn set_chunk_end(&mut self, chunk_end: bool) {
+        self.chunk_end = chunk_end;
     }
 
     #[inline]

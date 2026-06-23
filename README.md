@@ -140,6 +140,30 @@ pool.pump_data(|handle, data| match data {
 要自己观察 Ping/Pong/Close 事件时用 `pump`；行情主循环只关心业务 payload 时用
 `pump_data`。
 
+### 6. batch data dispatch：同一 plaintext chunk 内先合并再回调
+
+对 Binance BBO 这类高频小消息，调用方经常需要在 decode 前先看同一个
+plaintext chunk 内的多个冗余 message，并只保留最大 seq。`pump_data_*_batches`
+就是给这个场景用的：
+
+```rust
+pool.pump_data_spin_marked_batches(256, |_handle, batch| {
+    for event in batch.iter() {
+        // 扫描 raw Text/Binary，找当前 chunk 内最大 seq / 最新快照。
+    }
+
+    if batch.is_chunk_end() {
+        // 当前 plaintext chunk 的所有 data message 已经交付完毕；
+        // 这里可以立刻发布 coalesced winner，不需要等下一个 chunk。
+    }
+})?;
+```
+
+batch 是固定容量的 hot-path view。一个很大的 plaintext chunk 可能拆成多个
+batch；除最后一个外，`is_chunk_end()` 都是 `false`。非 direct fallback 路径
+仍可能退化成 one-message batch，但 control frame、fragmentation、auto-pong
+语义保持不变。
+
 ---
 
 ## 一句话术语表（cheat sheet）
@@ -164,7 +188,7 @@ pool.pump_data(|handle, data| match data {
 
 ```toml
 [dependencies]
-talaris = "0.2"
+talaris = "0.7"
 ```
 
 ### 可运行 quickstart: 本地 plain-WS echo
