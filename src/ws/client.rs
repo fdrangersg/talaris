@@ -819,7 +819,33 @@ impl WsClient {
     where
         F: for<'a> FnMut(DataEventBatch<'a>),
     {
-        self.drain_data_events(|ev| sink(DataEventBatch::single(ev)))
+        let mut events = 0_usize;
+        loop {
+            self.clear_after_emit();
+            let (direct_events, direct_result) = self.try_drain_data_event_batches(&mut sink)?;
+            events += direct_events;
+            match direct_result {
+                DirectDataResult::Drained => continue,
+                DirectDataResult::WaitForMore => return Ok(events),
+                DirectDataResult::Fallback => {}
+            }
+
+            let Some(res) = self.poll_event() else {
+                return Ok(events);
+            };
+            let ev = res?;
+            events += 1;
+            match ev {
+                Event::Text(payload) => sink(DataEventBatch::single(DataEvent::Text(payload))),
+                Event::Binary(payload) => {
+                    sink(DataEventBatch::single(DataEvent::Binary(payload)));
+                }
+                Event::HandshakeComplete
+                | Event::Ping(_)
+                | Event::Pong(_)
+                | Event::Close { .. } => {}
+            }
+        }
     }
 
     /// Feed a newly-arrived plaintext chunk and drain data messages in batches.
@@ -924,13 +950,63 @@ impl WsClient {
     where
         F: FnMut(MarkedDataEventBatch<'_>),
     {
-        self.drain_data_events_marked_from_index(
-            base_meta,
-            message_index,
-            message_sequence,
-            chunk_prior_sink_service_nanos,
-            |ev| sink(MarkedDataEventBatch::single(ev)),
-        )
+        let mut events = 0_usize;
+        loop {
+            self.clear_after_emit();
+            let (direct_events, direct_result) = self.try_drain_data_event_batches_marked(
+                base_meta,
+                message_index,
+                message_sequence,
+                chunk_prior_sink_service_nanos,
+                &mut sink,
+            )?;
+            events += direct_events;
+            match direct_result {
+                DirectDataResult::Drained => continue,
+                DirectDataResult::WaitForMore => return Ok(events),
+                DirectDataResult::Fallback => {}
+            }
+
+            let Some(res) = self.poll_event() else {
+                return Ok(events);
+            };
+            let ev = res?;
+            events += 1;
+            match ev {
+                Event::Text(payload) => {
+                    let meta = next_marked_meta(
+                        base_meta,
+                        message_index,
+                        message_sequence,
+                        *chunk_prior_sink_service_nanos,
+                    );
+                    emit_marked_event_batch(
+                        &mut sink,
+                        MarkedDataEventBatch::single(MarkedDataEvent::Text { payload, meta }),
+                        meta.sampled,
+                        chunk_prior_sink_service_nanos,
+                    );
+                }
+                Event::Binary(payload) => {
+                    let meta = next_marked_meta(
+                        base_meta,
+                        message_index,
+                        message_sequence,
+                        *chunk_prior_sink_service_nanos,
+                    );
+                    emit_marked_event_batch(
+                        &mut sink,
+                        MarkedDataEventBatch::single(MarkedDataEvent::Binary { payload, meta }),
+                        meta.sampled,
+                        chunk_prior_sink_service_nanos,
+                    );
+                }
+                Event::HandshakeComplete
+                | Event::Ping(_)
+                | Event::Pong(_)
+                | Event::Close { .. } => {}
+            }
+        }
     }
 
     fn drain_data_events_marked_from_index<F>(
@@ -1374,6 +1450,308 @@ impl WsClient {
                 _ => unreachable!("guarded above"),
             }
             consumed += frame_len;
+            events += 1;
+        }
+    }
+
+    fn try_drain_data_event_batches<F>(
+        &mut self,
+        sink: &mut F,
+    ) -> Result<(usize, DirectDataResult), WsError>
+    where
+        F: FnMut(DataEventBatch<'_>),
+    {
+        if self.state != ConnState::Open
+            || !self.parser.is_idle()
+            || self.msg_opcode.is_some()
+            || self.recv_buf.is_empty()
+        {
+            return Ok((0, DirectDataResult::Fallback));
+        }
+
+        let mut consumed = 0_usize;
+        let mut events = 0_usize;
+        let mut batch = DataEventBatch::new();
+        loop {
+            let parse = {
+                let bytes = &self.recv_buf.as_slice()[consumed..];
+                if bytes.is_empty() {
+                    flush_data_event_batch(&mut batch, sink, true);
+                    self.recv_buf.consume(consumed);
+                    return Ok((events, DirectDataResult::Drained));
+                }
+
+                let header = match parse_server_data_header_fast(bytes) {
+                    Ok(FastDataHeaderResult::Parsed(header)) => header,
+                    Ok(FastDataHeaderResult::NeedMore) => {
+                        flush_data_event_batch(&mut batch, sink, true);
+                        self.recv_buf.consume(consumed);
+                        return Ok((events, DirectDataResult::WaitForMore));
+                    }
+                    Ok(FastDataHeaderResult::Fallback) => {
+                        flush_data_event_batch(&mut batch, sink, false);
+                        self.recv_buf.consume(consumed);
+                        return Ok((events, DirectDataResult::Fallback));
+                    }
+                    Err(e) => {
+                        flush_data_event_batch(&mut batch, sink, true);
+                        self.recv_buf.consume(consumed);
+                        self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
+                        return Err(WsError::Frame(e));
+                    }
+                };
+
+                if header.payload_len_u64 > self.config.max_frame_payload {
+                    flush_data_event_batch(&mut batch, sink, true);
+                    self.recv_buf.consume(consumed);
+                    self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                    return Err(WsError::MessageTooLarge);
+                }
+
+                let payload_len = header.payload_len;
+                if payload_len > self.config.max_message_size {
+                    flush_data_event_batch(&mut batch, sink, true);
+                    self.recv_buf.consume(consumed);
+                    self.queue_close(
+                        CloseCode::MessageTooBig.as_u16(),
+                        "message exceeds max_message_size",
+                    );
+                    return Err(WsError::MessageTooLarge);
+                }
+                let Some(frame_len) = header.header_len.checked_add(payload_len) else {
+                    flush_data_event_batch(&mut batch, sink, true);
+                    self.recv_buf.consume(consumed);
+                    self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                    return Err(WsError::MessageTooLarge);
+                };
+                if bytes.len() < frame_len {
+                    flush_data_event_batch(&mut batch, sink, true);
+                    self.recv_buf.consume(consumed);
+                    return Ok((events, DirectDataResult::WaitForMore));
+                }
+
+                let payload = &bytes[header.header_len..frame_len];
+                let event = match header.opcode {
+                    OpCode::Text => {
+                        let text = if self.config.assume_text_utf8 {
+                            // SAFETY: Enabled only through `unsafe`
+                            // `WsConfig::with_assume_text_utf8_unchecked`, whose
+                            // caller promises all server text payloads are UTF-8.
+                            unsafe { std::str::from_utf8_unchecked(payload) }
+                        } else if let Ok(text) = std::str::from_utf8(payload) {
+                            text
+                        } else {
+                            flush_data_event_batch(&mut batch, sink, true);
+                            self.recv_buf.consume(consumed);
+                            self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
+                            return Err(WsError::Utf8Invalid);
+                        };
+                        DataEvent::Text(text)
+                    }
+                    OpCode::Binary => DataEvent::Binary(payload),
+                    _ => unreachable!("guarded above"),
+                };
+                (event, frame_len)
+            };
+
+            if batch.is_full() {
+                flush_data_event_batch(&mut batch, sink, false);
+            }
+            let pushed = batch.push(parse.0);
+            debug_assert!(pushed);
+            consumed += parse.1;
+            events += 1;
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn try_drain_data_event_batches_marked<F>(
+        &mut self,
+        base_meta: DataEventMeta,
+        message_index: &mut u16,
+        message_sequence: &mut u64,
+        chunk_prior_sink_service_nanos: &mut u64,
+        sink: &mut F,
+    ) -> Result<(usize, DirectDataResult), WsError>
+    where
+        F: FnMut(MarkedDataEventBatch<'_>),
+    {
+        if self.state != ConnState::Open
+            || !self.parser.is_idle()
+            || self.msg_opcode.is_some()
+            || self.recv_buf.is_empty()
+        {
+            return Ok((0, DirectDataResult::Fallback));
+        }
+
+        let mut consumed = 0_usize;
+        let mut events = 0_usize;
+        let mut batch = MarkedDataEventBatch::new();
+        loop {
+            let parse = {
+                let bytes = &self.recv_buf.as_slice()[consumed..];
+                if bytes.is_empty() {
+                    flush_marked_data_event_batch(
+                        &mut batch,
+                        sink,
+                        true,
+                        base_meta.sampled,
+                        chunk_prior_sink_service_nanos,
+                    );
+                    self.recv_buf.consume(consumed);
+                    return Ok((events, DirectDataResult::Drained));
+                }
+
+                let header = match parse_server_data_header_fast(bytes) {
+                    Ok(FastDataHeaderResult::Parsed(header)) => header,
+                    Ok(FastDataHeaderResult::NeedMore) => {
+                        flush_marked_data_event_batch(
+                            &mut batch,
+                            sink,
+                            true,
+                            base_meta.sampled,
+                            chunk_prior_sink_service_nanos,
+                        );
+                        self.recv_buf.consume(consumed);
+                        return Ok((events, DirectDataResult::WaitForMore));
+                    }
+                    Ok(FastDataHeaderResult::Fallback) => {
+                        flush_marked_data_event_batch(
+                            &mut batch,
+                            sink,
+                            false,
+                            base_meta.sampled,
+                            chunk_prior_sink_service_nanos,
+                        );
+                        self.recv_buf.consume(consumed);
+                        return Ok((events, DirectDataResult::Fallback));
+                    }
+                    Err(e) => {
+                        flush_marked_data_event_batch(
+                            &mut batch,
+                            sink,
+                            true,
+                            base_meta.sampled,
+                            chunk_prior_sink_service_nanos,
+                        );
+                        self.recv_buf.consume(consumed);
+                        self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
+                        return Err(WsError::Frame(e));
+                    }
+                };
+
+                if header.payload_len_u64 > self.config.max_frame_payload {
+                    flush_marked_data_event_batch(
+                        &mut batch,
+                        sink,
+                        true,
+                        base_meta.sampled,
+                        chunk_prior_sink_service_nanos,
+                    );
+                    self.recv_buf.consume(consumed);
+                    self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                    return Err(WsError::MessageTooLarge);
+                }
+
+                let payload_len = header.payload_len;
+                if payload_len > self.config.max_message_size {
+                    flush_marked_data_event_batch(
+                        &mut batch,
+                        sink,
+                        true,
+                        base_meta.sampled,
+                        chunk_prior_sink_service_nanos,
+                    );
+                    self.recv_buf.consume(consumed);
+                    self.queue_close(
+                        CloseCode::MessageTooBig.as_u16(),
+                        "message exceeds max_message_size",
+                    );
+                    return Err(WsError::MessageTooLarge);
+                }
+                let Some(frame_len) = header.header_len.checked_add(payload_len) else {
+                    flush_marked_data_event_batch(
+                        &mut batch,
+                        sink,
+                        true,
+                        base_meta.sampled,
+                        chunk_prior_sink_service_nanos,
+                    );
+                    self.recv_buf.consume(consumed);
+                    self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                    return Err(WsError::MessageTooLarge);
+                };
+                if bytes.len() < frame_len {
+                    flush_marked_data_event_batch(
+                        &mut batch,
+                        sink,
+                        true,
+                        base_meta.sampled,
+                        chunk_prior_sink_service_nanos,
+                    );
+                    self.recv_buf.consume(consumed);
+                    return Ok((events, DirectDataResult::WaitForMore));
+                }
+
+                let payload = &bytes[header.header_len..frame_len];
+                let event = match header.opcode {
+                    OpCode::Text => {
+                        let text = if self.config.assume_text_utf8 {
+                            // SAFETY: Enabled only through `unsafe`
+                            // `WsConfig::with_assume_text_utf8_unchecked`, whose
+                            // caller promises all server text payloads are UTF-8.
+                            unsafe { std::str::from_utf8_unchecked(payload) }
+                        } else if let Ok(text) = std::str::from_utf8(payload) {
+                            text
+                        } else {
+                            flush_marked_data_event_batch(
+                                &mut batch,
+                                sink,
+                                true,
+                                base_meta.sampled,
+                                chunk_prior_sink_service_nanos,
+                            );
+                            self.recv_buf.consume(consumed);
+                            self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
+                            return Err(WsError::Utf8Invalid);
+                        };
+                        let meta = next_marked_meta(
+                            base_meta,
+                            message_index,
+                            message_sequence,
+                            *chunk_prior_sink_service_nanos,
+                        );
+                        MarkedDataEvent::Text {
+                            payload: text,
+                            meta,
+                        }
+                    }
+                    OpCode::Binary => {
+                        let meta = next_marked_meta(
+                            base_meta,
+                            message_index,
+                            message_sequence,
+                            *chunk_prior_sink_service_nanos,
+                        );
+                        MarkedDataEvent::Binary { payload, meta }
+                    }
+                    _ => unreachable!("guarded above"),
+                };
+                (event, frame_len)
+            };
+
+            if batch.is_full() {
+                flush_marked_data_event_batch(
+                    &mut batch,
+                    sink,
+                    false,
+                    base_meta.sampled,
+                    chunk_prior_sink_service_nanos,
+                );
+            }
+            let pushed = batch.push(parse.0);
+            debug_assert!(pushed);
+            consumed += parse.1;
             events += 1;
         }
     }
@@ -2896,6 +3274,73 @@ mod tests {
         assert_eq!(next_batches.len(), 1);
         assert!(next_batches[0].0);
         assert_eq!(next_batches[0].1, vec![("next".to_owned(), 0)]);
+    }
+
+    #[test]
+    fn drain_data_event_batches_marked_batches_after_buffered_partial_frame() {
+        let mut c = mk_open_client();
+        let extended = vec![b'x'; 130];
+        let mut wire = server_text(&extended);
+        wire.extend_from_slice(&server_text(b"two"));
+        wire.extend_from_slice(&server_text(b"three"));
+
+        let base_meta = DataEventMeta {
+            sampled: true,
+            source_recv_time_nanos: 99,
+            recv_sequence: 6,
+            transport_recv_mono_nanos: 1,
+            tls_plaintext_ready_mono_nanos: 2,
+            ws_payload_ready_mono_nanos: 0,
+            message_sequence: 0,
+            tls_plaintext_chunk_index: 8,
+            chunk_message_index: 0,
+            chunk_prior_sink_service_nanos: 0,
+        };
+
+        let split_at = 1;
+        let mut message_sequence = 41;
+        let events = c
+            .drain_data_event_batches_from_ingress_marked_with_message_sequence(
+                &wire[..split_at],
+                base_meta,
+                &mut message_sequence,
+                |_| panic!("partial frame must not emit a batch"),
+            )
+            .unwrap();
+        assert_eq!(events, 0);
+        assert!(!c.recv_buf.is_empty());
+
+        let mut batches = Vec::new();
+        let events = c
+            .drain_data_event_batches_from_ingress_marked_with_message_sequence(
+                &wire[split_at..],
+                base_meta,
+                &mut message_sequence,
+                |batch| {
+                    batches.push((
+                        batch.len(),
+                        batch.is_chunk_end(),
+                        batch
+                            .iter()
+                            .map(|ev| match ev {
+                                MarkedDataEvent::Text { payload, meta } => {
+                                    (payload.len(), meta.chunk_message_index)
+                                }
+                                MarkedDataEvent::Binary { .. } => panic!("unexpected binary"),
+                            })
+                            .collect::<Vec<_>>(),
+                    ));
+                },
+            )
+            .unwrap();
+
+        assert_eq!(events, 3);
+        assert_eq!(message_sequence, 44);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].0, 3);
+        assert!(batches[0].1);
+        assert_eq!(batches[0].2, vec![(130, 0), (3, 1), (5, 2)]);
+        assert!(c.recv_buf.is_empty());
     }
 
     #[test]
