@@ -23,6 +23,7 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::{Arc, Barrier, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -71,13 +72,45 @@ impl std::str::FromStr for Transport {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TungsteniteIoMode {
+    #[default]
+    Blocking,
+    Epoll,
+}
+
+impl TungsteniteIoMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocking => "blocking",
+            Self::Epoll => "epoll",
+        }
+    }
+}
+
+impl std::str::FromStr for TungsteniteIoMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "blocking" | "block" | "recv" => Ok(Self::Blocking),
+            "epoll" | "epoll-recv" => Ok(Self::Epoll),
+            other => Err(format!(
+                "unknown --tungstenite-io {other:?}; expected blocking or epoll"
+            )),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Config {
     transport: Transport,
     host: String,
     port: u16,
+    feed: common::BinanceFeed,
     symbols: Vec<String>,
     stream_counts: Vec<usize>,
+    depth_speed: String,
     redundancy_counts: Vec<usize>,
     seconds: u64,
     sample_bps: u16,
@@ -87,6 +120,13 @@ struct Config {
     cq_entries: u32,
     completion_batch: usize,
     spin_iters: usize,
+    recv_mode: talaris::connection::RecvMode,
+    socket_busy_poll_usecs: Option<u32>,
+    setup_flags: talaris::proactor::ProactorSetupFlags,
+    tls_provider: talaris::tls::TlsCryptoProvider,
+    tls_cipher: talaris::tls::TlsCipherPreference,
+    tungstenite_io: TungsteniteIoMode,
+    tungstenite_spin_iters: usize,
     talaris_cpu: Option<usize>,
     tungstenite_cpu: Option<usize>,
 }
@@ -103,13 +143,10 @@ impl Config {
         common::validate_power_of_two_u32("--sq-entries", sq_entries)?;
         common::validate_power_of_two_u32("--cq-entries", cq_entries)?;
 
-        let symbols = common::arg_string("--symbols", "btcusdt,ethusdt,bnbusdt,solusdt")
-            .split(',')
-            .filter_map(|s| {
-                let symbol = s.trim().to_ascii_lowercase();
-                (!symbol.is_empty()).then_some(symbol)
-            })
-            .collect::<Vec<_>>();
+        let symbols = common::parse_symbols(&common::arg_string(
+            "--symbols",
+            "btcusdt,ethusdt,bnbusdt,solusdt",
+        ));
         if symbols.is_empty() {
             return Err("--symbols must contain at least one symbol".to_owned());
         }
@@ -138,8 +175,10 @@ impl Config {
             transport: common::arg_or("--transport", Transport::Both),
             host: common::arg_string("--host", "fstream.binance.com"),
             port: common::arg_or("--port", 443_u16),
+            feed: common::arg_or("--feed", common::BinanceFeed::Bbo),
             symbols,
             stream_counts,
+            depth_speed: common::arg_string("--depth-speed", "100ms"),
             redundancy_counts,
             seconds: common::arg_or("--seconds", 45_u64).max(1),
             sample_bps,
@@ -149,6 +188,22 @@ impl Config {
             cq_entries,
             completion_batch: common::arg_or("--completion-batch", 64_usize).max(1),
             spin_iters: common::arg_or("--spin-iters", 256_usize),
+            recv_mode: common::arg_or("--recv-mode", talaris::connection::RecvMode::Multishot),
+            socket_busy_poll_usecs: common::optional_arg("--socket-busy-poll-usecs"),
+            setup_flags: common::parse_proactor_setup_flags(&common::arg_string(
+                "--setup-flags",
+                "none",
+            ))?,
+            tls_provider: common::arg_or(
+                "--tls-provider",
+                talaris::tls::TlsCryptoProvider::default(),
+            ),
+            tls_cipher: common::arg_or(
+                "--tls-cipher",
+                talaris::tls::TlsCipherPreference::ProviderDefault,
+            ),
+            tungstenite_io: common::arg_or("--tungstenite-io", TungsteniteIoMode::Blocking),
+            tungstenite_spin_iters: common::arg_or("--tungstenite-spin-iters", 0_usize),
             talaris_cpu: common::optional_arg("--talaris-cpu"),
             tungstenite_cpu: common::optional_arg("--tungstenite-cpu"),
         })
@@ -156,12 +211,14 @@ impl Config {
 
     fn print(&self) {
         println!(
-            "bench_config bench=live_compare transport={} endpoint={}:{} symbols={} stream_counts={:?} redundancy_counts={:?} seconds={} sample_bps={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} talaris_cpu={} tungstenite_cpu={}",
+            "bench_config bench=live_compare transport={} endpoint={}:{} feed={} symbols={} stream_counts={:?} depth_speed={} redundancy_counts={:?} seconds={} sample_bps={} buf={}x{} sq_entries={} cq_entries={} setup_flags={:?} completion_batch={} spin_iters={} recv_mode={} socket_busy_poll_usecs={} tls_provider={} tls_cipher={} tungstenite_io={} tungstenite_spin_iters={} talaris_cpu={} tungstenite_cpu={}",
             self.transport.as_str(),
             self.host,
             self.port,
+            self.feed.as_str(),
             self.symbols.join(","),
             self.stream_counts,
+            self.depth_speed,
             self.redundancy_counts,
             self.seconds,
             self.sample_bps,
@@ -169,8 +226,16 @@ impl Config {
             self.buf_size,
             self.sq_entries,
             self.cq_entries,
+            self.setup_flags,
             self.completion_batch,
             self.spin_iters,
+            self.recv_mode,
+            self.socket_busy_poll_usecs
+                .map_or_else(|| "-".to_owned(), |usecs| usecs.to_string()),
+            self.tls_provider,
+            self.tls_cipher,
+            self.tungstenite_io.as_str(),
+            self.tungstenite_spin_iters,
             self.talaris_cpu
                 .map_or_else(|| "-".to_owned(), |cpu| cpu.to_string()),
             self.tungstenite_cpu
@@ -191,7 +256,7 @@ fn run() -> BenchResult<()> {
 
     for &stream_count in &cfg.stream_counts {
         for &redundancy_count in &cfg.redundancy_counts {
-            let path = build_combined_path(&cfg.symbols, stream_count);
+            let path = build_combined_path(&cfg, stream_count)?;
             println!(
                 "bench_live_compare_start streams={stream_count} redundancy={redundancy_count} path={path}"
             );
@@ -273,7 +338,7 @@ fn run_talaris(
         .talaris_cpu
         .map(|cpu| common::PinGuard::pin("talaris", cpu));
 
-    let conn_cfg = talaris_conn_config(&cfg, path);
+    let conn_cfg = talaris_conn_config(&cfg, path)?;
     let proactor_cfg = conn_cfg.proactor;
     let mut pool = talaris::Pool::new(
         talaris::PoolConfig::new(proactor_cfg).with_completion_batch_capacity(cfg.completion_batch),
@@ -281,7 +346,7 @@ fn run_talaris(
     let mut handles = Vec::with_capacity(redundancy_count);
     let mut ingress_before = Vec::with_capacity(redundancy_count);
     for _ in 0..redundancy_count {
-        let handle = pool.connect_blocking(talaris_conn_config(&cfg, path))?;
+        let handle = pool.connect_blocking(talaris_conn_config(&cfg, path)?)?;
         assert_eq!(pool.state(handle), Some(talaris::connection::State::Open));
         ingress_before.push(pool.ingress_stats(handle).unwrap_or_default());
         handles.push(handle);
@@ -316,16 +381,32 @@ fn run_talaris(
     })
 }
 
-fn talaris_conn_config(cfg: &Config, path: &str) -> talaris::connection::ConnectionConfig {
-    talaris::connection::ConnectionConfig::new(&cfg.host, cfg.port, path)
+fn talaris_conn_config(
+    cfg: &Config,
+    path: &str,
+) -> BenchResult<talaris::connection::ConnectionConfig> {
+    let tls_config = Arc::new(
+        talaris::tls::TlsAdapter::client_config_with_cipher_preference(
+            cfg.tls_provider,
+            cfg.tls_cipher,
+        )?,
+    );
+    let mut conn_cfg = talaris::connection::ConnectionConfig::new(&cfg.host, cfg.port, path)
+        .with_tls_config(tls_config)
         .with_sq_entries(cfg.sq_entries)
         .with_cq_entries(cfg.cq_entries)
+        .with_proactor_setup_flags(cfg.setup_flags)
+        .with_recv_mode(cfg.recv_mode)
         .with_buf_ring(cfg.buf_size, cfg.buf_entries)
         .with_ws_limits(8 * 1024 * 1024, 16 * 1024 * 1024)
         .with_ws_buffer_capacities(128 * 1024, 128 * 1024, 16 * 1024)
         .with_ingress_stats(true)
         .with_observability_sample_rate_bps(cfg.sample_bps)
-        .with_observability_histograms(false)
+        .with_observability_histograms(false);
+    if let Some(usecs) = cfg.socket_busy_poll_usecs {
+        conn_cfg = conn_cfg.with_socket_busy_poll_usecs(usecs);
+    }
+    Ok(conn_cfg)
 }
 
 fn aggregate_ingress_delta(
@@ -477,9 +558,12 @@ fn connect_tungstenite_socket(
     tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(5)))?;
 
-    let tls_config = Arc::new(talaris::tls::TlsAdapter::client_config(
-        talaris::tls::TlsCryptoProvider::default(),
-    )?);
+    let tls_config = Arc::new(
+        talaris::tls::TlsAdapter::client_config_with_cipher_preference(
+            cfg.tls_provider,
+            cfg.tls_cipher,
+        )?,
+    );
     let server_name = rustls::pki_types::ServerName::try_from(cfg.host.clone())
         .map_err(|_| format!("invalid server name {:?}", cfg.host))?;
     let mut tls_conn = rustls::ClientConnection::new(tls_config, server_name)?;
@@ -519,17 +603,63 @@ fn run_tungstenite_worker(
     let mut stats = common::MessageStats::default();
     let mut latency = TungsteniteLatencyStats::new()?;
     let cpu = common::ThreadCpuTimer::start();
-    while Instant::now() < deadline {
-        match socket.read() {
-            Ok(message) => {
-                let ready_at = Instant::now();
-                let marker = socket.get_ref().last_read_marker();
-                if record_tungstenite_message(&mut stats, message)? {
-                    latency.record_message(marker, ready_at);
+
+    match cfg.tungstenite_io {
+        TungsteniteIoMode::Blocking => {
+            while Instant::now() < deadline {
+                match socket.read() {
+                    Ok(message) => {
+                        record_tungstenite_ready_message(
+                            &socket,
+                            &mut stats,
+                            &mut latency,
+                            message,
+                            None,
+                        )?;
+                    }
+                    Err(tungstenite::Error::Io(e)) if is_timeout(&e) => {}
+                    Err(e) => return Err(Box::new(e)),
                 }
             }
-            Err(tungstenite::Error::Io(e)) if is_timeout(&e) => {}
-            Err(e) => return Err(Box::new(e)),
+        }
+        TungsteniteIoMode::Epoll => {
+            socket.get_mut().set_nonblocking(true)?;
+            let epoll = EpollWaiter::new(socket.get_ref().as_raw_fd())?;
+            let mut events = [BenchEpollEvent { events: 0, u64: 0 }; 8];
+            let mut epoll_generation = 0_u64;
+            while Instant::now() < deadline {
+                let (ready, epoll_ready_at) = wait_tungstenite_epoll(
+                    &epoll,
+                    &mut events,
+                    cfg.tungstenite_spin_iters,
+                    deadline,
+                )?;
+                if ready == 0 {
+                    continue;
+                }
+                epoll_generation = epoll_generation.saturating_add(1);
+                for event in events.iter().take(ready) {
+                    if event.events & epoll_error_events() != 0 {
+                        // Let tungstenite/rustls surface the concrete EOF/error.
+                    }
+                    loop {
+                        match socket.read() {
+                            Ok(message) => {
+                                record_tungstenite_ready_message(
+                                    &socket,
+                                    &mut stats,
+                                    &mut latency,
+                                    message,
+                                    Some((epoll_generation, epoll_ready_at)),
+                                )?;
+                            }
+                            Err(tungstenite::Error::Io(e)) if is_timeout(&e) => break,
+                            Err(e) => return Err(Box::new(e)),
+                        }
+                    }
+                }
+            }
+            socket.get_mut().set_nonblocking(false)?;
         }
     }
 
@@ -544,6 +674,24 @@ fn run_tungstenite_worker(
         elapsed,
         cpu: cpu_elapsed,
     })
+}
+
+fn record_tungstenite_ready_message(
+    socket: &tungstenite::WebSocket<TlsCountingStream>,
+    stats: &mut common::MessageStats,
+    latency: &mut TungsteniteLatencyStats,
+    message: tungstenite::Message,
+    epoll_marker: Option<(u64, Instant)>,
+) -> Result<(), tungstenite::Error> {
+    let ready_at = Instant::now();
+    let marker = socket.get_ref().last_read_marker();
+    if record_tungstenite_message(stats, message)? {
+        latency.record_message(marker, ready_at);
+        if let Some((epoll_generation, epoll_ready_at)) = epoll_marker {
+            latency.record_epoll_message(epoll_generation, epoll_ready_at, ready_at);
+        }
+    }
+    Ok(())
 }
 
 fn record_tungstenite_message(
@@ -751,8 +899,11 @@ impl TalarisLatencyStats {
 #[derive(Debug)]
 struct TungsteniteLatencyStats {
     read_to_ws: StageLatencyStats,
+    epoll_to_ws: StageLatencyStats,
     last_generation: Option<u64>,
     current_read_message_index: u16,
+    last_epoll_generation: Option<u64>,
+    current_epoll_message_index: u16,
     missing_markers: u64,
 }
 
@@ -760,8 +911,11 @@ impl TungsteniteLatencyStats {
     fn new() -> Result<Self, hdrhistogram::CreationError> {
         Ok(Self {
             read_to_ws: StageLatencyStats::new()?,
+            epoll_to_ws: StageLatencyStats::new()?,
             last_generation: None,
             current_read_message_index: 0,
+            last_epoll_generation: None,
+            current_epoll_message_index: 0,
             missing_markers: 0,
         })
     }
@@ -784,8 +938,28 @@ impl TungsteniteLatencyStats {
             .record(MessagePosition::from_index(index), nanos);
     }
 
+    fn record_epoll_message(
+        &mut self,
+        epoll_generation: u64,
+        epoll_ready_at: Instant,
+        ready_at: Instant,
+    ) {
+        let index = if self.last_epoll_generation == Some(epoll_generation) {
+            self.current_epoll_message_index = self.current_epoll_message_index.saturating_add(1);
+            self.current_epoll_message_index
+        } else {
+            self.last_epoll_generation = Some(epoll_generation);
+            self.current_epoll_message_index = 0;
+            0
+        };
+        let nanos = duration_nanos(ready_at.saturating_duration_since(epoll_ready_at));
+        self.epoll_to_ws
+            .record(MessagePosition::from_index(index), nanos);
+    }
+
     fn merge_from(&mut self, other: &Self) {
         self.read_to_ws.merge_from(&other.read_to_ws);
+        self.epoll_to_ws.merge_from(&other.epoll_to_ws);
         self.missing_markers = self.missing_markers.saturating_add(other.missing_markers);
     }
 
@@ -797,6 +971,8 @@ impl TungsteniteLatencyStats {
             "socket_read_to_ws",
             "read_message",
         );
+        self.epoll_to_ws
+            .print(streams, redundancy, mode, "epoll_to_ws", "epoll_message");
         println!(
             "bench_latency_marker bench=live_compare mode={mode} streams={streams} redundancy={redundancy} missing_markers={}",
             common::fmt_int(self.missing_markers)
@@ -957,6 +1133,10 @@ impl CountingTcpStream {
         self.inner.set_write_timeout(timeout)
     }
 
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        self.inner.set_nonblocking(nonblocking)
+    }
+
     const fn read_stats(&self) -> StreamReadStats {
         StreamReadStats {
             calls: self.read_calls,
@@ -979,6 +1159,12 @@ impl CountingTcpStream {
             }),
             None => None,
         }
+    }
+}
+
+impl AsRawFd for CountingTcpStream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.inner.as_raw_fd()
     }
 }
 
@@ -1027,6 +1213,16 @@ impl TlsCountingStream {
     const fn reset_read_stats(&mut self) {
         self.stream.reset_read_stats();
     }
+
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        self.stream.set_nonblocking(nonblocking)
+    }
+}
+
+impl AsRawFd for TlsCountingStream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
+    }
 }
 
 impl Read for TlsCountingStream {
@@ -1064,16 +1260,154 @@ struct ReadMarker {
     read_at: Instant,
 }
 
-fn build_combined_path(symbols: &[String], stream_count: usize) -> String {
-    let mut path = String::from("/stream?streams=");
-    for (index, symbol) in symbols.iter().take(stream_count).enumerate() {
-        if index > 0 {
-            path.push('/');
+#[cfg(target_os = "linux")]
+type BenchEpollEvent = libc::epoll_event;
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Copy, Debug)]
+#[allow(non_camel_case_types)]
+struct BenchEpollEvent {
+    events: u32,
+    u64: u64,
+}
+
+#[derive(Debug)]
+struct EpollWaiter {
+    fd: RawFd,
+}
+
+impl EpollWaiter {
+    fn new(socket_fd: RawFd) -> std::io::Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = socket_fd;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "epoll is only available on Linux",
+            ))
         }
-        path.push_str(symbol);
-        path.push_str("@bookTicker");
+
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: epoll_create1 has no Rust aliasing requirements.
+            let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut event = libc::epoll_event {
+                events: epoll_read_events(),
+                u64: u64::try_from(socket_fd).unwrap_or(0),
+            };
+            // SAFETY: fd and socket_fd are valid file descriptors; event points
+            // to initialized memory for the duration of the syscall.
+            let rc = unsafe { libc::epoll_ctl(fd, libc::EPOLL_CTL_ADD, socket_fd, &raw mut event) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                // SAFETY: fd was returned by epoll_create1 above.
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(err);
+            }
+            Ok(Self { fd })
+        }
     }
-    path
+
+    fn wait(&self, events: &mut [BenchEpollEvent], timeout_ms: i32) -> std::io::Result<usize> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (self, events, timeout_ms);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "epoll is only available on Linux",
+            ))
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let maxevents = i32::try_from(events.len()).unwrap_or(i32::MAX);
+            // SAFETY: events points to writable memory for maxevents entries.
+            let rc =
+                unsafe { libc::epoll_wait(self.fd, events.as_mut_ptr(), maxevents, timeout_ms) };
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(usize::try_from(rc).unwrap_or(usize::MAX))
+        }
+    }
+}
+
+impl Drop for EpollWaiter {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        // SAFETY: fd is owned by this wrapper.
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn epoll_read_events() -> u32 {
+    u32::try_from(libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP).unwrap_or(u32::MAX)
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn epoll_read_events() -> u32 {
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn epoll_error_events() -> u32 {
+    u32::try_from(libc::EPOLLERR | libc::EPOLLHUP).unwrap_or(0)
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn epoll_error_events() -> u32 {
+    0
+}
+
+fn epoll_timeout_ms(deadline: Instant) -> i32 {
+    let now = Instant::now();
+    if now >= deadline {
+        return 0;
+    }
+    let millis = deadline.duration_since(now).as_millis().max(1);
+    i32::try_from(millis).unwrap_or(i32::MAX)
+}
+
+fn wait_tungstenite_epoll(
+    epoll: &EpollWaiter,
+    events: &mut [BenchEpollEvent],
+    spin_iters: usize,
+    deadline: Instant,
+) -> std::io::Result<(usize, Instant)> {
+    if spin_iters == 0 {
+        let ready = epoll.wait(events, epoll_timeout_ms(deadline))?;
+        return Ok((ready, Instant::now()));
+    }
+
+    for iter in 0..=spin_iters {
+        let ready = epoll.wait(events, 0)?;
+        let ready_at = Instant::now();
+        if ready != 0 || ready_at >= deadline {
+            return Ok((ready, ready_at));
+        }
+        if iter < spin_iters {
+            std::hint::spin_loop();
+        }
+    }
+
+    Ok((0, Instant::now()))
+}
+
+fn build_combined_path(cfg: &Config, stream_count: usize) -> BenchResult<String> {
+    let paths =
+        common::build_binance_paths(cfg.feed, &cfg.symbols, stream_count, &cfg.depth_speed)?;
+    match paths.as_slice() {
+        [path] => Ok(path.clone()),
+        _ => Err("--feed depth-trade builds multiple routed paths; use live_pipeline for mixed-feed Pool/io_uring runs".into()),
+    }
 }
 
 fn verify_alpn(conn: &rustls::ClientConnection) -> BenchResult<()> {
@@ -1206,14 +1540,16 @@ fn print_usage() {
     println!(
         "live_compare bench\n\
          \n\
-         Runs talaris and tungstenite concurrently against Binance USD-M futures combined BBO streams.\n\
+         Runs talaris and tungstenite concurrently against Binance USD-M futures combined streams.\n\
          \n\
          Args:\n\
            --transport talaris|tungstenite|both\n\
            --host HOST                  websocket host\n\
            --port PORT                  websocket TLS port\n\
+           --feed bbo|depth|trade       Binance feed class; depth-trade belongs in live_pipeline\n\
            --symbols a,b,c,d            symbols used to build combined streams\n\
            --stream-counts A,B,C        number of symbols per scenario\n\
+           --depth-speed default|100ms|250ms|500ms\n\
            --redundancy-counts A,B,C    identical connections per client and scenario\n\
            --seconds N                  run duration per scenario\n\
            --sample-bps N               talaris observability sample rate, 0..10000\n\
@@ -1221,8 +1557,15 @@ fn print_usage() {
            --buf-entries N              provided buffer entries, power of two\n\
            --sq-entries N               io_uring SQ entries, power of two\n\
            --cq-entries N               io_uring CQ entries, power of two\n\
+           --setup-flags LIST           none|coop|taskrun|single|defer, comma or + separated\n\
            --completion-batch N         Pool CQE scratch buffer capacity\n\
            --spin-iters N               0 uses blocking talaris pump_data_marked\n\
+           --recv-mode MODE             multishot|multishot-bundle\n\
+           --socket-busy-poll-usecs N   set Linux SO_BUSY_POLL on talaris sockets\n\
+           --tls-provider PROVIDER      ring|aws-lc\n\
+           --tls-cipher PREF            default|aes128|aes256|chacha\n\
+           --tungstenite-io MODE        blocking|epoll\n\
+           --tungstenite-spin-iters N   epoll mode: 0 blocks, >0 busy-polls timeout=0\n\
            --talaris-cpu N              pin talaris thread\n\
            --tungstenite-cpu N          pin tungstenite thread"
     );

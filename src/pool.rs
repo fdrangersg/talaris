@@ -40,8 +40,9 @@ use crate::connection_state::ConnectionState;
 use crate::observability::LatencyHistograms;
 use crate::proactor::{Completion, Proactor, ProactorConfig, ProactorError};
 use crate::ws::{
-    ConnState as WsConnState, DataEvent as WsDataEvent, Event as WsEvent,
-    MarkedDataEvent as WsMarkedDataEvent,
+    ConnState as WsConnState, DataEvent as WsDataEvent, DataEventBatch as WsDataEventBatch,
+    Event as WsEvent, MarkedDataEvent as WsMarkedDataEvent,
+    MarkedDataEventBatch as WsMarkedDataEventBatch,
 };
 
 /// CQE.token() 中 conn_id 的位掩码 —— 28 bit，最多 ~2.6 亿条 conn / Pool，
@@ -414,6 +415,51 @@ impl Pool {
         self.pump_data_marked_impl(0, sink)
     }
 
+    /// Batch variant of [`Self::pump_data`].
+    ///
+    /// The callback receives fixed-capacity batches of data messages. Direct
+    /// plaintext chunks can produce multi-message batches; fallback protocol
+    /// paths may still produce one-message batches. Use
+    /// [`WsDataEventBatch::is_chunk_end`] to know when all data messages from
+    /// the current plaintext chunk have been delivered.
+    pub fn pump_data_batches<F>(&mut self, sink: F) -> Result<(), ConnectionError>
+    where
+        F: for<'a> FnMut(ConnHandle, WsDataEventBatch<'a>),
+    {
+        self.pump_data_batches_impl(1, sink)
+    }
+
+    /// Non-blocking batch variant of [`Self::pump_data_nowait`].
+    pub fn pump_data_batches_nowait<F>(&mut self, sink: F) -> Result<(), ConnectionError>
+    where
+        F: for<'a> FnMut(ConnHandle, WsDataEventBatch<'a>),
+    {
+        self.pump_data_batches_impl(0, sink)
+    }
+
+    /// Batch variant of [`Self::pump_data_marked`].
+    ///
+    /// Batch delivery measures sink service at the batch boundary. Messages in
+    /// one emitted batch share the same `chunk_prior_sink_service_nanos`; use
+    /// [`Self::pump_data_marked`] for strict per-message sink queuing metrics.
+    /// Use [`WsMarkedDataEventBatch::is_chunk_end`] to coalesce all data
+    /// messages from the current plaintext chunk without waiting for the next
+    /// chunk.
+    pub fn pump_data_marked_batches<F>(&mut self, sink: F) -> Result<(), ConnectionError>
+    where
+        F: for<'a> FnMut(ConnHandle, WsMarkedDataEventBatch<'a>),
+    {
+        self.pump_data_marked_batches_impl(1, sink)
+    }
+
+    /// Non-blocking batch variant of [`Self::pump_data_marked_nowait`].
+    pub fn pump_data_marked_batches_nowait<F>(&mut self, sink: F) -> Result<(), ConnectionError>
+    where
+        F: for<'a> FnMut(ConnHandle, WsMarkedDataEventBatch<'a>),
+    {
+        self.pump_data_marked_batches_impl(0, sink)
+    }
+
     /// Busy-poll 版本的 [`pump_data`](Self::pump_data)。
     ///
     /// 本方法只轮询 mmap 出来的 CQ ring，不调用 [`Proactor::wait_for_cqe`]。
@@ -425,6 +471,18 @@ impl Pool {
         F: for<'a> FnMut(ConnHandle, WsDataEvent<'a>),
     {
         self.pump_data_spin_impl(spin_iters, sink)
+    }
+
+    /// Busy-poll batch variant of [`Self::pump_data_spin`].
+    pub fn pump_data_spin_batches<F>(
+        &mut self,
+        spin_iters: usize,
+        sink: F,
+    ) -> Result<bool, ConnectionError>
+    where
+        F: for<'a> FnMut(ConnHandle, WsDataEventBatch<'a>),
+    {
+        self.pump_data_spin_batches_impl(spin_iters, sink)
     }
 
     /// Busy-poll marked data-only pump.
@@ -441,6 +499,21 @@ impl Pool {
         F: for<'a> FnMut(ConnHandle, WsMarkedDataEvent<'a>),
     {
         self.pump_data_spin_marked_impl(spin_iters, sink)
+    }
+
+    /// Busy-poll batch variant of [`Self::pump_data_spin_marked`].
+    ///
+    /// See [`Self::pump_data_marked_batches`] for batch observability
+    /// semantics.
+    pub fn pump_data_spin_marked_batches<F>(
+        &mut self,
+        spin_iters: usize,
+        sink: F,
+    ) -> Result<bool, ConnectionError>
+    where
+        F: for<'a> FnMut(ConnHandle, WsMarkedDataEventBatch<'a>),
+    {
+        self.pump_data_spin_marked_batches_impl(spin_iters, sink)
     }
 
     /// data-only pump 实现。CQE drain 后按连接路由；同一连接连续 plain recv
@@ -529,6 +602,98 @@ impl Pool {
                 }
             }
         }
+
+        sync_active_count(conns, active_count);
+        first_err.map_or(Ok(()), Err)
+    }
+
+    fn pump_data_batches_impl<F>(
+        &mut self,
+        wait_nr: usize,
+        mut sink: F,
+    ) -> Result<(), ConnectionError>
+    where
+        F: for<'a> FnMut(ConnHandle, WsDataEventBatch<'a>),
+    {
+        let Self {
+            proactor,
+            conns,
+            completions_buf,
+            active_count,
+            ..
+        } = self;
+
+        let mut first_err: Option<ConnectionError> = None;
+
+        for slot in conns.iter_mut() {
+            let Some(conn) = slot.as_mut() else { continue };
+            if let Err(e) = conn.try_submit_send(proactor) {
+                fail_conn(conn, e, &mut first_err);
+                continue;
+            }
+            if let Err(e) = conn.try_rearm_multishot(proactor) {
+                fail_conn(conn, e, &mut first_err);
+            }
+        }
+
+        proactor.submit()?;
+        proactor.wait_for_cqe(wait_nr)?;
+
+        completions_buf.clear();
+        proactor.drain_completions(|c| completions_buf.push(c));
+        dispatch_conn_completions_data_batches(
+            conns,
+            proactor,
+            completions_buf,
+            &mut sink,
+            &mut first_err,
+        );
+
+        sync_active_count(conns, active_count);
+        first_err.map_or(Ok(()), Err)
+    }
+
+    fn pump_data_marked_batches_impl<F>(
+        &mut self,
+        wait_nr: usize,
+        mut sink: F,
+    ) -> Result<(), ConnectionError>
+    where
+        F: for<'a> FnMut(ConnHandle, WsMarkedDataEventBatch<'a>),
+    {
+        let Self {
+            proactor,
+            conns,
+            completions_buf,
+            active_count,
+            ..
+        } = self;
+
+        let mut first_err: Option<ConnectionError> = None;
+
+        for slot in conns.iter_mut() {
+            let Some(conn) = slot.as_mut() else { continue };
+            if let Err(e) = conn.try_submit_send(proactor) {
+                fail_conn(conn, e, &mut first_err);
+                continue;
+            }
+            if let Err(e) = conn.try_rearm_multishot(proactor) {
+                fail_conn(conn, e, &mut first_err);
+            }
+        }
+
+        proactor.submit()?;
+        proactor.wait_for_cqe(wait_nr)?;
+
+        completions_buf.clear();
+        proactor.drain_completions(|c| completions_buf.push(c));
+        dispatch_conn_completions_data_marked_batches(
+            conns,
+            proactor,
+            completions_buf,
+            &mut sink,
+            &mut first_err,
+        );
 
         sync_active_count(conns, active_count);
         first_err.map_or(Ok(()), Err)
@@ -628,6 +793,124 @@ impl Pool {
                 progressed = true;
                 drain_post_progress(post_progress_spin_iters, &mut first_err, |first_err| {
                     let _ = drain_conn_completions_data_marked(
+                        conns,
+                        proactor,
+                        completions_buf,
+                        &mut sink,
+                        first_err,
+                    );
+                });
+            }
+
+            if progressed || first_err.is_some() {
+                break;
+            }
+            if iter < spin_iters {
+                std::hint::spin_loop();
+            }
+        }
+
+        sync_active_count(conns, active_count);
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(progressed),
+        }
+    }
+
+    fn pump_data_spin_batches_impl<F>(
+        &mut self,
+        spin_iters: usize,
+        mut sink: F,
+    ) -> Result<bool, ConnectionError>
+    where
+        F: for<'a> FnMut(ConnHandle, WsDataEventBatch<'a>),
+    {
+        let post_progress_spin_iters = self.post_progress_spin_iters;
+        let Self {
+            proactor,
+            conns,
+            completions_buf,
+            active_count,
+            ..
+        } = self;
+
+        let mut first_err: Option<ConnectionError> = None;
+        let mut progressed = false;
+
+        submit_conn_ops(conns, proactor, &mut first_err);
+        proactor.submit()?;
+
+        for iter in 0..=spin_iters {
+            let cqes = drain_conn_completions_data_batches(
+                conns,
+                proactor,
+                completions_buf,
+                &mut sink,
+                &mut first_err,
+            );
+            if cqes > 0 {
+                progressed = true;
+                drain_post_progress(post_progress_spin_iters, &mut first_err, |first_err| {
+                    let _ = drain_conn_completions_data_batches(
+                        conns,
+                        proactor,
+                        completions_buf,
+                        &mut sink,
+                        first_err,
+                    );
+                });
+            }
+
+            if progressed || first_err.is_some() {
+                break;
+            }
+            if iter < spin_iters {
+                std::hint::spin_loop();
+            }
+        }
+
+        sync_active_count(conns, active_count);
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(progressed),
+        }
+    }
+
+    fn pump_data_spin_marked_batches_impl<F>(
+        &mut self,
+        spin_iters: usize,
+        mut sink: F,
+    ) -> Result<bool, ConnectionError>
+    where
+        F: for<'a> FnMut(ConnHandle, WsMarkedDataEventBatch<'a>),
+    {
+        let post_progress_spin_iters = self.post_progress_spin_iters;
+        let Self {
+            proactor,
+            conns,
+            completions_buf,
+            active_count,
+            ..
+        } = self;
+
+        let mut first_err: Option<ConnectionError> = None;
+        let mut progressed = false;
+
+        submit_conn_ops(conns, proactor, &mut first_err);
+        proactor.submit()?;
+
+        for iter in 0..=spin_iters {
+            let cqes = drain_conn_completions_data_marked_batches(
+                conns,
+                proactor,
+                completions_buf,
+                &mut sink,
+                &mut first_err,
+            );
+            if cqes > 0 {
+                progressed = true;
+                drain_post_progress(post_progress_spin_iters, &mut first_err, |first_err| {
+                    let _ = drain_conn_completions_data_marked_batches(
                         conns,
                         proactor,
                         completions_buf,
@@ -1051,6 +1334,160 @@ fn dispatch_conn_completions_data_marked<F>(
         }
 
         match conn.handle_completion_data_marked(proactor, c, |ev| sink(handle, ev)) {
+            Ok(_) => {
+                conn.sync_ws_open_state();
+                conn.sync_ws_close_state();
+            }
+            Err(e) => fail_conn(conn, e, first_err),
+        }
+        i += 1;
+    }
+}
+
+fn drain_conn_completions_data_batches<F>(
+    conns: &mut [Option<ConnectionState>],
+    proactor: &mut Proactor,
+    completions_buf: &mut Vec<Completion>,
+    sink: &mut F,
+    first_err: &mut Option<ConnectionError>,
+) -> usize
+where
+    F: for<'a> FnMut(ConnHandle, WsDataEventBatch<'a>),
+{
+    completions_buf.clear();
+    let count = proactor.drain_completions(|c| completions_buf.push(c));
+    dispatch_conn_completions_data_batches(conns, proactor, completions_buf, sink, first_err);
+    count
+}
+
+fn dispatch_conn_completions_data_batches<F>(
+    conns: &mut [Option<ConnectionState>],
+    proactor: &mut Proactor,
+    completions_buf: &[Completion],
+    sink: &mut F,
+    first_err: &mut Option<ConnectionError>,
+) where
+    F: for<'a> FnMut(ConnHandle, WsDataEventBatch<'a>),
+{
+    let mut i = 0_usize;
+    while i < completions_buf.len() {
+        let c = completions_buf[i];
+        let conn_id = completion_conn_id(c);
+        let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) else {
+            i += 1;
+            continue;
+        };
+
+        let handle = ConnHandle(conn.conn_id());
+        if conn.can_handle_plain_recv_data_batch(c) {
+            let mut end = i + 1;
+            while end < completions_buf.len() {
+                let next = completions_buf[end];
+                if completion_conn_id(next) != conn_id
+                    || !conn.can_handle_plain_recv_data_batch(next)
+                {
+                    break;
+                }
+                end += 1;
+            }
+
+            match conn.handle_plain_recv_data_event_batches(
+                &completions_buf[i..end],
+                &mut |batch| {
+                    sink(handle, batch);
+                },
+            ) {
+                Ok(_) => {
+                    conn.sync_ws_open_state();
+                    conn.sync_ws_close_state();
+                }
+                Err(e) => fail_conn(conn, e, first_err),
+            }
+            i = end;
+            continue;
+        }
+
+        match conn.handle_completion_data_batch(proactor, c, |batch| sink(handle, batch)) {
+            Ok(_) => {
+                conn.sync_ws_open_state();
+                conn.sync_ws_close_state();
+            }
+            Err(e) => fail_conn(conn, e, first_err),
+        }
+        i += 1;
+    }
+}
+
+fn drain_conn_completions_data_marked_batches<F>(
+    conns: &mut [Option<ConnectionState>],
+    proactor: &mut Proactor,
+    completions_buf: &mut Vec<Completion>,
+    sink: &mut F,
+    first_err: &mut Option<ConnectionError>,
+) -> usize
+where
+    F: for<'a> FnMut(ConnHandle, WsMarkedDataEventBatch<'a>),
+{
+    completions_buf.clear();
+    let count = proactor.drain_completions(|c| completions_buf.push(c));
+    dispatch_conn_completions_data_marked_batches(
+        conns,
+        proactor,
+        completions_buf,
+        sink,
+        first_err,
+    );
+    count
+}
+
+fn dispatch_conn_completions_data_marked_batches<F>(
+    conns: &mut [Option<ConnectionState>],
+    proactor: &mut Proactor,
+    completions_buf: &[Completion],
+    sink: &mut F,
+    first_err: &mut Option<ConnectionError>,
+) where
+    F: for<'a> FnMut(ConnHandle, WsMarkedDataEventBatch<'a>),
+{
+    let mut i = 0_usize;
+    while i < completions_buf.len() {
+        let c = completions_buf[i];
+        let conn_id = completion_conn_id(c);
+        let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) else {
+            i += 1;
+            continue;
+        };
+
+        let handle = ConnHandle(conn.conn_id());
+        if conn.can_handle_plain_recv_data_batch(c) {
+            let mut end = i + 1;
+            while end < completions_buf.len() {
+                let next = completions_buf[end];
+                if completion_conn_id(next) != conn_id
+                    || !conn.can_handle_plain_recv_data_batch(next)
+                {
+                    break;
+                }
+                end += 1;
+            }
+
+            match conn.handle_plain_recv_data_event_batches_marked(
+                &completions_buf[i..end],
+                &mut |batch| {
+                    sink(handle, batch);
+                },
+            ) {
+                Ok(_) => {
+                    conn.sync_ws_open_state();
+                    conn.sync_ws_close_state();
+                }
+                Err(e) => fail_conn(conn, e, first_err),
+            }
+            i = end;
+            continue;
+        }
+
+        match conn.handle_completion_data_marked_batch(proactor, c, |batch| sink(handle, batch)) {
             Ok(_) => {
                 conn.sync_ws_open_state();
                 conn.sync_ws_close_state();

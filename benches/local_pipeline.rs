@@ -100,6 +100,9 @@ struct Config {
     cq_entries: u32,
     completion_batch: usize,
     spin_iters: usize,
+    batch_sink: bool,
+    bbo_chunk_coalesce: bool,
+    downstream_spin_ns: u64,
     metrics_interval: std::time::Duration,
     prom_out: Option<String>,
     user_cpu: Option<usize>,
@@ -141,6 +144,9 @@ impl Config {
             cq_entries,
             completion_batch: common::arg_or("--completion-batch", 64_usize).max(1),
             spin_iters: common::arg_or("--spin-iters", 256_usize),
+            batch_sink: common::flag_present("--batch-sink"),
+            bbo_chunk_coalesce: common::flag_present("--bbo-chunk-coalesce"),
+            downstream_spin_ns: common::arg_or("--downstream-spin-ns", 0_u64),
             metrics_interval: std::time::Duration::from_millis(common::arg_or(
                 "--metrics-interval-ms",
                 1000_u64,
@@ -153,7 +159,7 @@ impl Config {
 
     fn print(&self) {
         println!(
-            "bench_config bench=local_pipeline mode={} seconds={} messages={} payload_profile={} payload={} actual_payload={} frames_per_write={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} sample_bps={} histograms={} metrics_interval_ms={} prom_out={}",
+            "bench_config bench=local_pipeline mode={} seconds={} messages={} payload_profile={} payload={} actual_payload={} frames_per_write={} buf={}x{} sq_entries={} cq_entries={} completion_batch={} spin_iters={} batch_sink={} bbo_chunk_coalesce={} downstream_spin_ns={} sample_bps={} histograms={} metrics_interval_ms={} prom_out={}",
             self.mode.as_str(),
             self.seconds,
             self.messages,
@@ -167,6 +173,9 @@ impl Config {
             self.cq_entries,
             self.completion_batch,
             self.spin_iters,
+            self.batch_sink,
+            self.bbo_chunk_coalesce,
+            self.downstream_spin_ns,
             self.mode.sample_bps(),
             self.mode.histograms(),
             self.metrics_interval.as_millis(),
@@ -211,15 +220,67 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut prom = common::PromWriter::from_arg(cfg.prom_out.clone())?;
     let mut stats = common::MessageStats::default();
+    let mut coalesce = BboChunkCoalescer::default();
     let cpu = common::ThreadCpuTimer::start();
     let started = std::time::Instant::now();
     let mut metrics_schedule = common::MetricsSchedule::new(started, cfg.metrics_interval);
 
+    if cfg.bbo_chunk_coalesce {
+        if !cfg.batch_sink {
+            return Err("--bbo-chunk-coalesce requires --batch-sink".into());
+        }
+        if cfg.payload_profile != common::PayloadProfile::BinanceBbo {
+            return Err("--bbo-chunk-coalesce requires --payload-profile binance-bbo".into());
+        }
+    }
+
     while should_continue(&cfg, &stats, started.elapsed()) {
         if cfg.mode.marked() {
-            pump_marked(&mut pool, cfg.spin_iters, &mut stats)?;
+            if cfg.batch_sink && cfg.bbo_chunk_coalesce {
+                pump_marked_batches_coalesced(
+                    &mut pool,
+                    cfg.spin_iters,
+                    &mut stats,
+                    &mut coalesce,
+                    cfg.downstream_spin_ns,
+                )?;
+            } else if cfg.batch_sink {
+                pump_marked_batches(
+                    &mut pool,
+                    cfg.spin_iters,
+                    &mut stats,
+                    cfg.downstream_spin_ns,
+                )?;
+            } else {
+                pump_marked(
+                    &mut pool,
+                    cfg.spin_iters,
+                    &mut stats,
+                    cfg.downstream_spin_ns,
+                )?;
+            }
+        } else if cfg.batch_sink && cfg.bbo_chunk_coalesce {
+            pump_unmarked_batches_coalesced(
+                &mut pool,
+                cfg.spin_iters,
+                &mut stats,
+                &mut coalesce,
+                cfg.downstream_spin_ns,
+            )?;
+        } else if cfg.batch_sink {
+            pump_unmarked_batches(
+                &mut pool,
+                cfg.spin_iters,
+                &mut stats,
+                cfg.downstream_spin_ns,
+            )?;
         } else {
-            pump_unmarked(&mut pool, cfg.spin_iters, &mut stats)?;
+            pump_unmarked(
+                &mut pool,
+                cfg.spin_iters,
+                &mut stats,
+                cfg.downstream_spin_ns,
+            )?;
         }
         metrics_schedule.write_due(&mut prom, "local_pipeline", &mut pool, started)?;
     }
@@ -236,6 +297,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     if cfg.mode.marked() {
         common::print_marked_summary(&stats);
+    }
+    if cfg.bbo_chunk_coalesce {
+        coalesce.print();
     }
     common::print_ingress_stats(handle, pool.ingress_stats(handle));
 
@@ -258,12 +322,15 @@ fn pump_unmarked(
     pool: &mut talaris::Pool,
     spin_iters: usize,
     stats: &mut common::MessageStats,
+    downstream_spin_ns: u64,
 ) -> Result<(), talaris::connection::ConnectionError> {
     if spin_iters == 0 {
-        pool.pump_data(|_, ev| record_unmarked_event(stats, &ev))
+        pool.pump_data(|_, ev| record_unmarked_event(stats, &ev, downstream_spin_ns))
     } else {
-        pool.pump_data_spin(spin_iters, |_, ev| record_unmarked_event(stats, &ev))
-            .map(|_| ())
+        pool.pump_data_spin(spin_iters, |_, ev| {
+            record_unmarked_event(stats, &ev, downstream_spin_ns);
+        })
+        .map(|_| ())
     }
 }
 
@@ -271,23 +338,117 @@ fn pump_marked(
     pool: &mut talaris::Pool,
     spin_iters: usize,
     stats: &mut common::MessageStats,
+    downstream_spin_ns: u64,
 ) -> Result<(), talaris::connection::ConnectionError> {
     if spin_iters == 0 {
-        pool.pump_data_marked(|_, ev| record_marked_event(stats, &ev))
+        pool.pump_data_marked(|_, ev| record_marked_event(stats, &ev, downstream_spin_ns))
     } else {
-        pool.pump_data_spin_marked(spin_iters, |_, ev| record_marked_event(stats, &ev))
-            .map(|_| ())
+        pool.pump_data_spin_marked(spin_iters, |_, ev| {
+            record_marked_event(stats, &ev, downstream_spin_ns);
+        })
+        .map(|_| ())
     }
 }
 
-fn record_unmarked_event(stats: &mut common::MessageStats, ev: &talaris::ws::DataEvent<'_>) {
+fn pump_unmarked_batches(
+    pool: &mut talaris::Pool,
+    spin_iters: usize,
+    stats: &mut common::MessageStats,
+    downstream_spin_ns: u64,
+) -> Result<(), talaris::connection::ConnectionError> {
+    if spin_iters == 0 {
+        pool.pump_data_batches(|_, batch| record_unmarked_batch(stats, &batch, downstream_spin_ns))
+    } else {
+        pool.pump_data_spin_batches(spin_iters, |_, batch| {
+            record_unmarked_batch(stats, &batch, downstream_spin_ns);
+        })
+        .map(|_| ())
+    }
+}
+
+fn pump_marked_batches(
+    pool: &mut talaris::Pool,
+    spin_iters: usize,
+    stats: &mut common::MessageStats,
+    downstream_spin_ns: u64,
+) -> Result<(), talaris::connection::ConnectionError> {
+    if spin_iters == 0 {
+        pool.pump_data_marked_batches(|_, batch| {
+            record_marked_batch(stats, &batch, downstream_spin_ns);
+        })
+    } else {
+        pool.pump_data_spin_marked_batches(spin_iters, |_, batch| {
+            record_marked_batch(stats, &batch, downstream_spin_ns);
+        })
+        .map(|_| ())
+    }
+}
+
+fn pump_unmarked_batches_coalesced(
+    pool: &mut talaris::Pool,
+    spin_iters: usize,
+    stats: &mut common::MessageStats,
+    coalesce: &mut BboChunkCoalescer,
+    downstream_spin_ns: u64,
+) -> Result<(), talaris::connection::ConnectionError> {
+    if spin_iters == 0 {
+        pool.pump_data_batches(|_, batch| {
+            coalesce.record_unmarked_batch(stats, &batch, downstream_spin_ns);
+        })
+    } else {
+        pool.pump_data_spin_batches(spin_iters, |_, batch| {
+            coalesce.record_unmarked_batch(stats, &batch, downstream_spin_ns);
+        })
+        .map(|_| ())
+    }
+}
+
+fn pump_marked_batches_coalesced(
+    pool: &mut talaris::Pool,
+    spin_iters: usize,
+    stats: &mut common::MessageStats,
+    coalesce: &mut BboChunkCoalescer,
+    downstream_spin_ns: u64,
+) -> Result<(), talaris::connection::ConnectionError> {
+    if spin_iters == 0 {
+        pool.pump_data_marked_batches(|_, batch| {
+            coalesce.record_marked_batch(stats, &batch, downstream_spin_ns);
+        })
+    } else {
+        pool.pump_data_spin_marked_batches(spin_iters, |_, batch| {
+            coalesce.record_marked_batch(stats, &batch, downstream_spin_ns);
+        })
+        .map(|_| ())
+    }
+}
+
+fn record_unmarked_event(
+    stats: &mut common::MessageStats,
+    ev: &talaris::ws::DataEvent<'_>,
+    downstream_spin_ns: u64,
+) {
     match ev {
         talaris::ws::DataEvent::Text(payload) => stats.record_text(payload),
         talaris::ws::DataEvent::Binary(payload) => stats.record_binary(payload),
     }
+    spin_downstream(downstream_spin_ns);
 }
 
-fn record_marked_event(stats: &mut common::MessageStats, ev: &talaris::ws::MarkedDataEvent<'_>) {
+fn record_unmarked_batch(
+    stats: &mut common::MessageStats,
+    batch: &talaris::ws::DataEventBatch<'_>,
+    downstream_spin_ns: u64,
+) {
+    for ev in batch.iter() {
+        record_unmarked_event(stats, &ev, downstream_spin_ns);
+    }
+}
+
+fn record_marked_event(
+    stats: &mut common::MessageStats,
+    ev: &talaris::ws::MarkedDataEvent<'_>,
+    downstream_spin_ns: u64,
+) {
     match ev {
         talaris::ws::MarkedDataEvent::Text { payload, meta } => {
             stats.record_meta(*meta);
@@ -297,6 +458,176 @@ fn record_marked_event(stats: &mut common::MessageStats, ev: &talaris::ws::Marke
             stats.record_meta(*meta);
             stats.record_binary(payload);
         }
+    }
+    spin_downstream(downstream_spin_ns);
+}
+
+fn record_marked_batch(
+    stats: &mut common::MessageStats,
+    batch: &talaris::ws::MarkedDataEventBatch<'_>,
+    downstream_spin_ns: u64,
+) {
+    for ev in batch.iter() {
+        record_marked_event(stats, &ev, downstream_spin_ns);
+    }
+}
+
+#[derive(Debug, Default)]
+struct BboChunkCoalescer {
+    pending: Option<u64>,
+    batches: u64,
+    chunk_end_batches: u64,
+    split_batches: u64,
+    raw_messages: u64,
+    published_messages: u64,
+    replaced_pending: u64,
+    dropped_not_newer: u64,
+    missing_seq: u64,
+    max_batch_len: usize,
+}
+
+impl BboChunkCoalescer {
+    fn record_unmarked_batch(
+        &mut self,
+        stats: &mut common::MessageStats,
+        batch: &talaris::ws::DataEventBatch<'_>,
+        downstream_spin_ns: u64,
+    ) {
+        self.record_batch_boundary(batch.len(), batch.is_chunk_end());
+        for ev in batch.iter() {
+            match ev {
+                talaris::ws::DataEvent::Text(payload) => {
+                    stats.record_text(payload);
+                    self.observe_payload(payload.as_bytes());
+                }
+                talaris::ws::DataEvent::Binary(payload) => {
+                    stats.record_binary(payload);
+                    self.observe_payload(payload);
+                }
+            }
+        }
+        self.flush_chunk_if_needed(batch.is_chunk_end(), downstream_spin_ns);
+    }
+
+    fn record_marked_batch(
+        &mut self,
+        stats: &mut common::MessageStats,
+        batch: &talaris::ws::MarkedDataEventBatch<'_>,
+        downstream_spin_ns: u64,
+    ) {
+        self.record_batch_boundary(batch.len(), batch.is_chunk_end());
+        for ev in batch.iter() {
+            match ev {
+                talaris::ws::MarkedDataEvent::Text { payload, meta } => {
+                    stats.record_meta(meta);
+                    stats.record_text(payload);
+                    self.observe_payload(payload.as_bytes());
+                }
+                talaris::ws::MarkedDataEvent::Binary { payload, meta } => {
+                    stats.record_meta(meta);
+                    stats.record_binary(payload);
+                    self.observe_payload(payload);
+                }
+            }
+        }
+        self.flush_chunk_if_needed(batch.is_chunk_end(), downstream_spin_ns);
+    }
+
+    fn record_batch_boundary(&mut self, len: usize, chunk_end: bool) {
+        self.batches = self.batches.saturating_add(1);
+        if chunk_end {
+            self.chunk_end_batches = self.chunk_end_batches.saturating_add(1);
+        } else {
+            self.split_batches = self.split_batches.saturating_add(1);
+        }
+        self.max_batch_len = self.max_batch_len.max(len);
+    }
+
+    fn observe_payload(&mut self, payload: &[u8]) {
+        self.raw_messages = self.raw_messages.saturating_add(1);
+        let Some(seq) = parse_binance_bbo_update_id(payload) else {
+            self.missing_seq = self.missing_seq.saturating_add(1);
+            return;
+        };
+
+        match self.pending {
+            None => self.pending = Some(seq),
+            Some(current) if seq > current => {
+                self.pending = Some(seq);
+                self.replaced_pending = self.replaced_pending.saturating_add(1);
+            }
+            Some(_) => {
+                self.dropped_not_newer = self.dropped_not_newer.saturating_add(1);
+            }
+        }
+    }
+
+    fn flush_chunk_if_needed(&mut self, chunk_end: bool, downstream_spin_ns: u64) {
+        if !chunk_end {
+            return;
+        }
+        if self.pending.take().is_some() {
+            self.published_messages = self.published_messages.saturating_add(1);
+            spin_downstream(downstream_spin_ns);
+        }
+    }
+
+    fn print(&self) {
+        let avoided = self.raw_messages.saturating_sub(self.published_messages);
+        let publish_reduction_pct = if self.raw_messages == 0 {
+            0.0
+        } else {
+            100.0 * avoided as f64 / self.raw_messages as f64
+        };
+        let avg_raw_per_publish = if self.published_messages == 0 {
+            0.0
+        } else {
+            self.raw_messages as f64 / self.published_messages as f64
+        };
+        println!(
+            "bench_bbo_coalesce raw_messages={} published={} avoided={} publish_reduction_pct={:.2} avg_raw_per_publish={:.3} batches={} chunk_end_batches={} split_batches={} max_batch_len={} replaced_pending={} dropped_not_newer={} missing_seq={}",
+            common::fmt_int(self.raw_messages),
+            common::fmt_int(self.published_messages),
+            common::fmt_int(avoided),
+            publish_reduction_pct,
+            avg_raw_per_publish,
+            common::fmt_int(self.batches),
+            common::fmt_int(self.chunk_end_batches),
+            common::fmt_int(self.split_batches),
+            self.max_batch_len,
+            common::fmt_int(self.replaced_pending),
+            common::fmt_int(self.dropped_not_newer),
+            common::fmt_int(self.missing_seq)
+        );
+    }
+}
+
+fn parse_binance_bbo_update_id(payload: &[u8]) -> Option<u64> {
+    let key = b"\"u\":";
+    let pos = payload
+        .windows(key.len())
+        .position(|window| window == key)?;
+    let mut value = 0_u64;
+    let mut saw_digit = false;
+    for &byte in &payload[pos + key.len()..] {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        saw_digit = true;
+        value = value
+            .saturating_mul(10)
+            .saturating_add(u64::from(byte - b'0'));
+    }
+    saw_digit.then_some(value)
+}
+
+fn spin_downstream(nanos: u64) {
+    if nanos == 0 {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_nanos(nanos);
+    while std::time::Instant::now() < deadline {
+        std::hint::spin_loop();
     }
 }
 
@@ -324,6 +655,9 @@ fn print_usage() {
            --cq-entries N            io_uring CQ entries, power of two\n\
            --completion-batch N      Pool CQE scratch buffer capacity\n\
            --spin-iters N            0 uses blocking pump_data(_marked)\n\
+           --batch-sink              use chunk/batch sink API\n\
+           --bbo-chunk-coalesce      with --batch-sink, publish only max Binance BBO seq per chunk\n\
+           --downstream-spin-ns N    simulated downstream decode/publish cost per published message\n\
            --metrics-interval-ms N   write interval Prometheus snapshots, 0 disables periodic snapshots\n\
            --prom-out PATH|-         write Prometheus snapshots to file or stdout\n\
            --user-cpu N              pin benchmark thread\n\

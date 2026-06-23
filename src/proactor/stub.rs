@@ -173,6 +173,16 @@ impl BufferRing {
     }
 
     #[must_use]
+    pub const fn entries(&self) -> u16 {
+        0
+    }
+
+    #[must_use]
+    pub const fn buf_size(&self) -> u32 {
+        0
+    }
+
+    #[must_use]
     pub fn buffer(&self, _bid: u16) -> &[u8] {
         unimplemented!("{STUB_PANIC}")
     }
@@ -221,6 +231,10 @@ impl TcpSocket {
     }
 
     pub fn set_nodelay(&self, _on: bool) -> io::Result<()> {
+        unimplemented!("{STUB_PANIC}")
+    }
+
+    pub fn set_busy_poll(&self, _usecs: u32) -> io::Result<()> {
         unimplemented!("{STUB_PANIC}")
     }
 
@@ -369,6 +383,11 @@ impl Proactor {
         unimplemented!("{STUB_PANIC}")
     }
 
+    #[must_use]
+    pub const fn supports_recvsend_bundle(&self) -> bool {
+        false
+    }
+
     /// # Safety
     /// Stub —— 调用即 panic。
     pub unsafe fn submit_connect(
@@ -433,6 +452,17 @@ impl Proactor {
     /// # Safety
     /// Stub —— 调用即 panic。
     pub unsafe fn submit_recv_multishot(
+        &mut self,
+        _fd: RawFd,
+        _buf_group: u16,
+        _user_data: UserData,
+    ) -> Result<(), ProactorError> {
+        unimplemented!("{STUB_PANIC}")
+    }
+
+    /// # Safety
+    /// Stub —— 调用即 panic。
+    pub unsafe fn submit_recv_multishot_bundle(
         &mut self,
         _fd: RawFd,
         _buf_group: u16,

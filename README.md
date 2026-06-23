@@ -140,6 +140,30 @@ pool.pump_data(|handle, data| match data {
 要自己观察 Ping/Pong/Close 事件时用 `pump`；行情主循环只关心业务 payload 时用
 `pump_data`。
 
+### 6. batch data dispatch：同一 plaintext chunk 内先合并再回调
+
+对 Binance BBO 这类高频小消息，调用方经常需要在 decode 前先看同一个
+plaintext chunk 内的多个冗余 message，并只保留最大 seq。`pump_data_*_batches`
+就是给这个场景用的：
+
+```rust
+pool.pump_data_spin_marked_batches(256, |_handle, batch| {
+    for event in batch.iter() {
+        // 扫描 raw Text/Binary，找当前 chunk 内最大 seq / 最新快照。
+    }
+
+    if batch.is_chunk_end() {
+        // 当前 plaintext chunk 的所有 data message 已经交付完毕；
+        // 这里可以立刻发布 coalesced winner，不需要等下一个 chunk。
+    }
+})?;
+```
+
+batch 是固定容量的 hot-path view。一个很大的 plaintext chunk 可能拆成多个
+batch；除最后一个外，`is_chunk_end()` 都是 `false`。非 direct fallback 路径
+仍可能退化成 one-message batch，但 control frame、fragmentation、auto-pong
+语义保持不变。
+
 ---
 
 ## 一句话术语表（cheat sheet）
@@ -164,7 +188,7 @@ pool.pump_data(|handle, data| match data {
 
 ```toml
 [dependencies]
-talaris = "0.2"
+talaris = "0.7"
 ```
 
 ### 可运行 quickstart: 本地 plain-WS echo
@@ -415,6 +439,37 @@ completion；长时间只做 userspace spin/drain 的 loop 不应无脑开启。
 默认关闭。调 buf ring 时可临时开启，并通过 `pool.ingress_stats(h)` 读取
 `recv_data_cqes`、`recv_bytes`、`recv_ring_exhaustions`、`ws_data_drains` 和
 `ws_data_drain_skips`。生产连接保持关闭，避免在 hot path 上更新计数器。
+
+### `with_socket_busy_poll_usecs(usecs)` —— 只作为实验开关
+
+`SO_BUSY_POLL` 是 Linux per-socket busy polling budget。talaris 暴露它是为了让
+特定 kernel / NIC / feed 组合可以做 A/B，但它**不是**当前 Binance Perpetual BBO
+推荐默认项。
+
+2026-06-19 在 Binance USD-M perpetual BBO（BTC/ETH）、`recv-mode=multishot`、
+`spin-iters=256`、`buf-size=2048`、`completion-batch=64`、100% observability
+采样下做了 300s live feed 对照：
+
+| `SO_BUSY_POLL` | 判断 |
+|---|---|
+| off | 当前推荐默认值 |
+| 25us / 50us | 没有 ROI，`recv_to_ws` p99 明显变差 |
+| 100us | 偶尔改善 p50/p99，但 p999 不稳定，且 live feed 样本量变化会干扰判断 |
+
+结论：在当前 io_uring multishot + user-space `pump_data_spin(256)` 路径里，
+`SO_BUSY_POLL` 没有稳定打中主要瓶颈。它不会降低 CPU；当用户态已经 busy-spin 时，
+它只是把部分等待挪到 kernel/NIC poll path。生产 BBO 配置保持关闭：
+
+```text
+recv-mode=multishot
+spin-iters=256
+buf-size=2048
+completion-batch=64
+socket-busy-poll-usecs=off
+```
+
+如果后续在新机型或新 kernel 上复测，只建议复测 `100us`，不要再重复 `25us/50us`
+矩阵。
 
 ### `pin_current_thread_to(cpu)` —— 砍尾抖动
 

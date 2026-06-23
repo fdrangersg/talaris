@@ -32,6 +32,41 @@ pub const DEFAULT_BUF_RING_SLOT_SIZE: u32 = 4 * 1024;
 /// 影响 burst 时有多少个 buffer slot 可以同时借给 kernel。
 pub const DEFAULT_BUF_RING_ENTRIES: u16 = 256;
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum RecvMode {
+    /// One long-lived `IORING_OP_RECV_MULTISHOT` CQE per received buffer.
+    #[default]
+    Multishot,
+    /// Linux 6.10+ `IORING_RECVSEND_BUNDLE` multishot receive. One CQE may
+    /// cover multiple provided buffers starting at the CQE buffer id.
+    MultishotBundle,
+}
+
+impl std::fmt::Display for RecvMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Multishot => f.write_str("multishot"),
+            Self::MultishotBundle => f.write_str("multishot-bundle"),
+        }
+    }
+}
+
+impl std::str::FromStr for RecvMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "multishot" | "multi" | "recv-multi" => Ok(Self::Multishot),
+            "multishot-bundle" | "multi-bundle" | "bundle" | "recv-bundle" => {
+                Ok(Self::MultishotBundle)
+            }
+            _ => Err(format!(
+                "invalid recv mode {s:?}; expected multishot or multishot-bundle"
+            )),
+        }
+    }
+}
+
 /// Driver 状态机。
 ///
 /// ```text
@@ -158,6 +193,12 @@ pub struct ConnectionConfig {
     /// 当前 `ConnectionConfig` 为准，避免 transport endpoint 和 WS handshake
     /// header 被调参配置意外改散。
     pub ws_config: Option<WsConfig>,
+    /// io_uring recv opcode variant. Default is classic multishot recv; bundle
+    /// is Linux 6.10+ and should be A/B tested per feed.
+    pub recv_mode: RecvMode,
+    /// Per-socket Linux `SO_BUSY_POLL` budget in microseconds. `None` leaves the
+    /// socket default untouched; this is an opt-in low-latency experiment.
+    pub socket_busy_poll_usecs: Option<u32>,
     /// `send_buf` 初始容量。`None` 表示沿用 `buf_ring_slot_size`。
     ///
     /// 这是 socket/TLS outbound staging buffer；真实 pending 字节仍会按需 grow。
@@ -195,6 +236,8 @@ impl ConnectionConfig {
             buf_ring_slot_size: DEFAULT_BUF_RING_SLOT_SIZE,
             buf_ring_entries: DEFAULT_BUF_RING_ENTRIES,
             ws_config: None,
+            recv_mode: RecvMode::Multishot,
+            socket_busy_poll_usecs: None,
             send_buffer_initial_capacity: None,
             tls_pending_out_initial_capacity: None,
             plain_recv_batch_copy_max_bytes: 0,
@@ -293,6 +336,18 @@ impl ConnectionConfig {
     #[must_use]
     pub fn with_ws_config(mut self, config: WsConfig) -> Self {
         self.ws_config = Some(config);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_recv_mode(mut self, mode: RecvMode) -> Self {
+        self.recv_mode = mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_socket_busy_poll_usecs(mut self, usecs: u32) -> Self {
+        self.socket_busy_poll_usecs = Some(usecs);
         self
     }
 

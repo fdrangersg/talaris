@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use talaris::connection::IngressStats;
 use talaris::observability::DataEventMeta;
+use talaris::proactor::ProactorSetupFlags;
 use talaris::ws::frame::{MAX_HEADER_LEN, OpCode, encode_header};
 use talaris::ws::handshake::compute_accept;
 
@@ -125,6 +126,150 @@ pub fn flag_present(flag: &str) -> bool {
 
 pub fn optional_string(flag: &str) -> Option<String> {
     optional_arg(flag)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BinanceFeed {
+    Bbo,
+    Depth,
+    Trade,
+    DepthTrade,
+}
+
+impl BinanceFeed {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bbo => "bbo",
+            Self::Depth => "depth",
+            Self::Trade => "trade",
+            Self::DepthTrade => "depth-trade",
+        }
+    }
+}
+
+impl FromStr for BinanceFeed {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "bbo" | "book-ticker" | "bookTicker" => Ok(Self::Bbo),
+            "depth" | "diff-depth" => Ok(Self::Depth),
+            "trade" | "public-trade" | "agg-trade" | "aggTrade" => Ok(Self::Trade),
+            "depth-trade" | "depth+trade" | "mixed" => Ok(Self::DepthTrade),
+            other => Err(format!("unknown Binance feed {other:?}")),
+        }
+    }
+}
+
+pub fn parse_symbols(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .filter_map(|s| {
+            let symbol = s.trim().to_ascii_lowercase();
+            (!symbol.is_empty()).then_some(symbol)
+        })
+        .collect()
+}
+
+pub fn split_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .filter_map(|s| {
+            let value = s.trim().to_owned();
+            (!value.is_empty()).then_some(value)
+        })
+        .collect()
+}
+
+pub fn depth_suffix(speed: &str) -> Result<String, String> {
+    match speed {
+        "default" | "250ms" => Ok("@depth".to_owned()),
+        "100ms" => Ok("@depth@100ms".to_owned()),
+        "500ms" => Ok("@depth@500ms".to_owned()),
+        other => Err(format!(
+            "--depth-speed must be default, 100ms, 250ms, or 500ms; got {other:?}"
+        )),
+    }
+}
+
+pub fn build_binance_paths(
+    feed: BinanceFeed,
+    symbols: &[String],
+    stream_count: usize,
+    depth_speed: &str,
+) -> Result<Vec<String>, String> {
+    if stream_count == 0 {
+        return Err("--stream-count must be positive".to_owned());
+    }
+    if stream_count > symbols.len() {
+        return Err(format!(
+            "--stream-count {stream_count} exceeds symbol count {}",
+            symbols.len()
+        ));
+    }
+    let selected = &symbols[..stream_count];
+    let depth_suffix = depth_suffix(depth_speed)?;
+    Ok(match feed {
+        BinanceFeed::Bbo => vec![build_binance_stream_path(
+            "/public",
+            selected.iter().map(|symbol| format!("{symbol}@bookTicker")),
+        )],
+        BinanceFeed::Depth => vec![build_binance_stream_path(
+            "/public",
+            selected
+                .iter()
+                .map(|symbol| format!("{symbol}{depth_suffix}")),
+        )],
+        BinanceFeed::Trade => vec![build_binance_stream_path(
+            "/market",
+            selected.iter().map(|symbol| format!("{symbol}@aggTrade")),
+        )],
+        BinanceFeed::DepthTrade => vec![
+            build_binance_stream_path(
+                "/public",
+                selected
+                    .iter()
+                    .map(|symbol| format!("{symbol}{depth_suffix}")),
+            ),
+            build_binance_stream_path(
+                "/market",
+                selected.iter().map(|symbol| format!("{symbol}@aggTrade")),
+            ),
+        ],
+    })
+}
+
+fn build_binance_stream_path<I>(route: &str, streams: I) -> String
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut path = String::from(route);
+    path.push_str("/stream?streams=");
+    for (index, stream) in streams.into_iter().enumerate() {
+        if index > 0 {
+            path.push('/');
+        }
+        path.push_str(&stream);
+    }
+    path
+}
+
+pub fn parse_proactor_setup_flags(raw: &str) -> Result<ProactorSetupFlags, String> {
+    let mut flags = ProactorSetupFlags::NONE;
+    for part in raw.split([',', '+']) {
+        match part.trim() {
+            "" | "none" => {}
+            "coop" | "coop-taskrun" => flags |= ProactorSetupFlags::COOP_TASKRUN,
+            "taskrun" | "taskrun-flag" => flags |= ProactorSetupFlags::TASKRUN_FLAG,
+            "single" | "single-issuer" => flags |= ProactorSetupFlags::SINGLE_ISSUER,
+            "defer" | "defer-taskrun" => flags |= ProactorSetupFlags::DEFER_TASKRUN,
+            other => {
+                return Err(format!(
+                    "unknown --setup-flags value {other:?}; expected none, coop, taskrun, single, defer"
+                ));
+            }
+        }
+    }
+    Ok(flags)
 }
 
 pub fn print_linux_only(name: &str) {

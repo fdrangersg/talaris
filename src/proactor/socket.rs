@@ -145,6 +145,46 @@ impl TcpSocket {
         Ok(())
     }
 
+    /// Linux `SO_BUSY_POLL` budget in microseconds.
+    ///
+    /// This is intentionally explicit and not part of the default socket setup:
+    /// it can increase CPU usage and only helps when the kernel/NIC path supports
+    /// socket busy polling.
+    #[cfg(target_os = "linux")]
+    pub fn set_busy_poll(&self, usecs: u32) -> io::Result<()> {
+        let val = libc::c_int::try_from(usecs).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SO_BUSY_POLL usecs does not fit c_int",
+            )
+        })?;
+        // SAFETY: setsockopt accepts a valid fd, SOL_SOCKET/SO_BUSY_POLL, and a
+        // pointer to a c_int value with its exact byte size.
+        let rc = unsafe {
+            libc::setsockopt(
+                self.fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BUSY_POLL,
+                (&raw const val).cast::<libc::c_void>(),
+                u32::try_from(std::mem::size_of_val(&val)).expect("c_int size fits in socklen_t"),
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Linux-only socket option; present on other targets so config validation
+    /// fails at connect time instead of at compile time.
+    #[cfg(not(target_os = "linux"))]
+    pub fn set_busy_poll(&self, _usecs: u32) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "SO_BUSY_POLL is only available on Linux",
+        ))
+    }
+
     /// `SO_REUSEADDR`。
     pub fn set_reuseaddr(&self, on: bool) -> io::Result<()> {
         let val: libc::c_int = on.into();
