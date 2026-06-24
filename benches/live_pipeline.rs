@@ -212,6 +212,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut prom = common::PromWriter::from_arg(cfg.prom_out.clone())?;
     let mut stats = common::MessageStats::default();
+    let mut batch_stats = BatchSinkStats::default();
     let cpu = common::ThreadCpuTimer::start();
     let started = std::time::Instant::now();
     let deadline = started + std::time::Duration::from_secs(cfg.seconds);
@@ -219,7 +220,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     while std::time::Instant::now() < deadline {
         if cfg.batch_sink {
-            pump_marked_batches(&mut pool, cfg.spin_iters, &mut stats)?;
+            pump_marked_batches(&mut pool, cfg.spin_iters, &mut stats, &mut batch_stats)?;
         } else {
             pump_marked(&mut pool, cfg.spin_iters, &mut stats)?;
         }
@@ -236,6 +237,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     common::print_result("live_pipeline", mode, &stats, elapsed, cpu_elapsed);
     common::print_marked_summary(&stats);
+    if cfg.batch_sink {
+        batch_stats.print("live_pipeline");
+    }
     for &handle in &handles {
         common::print_ingress_stats(handle, pool.ingress_stats(handle));
     }
@@ -282,12 +286,13 @@ fn pump_marked_batches(
     pool: &mut talaris::Pool,
     spin_iters: usize,
     stats: &mut common::MessageStats,
+    batch_stats: &mut BatchSinkStats,
 ) -> Result<(), talaris::connection::ConnectionError> {
     if spin_iters == 0 {
-        pool.pump_data_marked_batches(|_, batch| record_marked_batch(stats, &batch))
+        pool.pump_data_marked_batches(|_, batch| record_marked_batch(stats, batch_stats, &batch))
     } else {
         pool.pump_data_spin_marked_batches(spin_iters, |_, batch| {
-            record_marked_batch(stats, &batch);
+            record_marked_batch(stats, batch_stats, &batch);
         })
         .map(|_| ())
     }
@@ -308,10 +313,62 @@ fn record_marked_event(stats: &mut common::MessageStats, ev: &talaris::ws::Marke
 
 fn record_marked_batch(
     stats: &mut common::MessageStats,
+    batch_stats: &mut BatchSinkStats,
     batch: &talaris::ws::MarkedDataEventBatch<'_>,
 ) {
+    batch_stats.record(batch);
     for ev in batch.iter() {
         record_marked_event(stats, &ev);
+    }
+}
+
+#[derive(Debug, Default)]
+struct BatchSinkStats {
+    batches: u64,
+    chunk_end_batches: u64,
+    split_batches: u64,
+    events: u64,
+    text_events: u64,
+    binary_events: u64,
+    max_batch_len: usize,
+}
+
+impl BatchSinkStats {
+    fn record(&mut self, batch: &talaris::ws::MarkedDataEventBatch<'_>) {
+        self.batches = self.batches.saturating_add(1);
+        if batch.is_chunk_end() {
+            self.chunk_end_batches = self.chunk_end_batches.saturating_add(1);
+        } else {
+            self.split_batches = self.split_batches.saturating_add(1);
+        }
+        self.events = self
+            .events
+            .saturating_add(u64::try_from(batch.len()).unwrap_or(u64::MAX));
+        self.text_events = self
+            .text_events
+            .saturating_add(u64::try_from(batch.text_count()).unwrap_or(u64::MAX));
+        self.binary_events = self
+            .binary_events
+            .saturating_add(u64::try_from(batch.binary_count()).unwrap_or(u64::MAX));
+        self.max_batch_len = self.max_batch_len.max(batch.len());
+    }
+
+    fn print(&self, bench: &str) {
+        let avg_events_per_batch = if self.batches == 0 {
+            0.0
+        } else {
+            self.events as f64 / self.batches as f64
+        };
+        println!(
+            "bench_batch bench={bench} batches={} chunk_end_batches={} split_batches={} events={} text_events={} binary_events={} avg_events_per_batch={avg_events_per_batch:.3} max_batch_len={}",
+            self.batches,
+            self.chunk_end_batches,
+            self.split_batches,
+            self.events,
+            self.text_events,
+            self.binary_events,
+            self.max_batch_len
+        );
     }
 }
 
