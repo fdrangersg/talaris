@@ -345,6 +345,16 @@ impl Pool {
         Ok(())
     }
 
+    /// Immediately remove a connection from the pool.
+    ///
+    /// This is intended for planned replacement paths where the caller has
+    /// already moved traffic to a new connection and does not want the old
+    /// close handshake to surface as a pool-level transport error. Any stale
+    /// CQEs for the removed connection are ignored by the slot-table router.
+    pub fn drop_connection(&mut self, h: ConnHandle) {
+        self.drop_slot(h.0);
+    }
+
     pub fn pump<F>(&mut self, sink: F) -> Result<(), ConnectionError>
     where
         F: FnMut(ConnHandle, WsEvent<'_>),
