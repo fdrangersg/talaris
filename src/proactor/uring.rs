@@ -23,7 +23,7 @@
 //!
 
 use std::io;
-use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use io_uring::{IoUring, opcode, types::Fd};
 use thiserror::Error;
@@ -301,21 +301,23 @@ impl Proactor {
     /// 别的线程，造成关错 socket）。这里直接拿 `OwnedFd` by value，借编译期
     /// move 语义杜绝。
     ///
-    /// SQ 满时返回 `Err` —— **fd 已经被消费但 kernel 没收到 close**，调用方需
-    /// 视该 fd 为 leak。生产代码通常会 `submit_and_wait` 推空 SQ 再 retry。
+    /// SQ 满时返回 `Err`，`OwnedFd` 会正常 drop，因此不会泄漏 fd；push 成功后
+    /// 再释放 RAII 所有权，把 close 责任交给 kernel。
     pub fn submit_close(&mut self, fd: OwnedFd, user_data: UserData) -> Result<(), ProactorError> {
-        let raw = fd.into_raw_fd();
+        let raw = fd.as_raw_fd();
         let entry = opcode::Close::new(Fd(raw))
             .build()
             .user_data(user_data.raw());
         // SAFETY: SubmissionQueue::push 的 unsafe 约束是 entry 内部资源有效；
-        // Close 不含 buffer 指针，恒满足。
+        // Close 不含 buffer 指针，fd 仍由 OwnedFd 持有直到 push 成功。
         unsafe {
             self.ring
                 .submission()
                 .push(&entry)
                 .map_err(|_| ProactorError::SqFull)?;
         }
+        // SQE 已经进入 SQ，kernel 将负责 close(raw)，不能再让 OwnedFd drop。
+        let _ = fd.into_raw_fd();
         Ok(())
     }
 
@@ -680,5 +682,39 @@ mod tests {
         let n = proactor.drain_completions(|_| sink_called = true);
         assert_eq!(n, 0);
         assert!(!sink_called);
+    }
+
+    #[test]
+    fn submit_close_keeps_fd_owned_when_sq_full() {
+        use std::fs::File;
+        use std::os::fd::{FromRawFd, IntoRawFd};
+
+        let mut proactor = Proactor::new(ProactorConfig::default().with_sq_entries(2)).unwrap();
+        let mut pushed = 0_u64;
+        loop {
+            match proactor.submit_nop(UserData::new(OpKind::Nop, pushed)) {
+                Ok(()) => pushed += 1,
+                Err(ProactorError::SqFull) => break,
+                Err(e) => panic!("unexpected submit_nop error: {e}"),
+            }
+            assert!(pushed < 1024, "test failed to fill the submission queue");
+        }
+        assert!(pushed > 0);
+
+        let file = File::open("/dev/null").unwrap();
+        let raw = file.into_raw_fd();
+        // SAFETY: raw came from File::into_raw_fd and is uniquely owned here.
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        assert!(matches!(
+            proactor.submit_close(owned, UserData::new(OpKind::Close, 99)),
+            Err(ProactorError::SqFull)
+        ));
+        let rc = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+        assert_eq!(rc, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
     }
 }

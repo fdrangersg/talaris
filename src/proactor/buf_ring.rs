@@ -146,9 +146,10 @@ impl BufferRing {
         let ring_mem =
             NonNull::new(raw.cast::<BufRingEntry>()).ok_or(BufferRingError::AllocFailed)?;
 
-        let buf_storage: ManuallyDrop<Box<[u8]>> = ManuallyDrop::new(
-            vec![0_u8; usize::from(entries) * buf_size as usize].into_boxed_slice(),
-        );
+        let buf_bytes = usize::from(entries)
+            .checked_mul(buf_size as usize)
+            .ok_or(BufferRingError::Layout)?;
+        let buf_storage = vec![0_u8; buf_bytes].into_boxed_slice();
         let buf_base = buf_storage.as_ptr() as u64;
 
         // 初始化所有 entries：第 i 个 entry 指向 buf_storage[i*buf_size..(i+1)*buf_size]，bid = i
@@ -170,13 +171,18 @@ impl BufferRing {
         // 注册到 kernel
         // SAFETY: ring_mem 寿命跟 self；kernel 在 unregister 前能持续访问
         unsafe {
-            proactor.register_buf_ring(ring_mem.as_ptr().cast::<u8>(), entries, bgid)?;
+            if let Err(e) =
+                proactor.register_buf_ring(ring_mem.as_ptr().cast::<u8>(), entries, bgid)
+            {
+                dealloc(ring_mem.as_ptr().cast::<u8>(), ring_layout);
+                return Err(e.into());
+            }
         }
 
         Ok(Self {
             ring_mem,
             ring_layout,
-            buf_storage,
+            buf_storage: ManuallyDrop::new(buf_storage),
             entries,
             buf_size,
             bgid,
@@ -463,5 +469,36 @@ mod tests {
             BufferRing::new(&mut proactor, 0, 4, 0),
             Err(BufferRingError::InvalidBufSize(0))
         ));
+    }
+
+    #[test]
+    fn duplicate_bgid_registration_is_reported() {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let sock_addr = SockAddr::from_std(local_addr);
+        let socket = TcpSocket::new(Domain::V4).unwrap();
+        let fd = socket.as_raw_fd();
+        let mut proactor = Proactor::new(ProactorConfig::default()).unwrap();
+        unsafe {
+            proactor
+                .submit_connect(
+                    fd,
+                    &sock_addr,
+                    UserData::new(OpKind::Connect, 0),
+                    SqeFlags::NONE,
+                )
+                .unwrap();
+        }
+        proactor.submit_and_wait(1).unwrap();
+        proactor.drain_completions(|c| {
+            c.to_result().expect("connect ok");
+        });
+
+        let mut ring = BufferRing::new(&mut proactor, 9, 4, 256).unwrap();
+        assert!(matches!(
+            BufferRing::new(&mut proactor, 9, 4, 256),
+            Err(BufferRingError::Proactor(_))
+        ));
+        ring.unregister(&mut proactor).unwrap();
     }
 }

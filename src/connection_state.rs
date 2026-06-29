@@ -50,8 +50,9 @@ enum WsIngressState {
 ///   - 更新 ingress stats / observability/
 pub(crate) struct ConnectionState {
     pub(crate) socket: TcpSocket,
-    /// `submit_connect` 期间 kernel 读这块；必须随 self 一起活。
-    pub(crate) addr: SockAddr,
+    /// `submit_connect` 期间 kernel 读这块；Box 保证 `ConnectionState` move 后
+    /// sockaddr 内存地址仍稳定，直到 Connect CQE 返回。
+    pub(crate) addr: Box<SockAddr>,
     pub(crate) tls: Option<TlsAdapter>,
     pub(crate) ws: WsClient,
     pub(crate) state: State,
@@ -103,7 +104,7 @@ impl ConnectionState {
             user: cfg,
             identity,
         } = assigned;
-        let sock_addr = SockAddr::from_std(addr);
+        let sock_addr = Box::new(SockAddr::from_std(addr));
         let domain = match addr {
             SocketAddr::V4(_) => Domain::V4,
             SocketAddr::V6(_) => Domain::V6,
@@ -291,8 +292,14 @@ impl ConnectionState {
     ) -> Result<(), ConnectionError> {
         let ud = UserData::new(OpKind::Connect, u64::from(self.identity.conn_id));
         // SAFETY: self.addr 与 self 同寿命；CQE 回来前不会被 move/drop
+        // Box 内部地址稳定，即使 ConnectionState 被 move 进 Vec 也不变。
         unsafe {
-            proactor.submit_connect(self.socket.as_raw_fd(), &self.addr, ud, SqeFlags::NONE)?;
+            proactor.submit_connect(
+                self.socket.as_raw_fd(),
+                self.addr.as_ref(),
+                ud,
+                SqeFlags::NONE,
+            )?;
         }
         self.state = State::Connecting;
         Ok(())
@@ -2354,5 +2361,22 @@ mod tests {
 
         let err = io::Error::from_raw_os_error(libc::ECONNRESET);
         assert!(!is_recv_buffer_ring_exhausted(&err));
+    }
+
+    #[test]
+    fn sockaddr_pointer_survives_connection_state_move() {
+        let assigned = AssignedConnectionConfig {
+            user: ConnectionConfig::new("127.0.0.1", 443, "/").with_tls(false),
+            identity: ConnectionRuntimeIdentity {
+                conn_id: 7,
+                bgid: 11,
+            },
+        };
+        let addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let conn = ConnectionState::new(assigned, addr).unwrap();
+        let before = conn.addr.as_ptr();
+
+        let moved = vec![conn];
+        assert_eq!(moved[0].addr.as_ptr(), before);
     }
 }
