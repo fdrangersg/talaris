@@ -19,7 +19,7 @@ use std::str::FromStr;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use talaris::connection::IngressStats;
+use talaris::connection_meta::IngressStats;
 use talaris::observability::DataEventMeta;
 use talaris::proactor::ProactorSetupFlags;
 use talaris::ws::frame::{MAX_HEADER_LEN, OpCode, encode_header};
@@ -850,7 +850,7 @@ pub fn print_ingress_stats(handle: talaris::ConnHandle, stats: Option<IngressSta
         handle.as_u32(),
         fmt_int(stats.recv_data_cqes),
         fmt_int(stats.recv_bytes),
-        fmt_int(stats.plaintext_chunks),
+        fmt_int(stats.plaintext_source_chunks),
         fmt_int(stats.plaintext_bytes),
         fmt_int(stats.ws_data_drains),
         fmt_int(stats.ws_data_drain_skips),
@@ -892,9 +892,9 @@ pub const fn ingress_stats_delta(before: IngressStats, after: IngressStats) -> I
         plain_recv_copied_bytes: after
             .plain_recv_copied_bytes
             .saturating_sub(before.plain_recv_copied_bytes),
-        plaintext_chunks: after
-            .plaintext_chunks
-            .saturating_sub(before.plaintext_chunks),
+        plaintext_source_chunks: after
+            .plaintext_source_chunks
+            .saturating_sub(before.plaintext_source_chunks),
         plaintext_bytes: after.plaintext_bytes.saturating_sub(before.plaintext_bytes),
         ws_data_drains: after.ws_data_drains.saturating_sub(before.ws_data_drains),
         ws_data_drain_skips: after

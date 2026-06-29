@@ -1,31 +1,23 @@
-//! `Pool` —— multi-conn 驱动
+//! `Pool` —— multi-connection driver
 //!
-//! 一个 [`Proactor`] 服务同 venue 的多条 WS。CQE 通过
-//! [`crate::proactor::UserData::token`] 低 28 位编码 conn_id；Pool drain 后按 id
-//! 路由到对应 `ConnectionState`。
+//! 一个 [`Proactor`] 服务同 venue 的多条 WS。
+//! CQE 通过 [`crate::proactor::UserData::token`] 低 28 位编码 conn_id；
+//! Pool drain 后按 id 路由到对应 [`crate::connection_state::ConnectionState`]。
 //!
 //! ## 关键不变式
 //!
 //! - **单线程占用**：`Pool: !Send + !Sync`（`PhantomData<*const ()>` 标记）。
 //!   io_uring 内部状态不能跨线程。
-//! - **conn_id 编码 ≤ 28 bit**：[`UserData`] 高 8 位是 OpKind，低 56 位是
+//! - **conn_id 编码 ≤ 28 bit**：[`crate::proactor::UserData`] 高 8 位是 OpKind，低 56 位是
 //!   caller token；这里再约定低 28 位为 conn_id，bits 55..28 预留给 op-seq
-//!   （v1 不使用）。
 //! - **bgid 单调递增**：每条 conn 独占一个 bgid（kernel 看，跨 conn 不重叠）。
-//!   v1 简单方案不回收 bgid（短期）；64 K 上限远超实际部署。
-//! - **drain 顺序**：每轮 pump 先 submit pending send + rearm multishot，再
-//!   `submit_and_wait`，最后 drain CQE 路由 + drain ws_events。
+//!   暂时不回收 bgid（短期）；64 K 上限远超实际部署。
+//! - **drain 顺序**：每轮 pump 先 submit pending send + rearm multishot，
+//!   再`submit_and_wait`，最后 drain CQE 路由 + drain ws_events。
 //!
-//! ## v1 与 v2 范围
-//!
-//! 本文件落地 plan.md "Network Pool 详细设计" 的 Migration Step 1：skeleton +
-//! ConnectionState 拆分。
-//!
-//! - 单 conn 路径与旧版单连接 wrapper 等价。
 //! - 多 conn pump 已能跑（CQE 按 conn_id 路由）。
-//! - 还未做：slot 复用 / Tombstone / pool 内重连 / 多 venue 共 Pool。
+//! - 还未做：slot 复用 / Tombstone / pool 内重连。
 //!
-//! [`UserData`]: crate::proactor::UserData
 
 // `expect()` 用法均为 invariant 断言（just-pushed conn 一定存在；28-bit mask
 // 一定 fits u32）。走到 panic 等于 Pool 内部状态已坏 —— HFT 进程应立即重启。
@@ -35,7 +27,10 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::net::{SocketAddr, ToSocketAddrs};
 
-use crate::connection::{ConnectionConfig, ConnectionError, IngressStats, State};
+use crate::connection_meta::{
+    AssignedConnectionConfig, ConnectionConfig, ConnectionError, ConnectionRuntimeIdentity,
+    IngressStats, State,
+};
 use crate::connection_state::ConnectionState;
 use crate::observability::LatencyHistograms;
 use crate::proactor::{Completion, Proactor, ProactorConfig, ProactorError};
@@ -47,28 +42,56 @@ use crate::ws::{
 
 /// CQE.token() 中 conn_id 的位掩码 —— 28 bit，最多 ~2.6 亿条 conn / Pool，
 /// 远超任何实际场景。bits 55..28 预留给 op-seq dedup（v1 不使用）。
+/// | bits 63..56 |  bits 55..28    | bits 27..0 |
+/// |    OpKind   | reserved op-seq |  conn_id   |
 const CONN_ID_MASK: u64 = 0x0FFF_FFFF;
 
 /// Pool slot table 默认初始容量。0 表示按 `Vec` 默认策略延迟分配。
+/// 大多数场景连接数很少，提前分配意义不大。不影响 recv/parse/pump
+/// 热路径延迟，只影响 Pool 初始化或动态新增连接时的 Vec grow 内存分配行为。
 pub const DEFAULT_POOL_INITIAL_CONN_CAPACITY: usize = 0;
 
 /// 每轮 pump drain CQE 的暂存 `Vec<Completion>` 默认初始容量。
+/// 每次 pump 时，Pool 会先从 io_uring CQ 里 drain 一批 CQE 到这个 Vec,
+/// 然后再遍历 completions_buf，按 conn_id 路由到对应 ConnectionState
+///
+/// Pool 需要先把当前 CQ 里的 completions 收集起来，再统一处理。
+/// 尤其 batch path 里还会看相邻 CQE 是否属于同一连接。
+/// 16 的含义是：默认先给这个 Vec 分配 16 个 Completion 的容量，避免每轮 pump 重新分配。
+/// 单连接或少量连接场景，一轮 pump 通常只有很少 CQE，比如 recv、send、close、nop 等。
+/// 16 足够覆盖常见情况，同时不浪费太多初始内存。
 pub const DEFAULT_POOL_COMPLETION_BATCH_CAPACITY: usize = 16;
 
-/// Pool 构造参数。透传 [`ProactorConfig`]，conn 自身参数走
-/// [`Pool::connect_blocking`] 时传 [`ConnectionConfig`]。
+/// Busy-spin data pumps 默认在首次 progress 后不继续额外 drain。
+pub const DEFAULT_POOL_POST_PROGRESS_SPIN_ITERS: usize = 0;
+
+/// Pool 的多连接调度层；真正 socket/io_uring/recv buffer 相关参数
+/// 主要在 ProactorConfig 和每条连接的 ConnectionConfig 里。
+/// PoolConfig
+///   -> Pool
+///     -> Proactor
+///     -> Vec<ConnectionState>
+///     -> completions_buf
 #[derive(Debug, Clone, Copy)]
 pub struct PoolConfig {
+    /// 底层 io_uring 配置，真正控制 ring entries, recv mode, buffer size, 是否绑核等更底层参数
     pub proactor: ProactorConfig,
-    /// `conns` slot table 初始容量。高 fanout bench 可设为目标连接数，避免
-    /// 逐条 connect 时 slot table grow。
+
+    /// Pool 的连接表 conns: Vec<Option<ConnectionState>> 初始容量。
+    /// 高 fanout bench 可设为目标连接数，避免逐条 connect 时 slot table grow。
+    /// 默认 [`DEFAULT_POOL_INITIAL_CONN_CAPACITY`]
     pub initial_conn_capacity: usize,
+
     /// `pump_impl` drain CQE 暂存区初始容量。高 fanout / burst 场景可增大，
     /// 避免第一轮大 batch grow。
     pub completion_batch_capacity: usize,
-    /// Busy-spin data pumps stop after first progress by default. This optional
-    /// budget keeps draining briefly after progress to coalesce nearby CQEs in
-    /// one pump call without delaying the first emitted event.
+
+    /// busy-spin data 一次 pump 调用取得一次进展后，是否继续短暂 drain 附近 CQE，
+    /// 此处的含义是 pump 调用内的 busy-spin 循环次数，减少函数返回/外层循环开销，也可能更快抓到刚到的 CQE
+    ///
+    /// 默认值为[`DEFAULT_POOL_POST_PROGRESS_SPIN_ITERS`].
+    /// 如果设置成比如 256，那么当一次 pump 已经收到数据后，会继续短暂尝试 256 次 drain 后续 CQE。
+    /// 这可能提高吞吐和同轮聚合能力，但也可能让第一个消息的返回路径稍微多做一点工作，这类参数需要按 feed 特征专项调
     pub post_progress_spin_iters: usize,
 }
 
@@ -79,7 +102,7 @@ impl PoolConfig {
             proactor,
             initial_conn_capacity: DEFAULT_POOL_INITIAL_CONN_CAPACITY,
             completion_batch_capacity: DEFAULT_POOL_COMPLETION_BATCH_CAPACITY,
-            post_progress_spin_iters: 0,
+            post_progress_spin_iters: DEFAULT_POOL_POST_PROGRESS_SPIN_ITERS,
         }
     }
 
@@ -109,6 +132,10 @@ impl Default for PoolConfig {
 }
 
 /// 业务面的 opaque conn 引用。**不跨 Pool 实例使用**。
+/// 内部的 u32 同时是：
+/// - conn_id
+/// - conns slot index
+/// - CQE token 低 28 位编码的连接编号
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct ConnHandle(u32);
 
@@ -120,26 +147,37 @@ impl ConnHandle {
     }
 }
 
-/// Multi-conn driver。单线程持有 [`Proactor`] + N 条 `ConnectionState`。
+/// Multi-conn driver/dispatcher:
+///   - 单线程持有 [`Proactor`];
+///   - 持有 Vec<Option<ConnectionState>>;
+///   - drain CQE;
+///   - 从 CQE user_data 中解析 conn_id;
+///   - 找到对应 ConnectionState (真正干活的是ConnectionState)；
+///   - 调用 conn.handle_completion...
 ///
-/// **Slot table 路由**（P2）：`conns: Vec<Option<ConnectionState>>`，conn_id
+/// **Slot table 路由**：`conns: Vec<Option<ConnectionState>>`，conn_id
 /// 既是 routing token 也是 slot index —— CQE 拿到 user_data 解出 conn_id 后
-/// `conns.get(conn_id as usize)` 是 O(1)，取代了早期 `iter().find(|c| c.conn_id() ...)`
-/// 的 O(N)。N 上去之后这条 hot path 决定整体吞吐。
+/// `conns.get(conn_id as usize)` 是 O(1)。
 pub struct Pool {
     proactor: Proactor,
     /// slot table：conn_id 直接索引。None 是关闭/失败留下的 tombstone（暂不复用）。
     conns: Vec<Option<ConnectionState>>,
     /// 活 conn 数。每次 push Some / 写 None 时同步维护，避免 hot path filter scan。
     active_count: u32,
+    /// 下一条连接要分配的连接 ID。单调递增。
     next_conn_id: u32,
+    /// 下一条连接的 buffer group id。
+    /// 在 io_uring provided-buffer 模式下，每条连接有自己的 buffer group，
+    /// 避免不同连接的 buffer 混用。
     next_bgid: u16,
-    /// pump_impl 内 drain CQE 暂存区。持久字段避免每轮 alloc（F3 dhat 审计发现
+    /// pump_impl 内 drain CQE 暂存区。持久字段避免每轮 alloc（dhat 审计发现
     /// 这是 hot loop 第一大 alloc：每轮 pump 一次 `Vec::with_capacity(16)`）。
     /// 初始 cap 16 已足够单 conn 单轮 ≤ 4 CQE；多 conn 高峰按需 grow 一次后稳定。
     completions_buf: Vec<Completion>,
+    /// 从 PoolConfig 拷进来的运行时配置
     post_progress_spin_iters: usize,
-    /// `Pool: !Send + !Sync` 显式标记。raw pointer phantom 不实际持有。
+    /// `Pool: !Send + !Sync` 显式标记。raw pointer phantom 不实际持有，不实际占内存，只影响类型系统
+    /// 这个 Pool 不应该跨线程移动或共享。因为它内部持有 io_uring、fd、buffer ring 等线程亲和资源。
     _not_send: PhantomData<*const ()>,
 }
 
@@ -174,8 +212,7 @@ impl Pool {
     /// 加一条 conn，阻塞跑到 [`State::Open`] 才返。失败时 slot 置 None
     /// （中途产生的 fd 由 `ConnectionState` drop 关闭）。
     ///
-    /// `cfg.proactor` 字段在此忽略——proactor 由 Pool 持有。`cfg.conn_id` /
-    /// `cfg.bgid` 也会被 Pool 覆盖为内部分配的值。
+    /// io_uring/proactor 参数来自 [`PoolConfig`]；connection runtime ids are assigned internally.
     pub fn connect_blocking(
         &mut self,
         cfg: ConnectionConfig,
@@ -201,8 +238,9 @@ impl Pool {
         }
     }
 
-    /// **非阻塞** connect：仅提交 connect SQE 并 reserve 一个 slot，立刻返回
-    /// [`ConnHandle`]。后续靠 caller `pump()` 推进 handshake，直到 `state(h) ==
+    /// **非阻塞** connect：在 Pool 里新增一条连接，并把 TCP connect SQE 提交给 io_uring，但不等待连接完成。
+    /// 仅提交 connect SQE 并 reserve 一个 slot，立刻返回 [`ConnHandle`]。
+    /// 后续靠 caller `pump()` 推进 handshake，直到 `state(h) ==
     /// Open`（或 `Closed` 表失败）。
     ///
     /// 用途：N 条 conn 并发 handshake —— 单 `connect_blocking` 串行 N 次的话，
@@ -231,7 +269,7 @@ impl Pool {
     /// 同 [`submit_connect`](Self::submit_connect)，跳过 DNS。
     pub fn submit_connect_to(
         &mut self,
-        mut cfg: ConnectionConfig,
+        cfg: ConnectionConfig,
         addr: SocketAddr,
     ) -> Result<ConnHandle, ConnectionError> {
         // 预先 reserve 一个 conn_id / bgid，超额时直接 Err（早期 .expect() 会
@@ -241,14 +279,18 @@ impl Pool {
         if conn_id > CONN_ID_MASK as u32 {
             return Err(ConnectionError::IdSpaceExhausted("conn_id"));
         }
+
         let bgid = self.next_bgid;
         let Some(next_bgid) = self.next_bgid.checked_add(1) else {
             return Err(ConnectionError::IdSpaceExhausted("bgid"));
         };
-        cfg.conn_id = conn_id;
-        cfg.bgid = bgid;
 
-        let mut conn = ConnectionState::new(cfg, addr)?;
+        let assigned = AssignedConnectionConfig {
+            user: cfg,
+            identity: ConnectionRuntimeIdentity { conn_id, bgid },
+        };
+
+        let mut conn = ConnectionState::new(assigned, addr)?;
         // 没 push 之前失败：socket / addr 由 conn drop 清理；id 不回退（单调）。
         conn.submit_connect(&mut self.proactor)?;
         // conn_id == conns.len() 不变式：slot table 直接 push 到末尾保证
@@ -1523,7 +1565,7 @@ fn write_ingress_prometheus_help<W: fmt::Write>(out: &mut W) -> fmt::Result {
     writeln!(out, "# TYPE talaris_ingress_recv_data_cqes_total counter")?;
     writeln!(
         out,
-        "# HELP talaris_ingress_recv_bytes_total Ciphertext bytes carried by recv data CQEs."
+        "# HELP talaris_ingress_recv_bytes_total Bytes carried by positive-length recv data CQEs. For TLS these are ciphertext bytes; for plain TCP these are plaintext bytes."
     )?;
     writeln!(out, "# TYPE talaris_ingress_recv_bytes_total counter")?;
     writeln!(
@@ -1576,7 +1618,7 @@ fn write_ingress_prometheus_help<W: fmt::Write>(out: &mut W) -> fmt::Result {
     )?;
     writeln!(
         out,
-        "# HELP talaris_ingress_plaintext_chunks_total Plaintext chunks fed into the WebSocket parser."
+        "# HELP talaris_ingress_plaintext_chunks_total Plaintext source chunks made available to WebSocket receive processing. TLS counts rustls plaintext slices; plain TCP counts recv/provided-buffer slices before optional copy batching."
     )?;
     writeln!(out, "# TYPE talaris_ingress_plaintext_chunks_total counter")?;
     writeln!(
@@ -1586,12 +1628,12 @@ fn write_ingress_prometheus_help<W: fmt::Write>(out: &mut W) -> fmt::Result {
     writeln!(out, "# TYPE talaris_ingress_plaintext_bytes_total counter")?;
     writeln!(
         out,
-        "# HELP talaris_ingress_ws_data_drains_total Data-pump CQEs that fed plaintext into WebSocket receive processing."
+        "# HELP talaris_ingress_ws_data_drains_total Data-pump plaintext source chunks that reached WebSocket receive processing."
     )?;
     writeln!(out, "# TYPE talaris_ingress_ws_data_drains_total counter")?;
     writeln!(
         out,
-        "# HELP talaris_ingress_ws_data_drain_skips_total Data-pump CQEs that skipped WebSocket draining because no plaintext arrived."
+        "# HELP talaris_ingress_ws_data_drain_skips_total Data-pump drain attempts skipped because no plaintext arrived."
     )?;
     writeln!(
         out,
@@ -1717,7 +1759,7 @@ mod post_progress_tests {
 )]
 mod tests {
     use super::*;
-    use crate::connection::{ConnectionConfig, State};
+    use crate::connection_meta::{ConnectionConfig, State};
     use crate::test_helpers::run_echo_server;
     use crate::ws::DataEvent as WsDataEvent;
     use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
@@ -1735,7 +1777,7 @@ mod tests {
         let server = thread::spawn(move || run_echo_server(listener, shutdown_rx));
 
         let cfg = ConnectionConfig::new("localhost", local_addr.port(), "/echo").with_tls(false);
-        let mut pool = Pool::new(PoolConfig::new(cfg.proactor)).expect("pool");
+        let mut pool = Pool::new(PoolConfig::default()).expect("pool");
         let handle = pool.connect_blocking_to(cfg, local_addr).expect("connect");
         assert_eq!(pool.state(handle), Some(State::Open));
 
@@ -1779,7 +1821,7 @@ mod tests {
     #[ignore = "需要外网 + test.deribit.com 可达；手动 --ignored 跑"]
     fn tls_smoke_deribit_testnet() {
         let cfg = ConnectionConfig::new("test.deribit.com", 443, "/ws/api/v2");
-        let mut pool = Pool::new(PoolConfig::new(cfg.proactor)).expect("pool");
+        let mut pool = Pool::new(PoolConfig::default()).expect("pool");
         let handle = pool
             .connect_blocking(cfg)
             .expect("tls handshake + ws upgrade");

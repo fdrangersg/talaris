@@ -35,7 +35,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use hdrhistogram::Histogram;
-use talaris::connection::IngressStats;
+use talaris::connection_meta::IngressStats;
 use talaris::ws::{DataEventMeta, MarkedDataEvent};
 
 const HIST_LOWEST_NS: u64 = 1;
@@ -139,7 +139,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let _pin = cfg.user_cpu.map(|cpu| common::PinGuard::pin("user", cpu));
     let base_conn_cfg = conn_config(&cfg);
-    let proactor_cfg = base_conn_cfg.proactor;
+    let proactor_cfg = proactor_config(&cfg);
     let mut pool = talaris::Pool::new(
         talaris::PoolConfig::new(proactor_cfg)
             .with_initial_conn_capacity(cfg.connections)
@@ -150,7 +150,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut handles = Vec::with_capacity(cfg.connections);
     for _ in 0..cfg.connections {
         let handle = pool.connect_blocking(base_conn_cfg.clone())?;
-        assert_eq!(pool.state(handle), Some(talaris::connection::State::Open));
+        assert_eq!(
+            pool.state(handle),
+            Some(talaris::connection_meta::State::Open)
+        );
         if let Some(subscribe) = cfg.subscribe.as_deref() {
             pool.send_text(handle, subscribe.as_bytes())?;
         }
@@ -192,10 +195,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn conn_config(cfg: &Config) -> talaris::connection::ConnectionConfig {
-    talaris::connection::ConnectionConfig::new(&cfg.host, cfg.port, &cfg.path)
+fn proactor_config(cfg: &Config) -> talaris::proactor::ProactorConfig {
+    talaris::proactor::ProactorConfig::default()
         .with_sq_entries(cfg.sq_entries)
         .with_cq_entries(cfg.cq_entries)
+}
+
+fn conn_config(cfg: &Config) -> talaris::connection_meta::ConnectionConfig {
+    talaris::connection_meta::ConnectionConfig::new(&cfg.host, cfg.port, &cfg.path)
         .with_buf_ring(cfg.buf_size, cfg.buf_entries)
         .with_ws_limits(8 * 1024 * 1024, 16 * 1024 * 1024)
         .with_ws_buffer_capacities(128 * 1024, 128 * 1024, 16 * 1024)
@@ -211,7 +218,7 @@ fn pump_marked(
     handle_index: &[usize],
     dedup: &mut LiveDedup,
     stats: &mut LiveRedundancyStats,
-) -> Result<(), talaris::connection::ConnectionError> {
+) -> Result<(), talaris::connection_meta::ConnectionError> {
     if spin_iters == 0 {
         pool.pump_data_marked(|handle, ev| {
             let conn_index = conn_index(handle_index, handle);
@@ -753,7 +760,9 @@ const fn add_ingress_stats(out: &mut IngressStats, stats: IngressStats) {
     out.plain_recv_copied_bytes = out
         .plain_recv_copied_bytes
         .saturating_add(stats.plain_recv_copied_bytes);
-    out.plaintext_chunks = out.plaintext_chunks.saturating_add(stats.plaintext_chunks);
+    out.plaintext_source_chunks = out
+        .plaintext_source_chunks
+        .saturating_add(stats.plaintext_source_chunks);
     out.plaintext_bytes = out.plaintext_bytes.saturating_add(stats.plaintext_bytes);
     out.ws_data_drains = out.ws_data_drains.saturating_add(stats.ws_data_drains);
     out.ws_data_drain_skips = out
@@ -778,7 +787,7 @@ fn print_aggregate_ingress(stats: Option<IngressStats>) {
         "bench_live_redundancy_ingress aggregate=true recv_cqes={} recv_bytes={} plaintext_chunks={} ws_data_events={} text={} binary={} rearm={} ring_exhaustions={} messages_per_recv_cqe={:.3}",
         common::fmt_int(stats.recv_data_cqes),
         common::fmt_int(stats.recv_bytes),
-        common::fmt_int(stats.plaintext_chunks),
+        common::fmt_int(stats.plaintext_source_chunks),
         common::fmt_int(stats.ws_data_events),
         common::fmt_int(stats.ws_text_events),
         common::fmt_int(stats.ws_binary_events),

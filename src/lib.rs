@@ -48,7 +48,7 @@
 #![allow(clippy::redundant_pub_crate)]
 #![cfg_attr(test, allow(clippy::float_cmp))]
 
-pub mod connection;
+pub mod connection_meta;
 
 pub mod pool;
 

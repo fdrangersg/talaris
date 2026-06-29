@@ -202,21 +202,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let addr = server.addr();
     let _pin = cfg.user_cpu.map(|cpu| common::PinGuard::pin("user", cpu));
 
-    let conn_cfg = talaris::connection::ConnectionConfig::new("localhost", addr.port(), "/")
+    let conn_cfg = talaris::connection_meta::ConnectionConfig::new("localhost", addr.port(), "/")
         .with_tls(false)
-        .with_sq_entries(cfg.sq_entries)
-        .with_cq_entries(cfg.cq_entries)
         .with_buf_ring(cfg.buf_size, cfg.buf_entries)
         .with_ws_limits(cfg.actual_payload_len, cfg.actual_payload_len as u64)
         .with_ingress_stats(true)
         .with_observability_sample_rate_bps(cfg.mode.sample_bps())
         .with_observability_histograms(cfg.mode.histograms());
-    let proactor_cfg = conn_cfg.proactor;
+    let proactor_cfg = talaris::proactor::ProactorConfig::default()
+        .with_sq_entries(cfg.sq_entries)
+        .with_cq_entries(cfg.cq_entries);
     let mut pool = talaris::Pool::new(
         talaris::PoolConfig::new(proactor_cfg).with_completion_batch_capacity(cfg.completion_batch),
     )?;
     let handle = pool.connect_blocking_to(conn_cfg, addr)?;
-    assert_eq!(pool.state(handle), Some(talaris::connection::State::Open));
+    assert_eq!(
+        pool.state(handle),
+        Some(talaris::connection_meta::State::Open)
+    );
 
     let mut prom = common::PromWriter::from_arg(cfg.prom_out.clone())?;
     let mut stats = common::MessageStats::default();
@@ -323,7 +326,7 @@ fn pump_unmarked(
     spin_iters: usize,
     stats: &mut common::MessageStats,
     downstream_spin_ns: u64,
-) -> Result<(), talaris::connection::ConnectionError> {
+) -> Result<(), talaris::connection_meta::ConnectionError> {
     if spin_iters == 0 {
         pool.pump_data(|_, ev| record_unmarked_event(stats, &ev, downstream_spin_ns))
     } else {
@@ -339,7 +342,7 @@ fn pump_marked(
     spin_iters: usize,
     stats: &mut common::MessageStats,
     downstream_spin_ns: u64,
-) -> Result<(), talaris::connection::ConnectionError> {
+) -> Result<(), talaris::connection_meta::ConnectionError> {
     if spin_iters == 0 {
         pool.pump_data_marked(|_, ev| record_marked_event(stats, &ev, downstream_spin_ns))
     } else {
@@ -355,7 +358,7 @@ fn pump_unmarked_batches(
     spin_iters: usize,
     stats: &mut common::MessageStats,
     downstream_spin_ns: u64,
-) -> Result<(), talaris::connection::ConnectionError> {
+) -> Result<(), talaris::connection_meta::ConnectionError> {
     if spin_iters == 0 {
         pool.pump_data_batches(|_, batch| record_unmarked_batch(stats, &batch, downstream_spin_ns))
     } else {
@@ -371,7 +374,7 @@ fn pump_marked_batches(
     spin_iters: usize,
     stats: &mut common::MessageStats,
     downstream_spin_ns: u64,
-) -> Result<(), talaris::connection::ConnectionError> {
+) -> Result<(), talaris::connection_meta::ConnectionError> {
     if spin_iters == 0 {
         pool.pump_data_marked_batches(|_, batch| {
             record_marked_batch(stats, &batch, downstream_spin_ns);
@@ -390,7 +393,7 @@ fn pump_unmarked_batches_coalesced(
     stats: &mut common::MessageStats,
     coalesce: &mut BboChunkCoalescer,
     downstream_spin_ns: u64,
-) -> Result<(), talaris::connection::ConnectionError> {
+) -> Result<(), talaris::connection_meta::ConnectionError> {
     if spin_iters == 0 {
         pool.pump_data_batches(|_, batch| {
             coalesce.record_unmarked_batch(stats, &batch, downstream_spin_ns);
@@ -409,7 +412,7 @@ fn pump_marked_batches_coalesced(
     stats: &mut common::MessageStats,
     coalesce: &mut BboChunkCoalescer,
     downstream_spin_ns: u64,
-) -> Result<(), talaris::connection::ConnectionError> {
+) -> Result<(), talaris::connection_meta::ConnectionError> {
     if spin_iters == 0 {
         pool.pump_data_marked_batches(|_, batch| {
             coalesce.record_marked_batch(stats, &batch, downstream_spin_ns);

@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use talaris::connection::{ConnectionConfig, State};
+    use talaris::connection_meta::{ConnectionConfig, State};
     use talaris::proactor::pin_current_thread_to;
     use talaris::ws::Event as WsEvent;
     use talaris::{Pool, PoolConfig};
@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 4. 起 Pool 并阻塞 connect ───────────────────────────────────
     // PoolConfig 透传 proactor 配置（entries / CQ sizing / taskrun flags）。
-    let mut pool = Pool::new(PoolConfig::new(cfg.proactor))?;
+    let mut pool = Pool::new(PoolConfig::default())?;
     let handle = pool.connect_blocking_to(cfg, addr)?;
     assert_eq!(pool.state(handle), Some(State::Open));
     eprintln!("[quickstart] WS upgrade OK, handle = {handle:?}");

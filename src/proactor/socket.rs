@@ -99,7 +99,7 @@ impl SockAddr {
     }
 }
 
-/// 拥有式 TCP socket。`Drop` 自动 `close(2)`。
+/// Owned TCP socket。`Drop` 自动 `close(2)`。
 ///
 /// **不带 `O_NONBLOCK`**——io_uring 自己管阻塞语义，setting nonblock 反而会让
 /// 某些 op（比如 connect）的语义变奇怪。socket flag 只设 `SOCK_CLOEXEC`。

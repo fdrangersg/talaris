@@ -50,7 +50,7 @@ struct Config {
     completion_batch: usize,
     spin_iters: usize,
     batch_sink: bool,
-    recv_mode: talaris::connection::RecvMode,
+    recv_mode: talaris::connection_meta::RecvMode,
     socket_busy_poll_usecs: Option<u32>,
     setup_flags: talaris::proactor::ProactorSetupFlags,
     tls_provider: talaris::tls::TlsCryptoProvider,
@@ -114,7 +114,7 @@ impl Config {
             completion_batch: common::arg_or("--completion-batch", 64_usize).max(1),
             spin_iters: common::arg_or("--spin-iters", 256_usize),
             batch_sink: common::flag_present("--batch-sink"),
-            recv_mode: common::arg_or("--recv-mode", talaris::connection::RecvMode::Multishot),
+            recv_mode: common::arg_or("--recv-mode", talaris::connection_meta::RecvMode::Multishot),
             socket_busy_poll_usecs: common::optional_arg("--socket-busy-poll-usecs"),
             setup_flags: common::parse_proactor_setup_flags(&common::arg_string(
                 "--setup-flags",
@@ -187,8 +187,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             cfg.tls_cipher,
         )?,
     );
+    let proactor_cfg = proactor_config(&cfg);
     let first_conn_cfg = conn_config(&cfg, &cfg.paths[0], Arc::clone(&tls_config));
-    let proactor_cfg = first_conn_cfg.proactor;
     let mut pool = talaris::Pool::new(
         talaris::PoolConfig::new(proactor_cfg).with_completion_batch_capacity(cfg.completion_batch),
     )?;
@@ -200,7 +200,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             conn_config(&cfg, path, Arc::clone(&tls_config))
         };
         let handle = pool.connect_blocking(conn_cfg)?;
-        assert_eq!(pool.state(handle), Some(talaris::connection::State::Open));
+        assert_eq!(
+            pool.state(handle),
+            Some(talaris::connection_meta::State::Open)
+        );
         handles.push(handle);
     }
 
@@ -246,16 +249,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn proactor_config(cfg: &Config) -> talaris::proactor::ProactorConfig {
+    talaris::proactor::ProactorConfig::default()
+        .with_sq_entries(cfg.sq_entries)
+        .with_cq_entries(cfg.cq_entries)
+        .with_setup_flags(cfg.setup_flags)
+}
+
 fn conn_config(
     cfg: &Config,
     path: &str,
     tls_config: Arc<rustls::ClientConfig>,
-) -> talaris::connection::ConnectionConfig {
-    let mut conn_cfg = talaris::connection::ConnectionConfig::new(&cfg.host, cfg.port, path)
+) -> talaris::connection_meta::ConnectionConfig {
+    let mut conn_cfg = talaris::connection_meta::ConnectionConfig::new(&cfg.host, cfg.port, path)
         .with_tls_config(tls_config)
-        .with_sq_entries(cfg.sq_entries)
-        .with_cq_entries(cfg.cq_entries)
-        .with_proactor_setup_flags(cfg.setup_flags)
         .with_recv_mode(cfg.recv_mode)
         .with_buf_ring(cfg.buf_size, cfg.buf_entries)
         .with_ws_limits(8 * 1024 * 1024, 16 * 1024 * 1024)
@@ -273,7 +280,7 @@ fn pump_marked(
     pool: &mut talaris::Pool,
     spin_iters: usize,
     stats: &mut common::MessageStats,
-) -> Result<(), talaris::connection::ConnectionError> {
+) -> Result<(), talaris::connection_meta::ConnectionError> {
     if spin_iters == 0 {
         pool.pump_data_marked(|_, ev| record_marked_event(stats, &ev))
     } else {
@@ -287,7 +294,7 @@ fn pump_marked_batches(
     spin_iters: usize,
     stats: &mut common::MessageStats,
     batch_stats: &mut BatchSinkStats,
-) -> Result<(), talaris::connection::ConnectionError> {
+) -> Result<(), talaris::connection_meta::ConnectionError> {
     if spin_iters == 0 {
         pool.pump_data_marked_batches(|_, batch| record_marked_batch(stats, batch_stats, &batch))
     } else {

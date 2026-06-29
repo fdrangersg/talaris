@@ -28,7 +28,7 @@ use std::sync::{Arc, Barrier, OnceLock};
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
-use talaris::connection::IngressStats;
+use talaris::connection_meta::IngressStats;
 use talaris::observability::DataEventMeta;
 use tungstenite::client::{IntoClientRequest, client};
 
@@ -120,7 +120,7 @@ struct Config {
     cq_entries: u32,
     completion_batch: usize,
     spin_iters: usize,
-    recv_mode: talaris::connection::RecvMode,
+    recv_mode: talaris::connection_meta::RecvMode,
     socket_busy_poll_usecs: Option<u32>,
     setup_flags: talaris::proactor::ProactorSetupFlags,
     tls_provider: talaris::tls::TlsCryptoProvider,
@@ -188,7 +188,7 @@ impl Config {
             cq_entries,
             completion_batch: common::arg_or("--completion-batch", 64_usize).max(1),
             spin_iters: common::arg_or("--spin-iters", 256_usize),
-            recv_mode: common::arg_or("--recv-mode", talaris::connection::RecvMode::Multishot),
+            recv_mode: common::arg_or("--recv-mode", talaris::connection_meta::RecvMode::Multishot),
             socket_busy_poll_usecs: common::optional_arg("--socket-busy-poll-usecs"),
             setup_flags: common::parse_proactor_setup_flags(&common::arg_string(
                 "--setup-flags",
@@ -338,8 +338,7 @@ fn run_talaris(
         .talaris_cpu
         .map(|cpu| common::PinGuard::pin("talaris", cpu));
 
-    let conn_cfg = talaris_conn_config(&cfg, path)?;
-    let proactor_cfg = conn_cfg.proactor;
+    let proactor_cfg = talaris_proactor_config(cfg.as_ref());
     let mut pool = talaris::Pool::new(
         talaris::PoolConfig::new(proactor_cfg).with_completion_batch_capacity(cfg.completion_batch),
     )?;
@@ -347,7 +346,10 @@ fn run_talaris(
     let mut ingress_before = Vec::with_capacity(redundancy_count);
     for _ in 0..redundancy_count {
         let handle = pool.connect_blocking(talaris_conn_config(&cfg, path)?)?;
-        assert_eq!(pool.state(handle), Some(talaris::connection::State::Open));
+        assert_eq!(
+            pool.state(handle),
+            Some(talaris::connection_meta::State::Open)
+        );
         ingress_before.push(pool.ingress_stats(handle).unwrap_or_default());
         handles.push(handle);
     }
@@ -381,21 +383,25 @@ fn run_talaris(
     })
 }
 
+fn talaris_proactor_config(cfg: &Config) -> talaris::proactor::ProactorConfig {
+    talaris::proactor::ProactorConfig::default()
+        .with_sq_entries(cfg.sq_entries)
+        .with_cq_entries(cfg.cq_entries)
+        .with_setup_flags(cfg.setup_flags)
+}
+
 fn talaris_conn_config(
     cfg: &Config,
     path: &str,
-) -> BenchResult<talaris::connection::ConnectionConfig> {
+) -> BenchResult<talaris::connection_meta::ConnectionConfig> {
     let tls_config = Arc::new(
         talaris::tls::TlsAdapter::client_config_with_cipher_preference(
             cfg.tls_provider,
             cfg.tls_cipher,
         )?,
     );
-    let mut conn_cfg = talaris::connection::ConnectionConfig::new(&cfg.host, cfg.port, path)
+    let mut conn_cfg = talaris::connection_meta::ConnectionConfig::new(&cfg.host, cfg.port, path)
         .with_tls_config(tls_config)
-        .with_sq_entries(cfg.sq_entries)
-        .with_cq_entries(cfg.cq_entries)
-        .with_proactor_setup_flags(cfg.setup_flags)
         .with_recv_mode(cfg.recv_mode)
         .with_buf_ring(cfg.buf_size, cfg.buf_entries)
         .with_ws_limits(8 * 1024 * 1024, 16 * 1024 * 1024)
@@ -438,7 +444,9 @@ fn aggregate_ingress_delta(
         out.plain_recv_copied_bytes = out
             .plain_recv_copied_bytes
             .saturating_add(delta.plain_recv_copied_bytes);
-        out.plaintext_chunks = out.plaintext_chunks.saturating_add(delta.plaintext_chunks);
+        out.plaintext_source_chunks = out
+            .plaintext_source_chunks
+            .saturating_add(delta.plaintext_source_chunks);
         out.plaintext_bytes = out.plaintext_bytes.saturating_add(delta.plaintext_bytes);
         out.ws_data_drains = out.ws_data_drains.saturating_add(delta.ws_data_drains);
         out.ws_data_drain_skips = out
@@ -457,7 +465,7 @@ fn pump_talaris(
     spin_iters: usize,
     stats: &mut common::MessageStats,
     latency: &mut TalarisLatencyStats,
-) -> Result<(), talaris::connection::ConnectionError> {
+) -> Result<(), talaris::connection_meta::ConnectionError> {
     if spin_iters == 0 {
         pool.pump_data_marked(|_, ev| record_talaris_marked_event(stats, latency, &ev))
     } else {
@@ -1489,16 +1497,16 @@ fn print_ingress_stats(streams: usize, redundancy: usize, stats: Option<IngressS
     } else {
         stats.ws_data_events as f64 / stats.recv_data_cqes as f64
     };
-    let messages_per_plaintext_chunk = if stats.plaintext_chunks == 0 {
+    let messages_per_plaintext_chunk = if stats.plaintext_source_chunks == 0 {
         0.0
     } else {
-        stats.ws_data_events as f64 / stats.plaintext_chunks as f64
+        stats.ws_data_events as f64 / stats.plaintext_source_chunks as f64
     };
     println!(
         "bench_ingress bench=live_compare mode=talaris streams={streams} redundancy={redundancy} recv_cqes={} recv_bytes={} plaintext_chunks={} plaintext_bytes={} ws_data_events={} text={} binary={} rearm={} ring_exhaustions={} messages_per_recv_cqe={:.3} messages_per_plaintext_chunk={:.3}",
         common::fmt_int(stats.recv_data_cqes),
         common::fmt_int(stats.recv_bytes),
-        common::fmt_int(stats.plaintext_chunks),
+        common::fmt_int(stats.plaintext_source_chunks),
         common::fmt_int(stats.plaintext_bytes),
         common::fmt_int(stats.ws_data_events),
         common::fmt_int(stats.ws_text_events),

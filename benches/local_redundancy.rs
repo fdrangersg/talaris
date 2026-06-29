@@ -36,7 +36,7 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 
-use talaris::connection::IngressStats;
+use talaris::connection_meta::IngressStats;
 use talaris::observability::DataEventMeta;
 use talaris::ws::frame::{MAX_HEADER_LEN, OpCode, encode_header};
 
@@ -234,11 +234,9 @@ fn run_case(
     }
 
     let _pin = cfg.user_cpu.map(|cpu| common::PinGuard::pin("user", cpu));
-    let first_addr = servers
-        .first()
-        .expect("connections list rejects zero")
-        .addr();
-    let proactor_cfg = conn_config(cfg, first_addr).proactor;
+    let proactor_cfg = talaris::proactor::ProactorConfig::default()
+        .with_sq_entries(cfg.sq_entries)
+        .with_cq_entries(cfg.cq_entries);
     let mut pool = talaris::Pool::new(
         talaris::PoolConfig::new(proactor_cfg)
             .with_initial_conn_capacity(connections)
@@ -251,7 +249,10 @@ fn run_case(
         let addr = server.addr();
         let conn_cfg = conn_config(cfg, addr);
         let handle = pool.connect_blocking_to(conn_cfg, addr)?;
-        assert_eq!(pool.state(handle), Some(talaris::connection::State::Open));
+        assert_eq!(
+            pool.state(handle),
+            Some(talaris::connection_meta::State::Open)
+        );
         handles.push(handle);
     }
     let handle_index = handle_index_map(&handles);
@@ -307,11 +308,9 @@ fn run_case(
 }
 
 #[cfg(target_os = "linux")]
-fn conn_config(cfg: &Config, addr: SocketAddr) -> talaris::connection::ConnectionConfig {
-    talaris::connection::ConnectionConfig::new("localhost", addr.port(), "/")
+fn conn_config(cfg: &Config, addr: SocketAddr) -> talaris::connection_meta::ConnectionConfig {
+    talaris::connection_meta::ConnectionConfig::new("localhost", addr.port(), "/")
         .with_tls(false)
-        .with_sq_entries(cfg.sq_entries)
-        .with_cq_entries(cfg.cq_entries)
         .with_buf_ring(cfg.buf_size, cfg.buf_entries)
         .with_ws_limits(BBO_SEQ_TEMPLATE.len(), BBO_SEQ_TEMPLATE.len() as u64)
         .with_plain_recv_batch_copy_max_bytes(cfg.copy_batch_bytes)
@@ -364,7 +363,7 @@ fn pump_redundancy(
     handle_index: &[usize],
     dedup: &mut DedupState,
     stats: &mut RedundancyStats,
-) -> Result<(), talaris::connection::ConnectionError> {
+) -> Result<(), talaris::connection_meta::ConnectionError> {
     if mode.marked() {
         return if spin_iters == 0 {
             pool.pump_data_marked(|handle, ev| {
@@ -692,7 +691,9 @@ const fn add_ingress_stats(out: &mut IngressStats, stats: IngressStats) {
     out.plain_recv_copied_bytes = out
         .plain_recv_copied_bytes
         .saturating_add(stats.plain_recv_copied_bytes);
-    out.plaintext_chunks = out.plaintext_chunks.saturating_add(stats.plaintext_chunks);
+    out.plaintext_source_chunks = out
+        .plaintext_source_chunks
+        .saturating_add(stats.plaintext_source_chunks);
     out.plaintext_bytes = out.plaintext_bytes.saturating_add(stats.plaintext_bytes);
     out.ws_data_drains = out.ws_data_drains.saturating_add(stats.ws_data_drains);
     out.ws_data_drain_skips = out
@@ -724,7 +725,7 @@ fn print_redundancy_ingress(connections: usize, stats: Option<IngressStats>) {
         connections,
         common::fmt_int(stats.recv_data_cqes),
         common::fmt_int(stats.recv_bytes),
-        common::fmt_int(stats.plaintext_chunks),
+        common::fmt_int(stats.plaintext_source_chunks),
         common::fmt_int(stats.ws_data_events),
         common::fmt_int(stats.ws_text_events),
         common::fmt_int(stats.ws_binary_events),

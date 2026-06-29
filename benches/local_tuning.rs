@@ -287,24 +287,27 @@ fn run_variant(cfg: &Config, variant: Variant) -> Result<ResultRow, Box<dyn std:
     )?;
     let addr = server.addr();
 
-    let conn_cfg = talaris::connection::ConnectionConfig::new("localhost", addr.port(), "/")
+    let conn_cfg = talaris::connection_meta::ConnectionConfig::new("localhost", addr.port(), "/")
         .with_tls(false)
-        .with_sq_entries(cfg.sq_entries)
-        .with_cq_entries(cfg.cq_entries)
         .with_buf_ring(variant.buf_size, variant.buf_entries)
         .with_ws_limits(actual_payload_len, actual_payload_len as u64)
         .with_plain_recv_batch_copy_max_bytes(cfg.copy_batch_bytes)
         .with_ingress_stats(true)
         .with_observability_sample_rate_bps(0)
         .with_observability_histograms(false);
-    let proactor_cfg = conn_cfg.proactor;
+    let proactor_cfg = talaris::proactor::ProactorConfig::default()
+        .with_sq_entries(cfg.sq_entries)
+        .with_cq_entries(cfg.cq_entries);
     let mut pool = talaris::Pool::new(
         talaris::PoolConfig::new(proactor_cfg)
             .with_completion_batch_capacity(variant.completion_batch)
             .with_post_progress_spin_iters(cfg.post_progress_spin_iters),
     )?;
     let handle = pool.connect_blocking_to(conn_cfg, addr)?;
-    assert_eq!(pool.state(handle), Some(talaris::connection::State::Open));
+    assert_eq!(
+        pool.state(handle),
+        Some(talaris::connection_meta::State::Open)
+    );
 
     let mut warmup = common::MessageStats::default();
     while warmup.messages < cfg.warmup_messages {
@@ -344,7 +347,7 @@ fn run_variant(cfg: &Config, variant: Variant) -> Result<ResultRow, Box<dyn std:
         mib_s,
         cpu_ns_msg: common::ns_per_message(cpu_elapsed, stats.messages),
         recv_cqes: ingress.recv_data_cqes,
-        plaintext_chunks: ingress.plaintext_chunks,
+        plaintext_chunks: ingress.plaintext_source_chunks,
         ws_events: ingress.ws_data_events,
         rearms: ingress.recv_multishot_rearms,
         ring_exhaustions: ingress.recv_ring_exhaustions,
@@ -353,7 +356,7 @@ fn run_variant(cfg: &Config, variant: Variant) -> Result<ResultRow, Box<dyn std:
         plain_copied_batches: ingress.plain_recv_copied_batches,
         plain_copied_bytes: ingress.plain_recv_copied_bytes,
         messages_per_recv_cqe: ratio(stats.messages, ingress.recv_data_cqes),
-        messages_per_plaintext_chunk: ratio(stats.messages, ingress.plaintext_chunks),
+        messages_per_plaintext_chunk: ratio(stats.messages, ingress.plaintext_source_chunks),
         checksum: stats.checksum(),
     })
 }
@@ -362,7 +365,7 @@ fn pump_talaris(
     pool: &mut talaris::Pool,
     spin_iters: usize,
     stats: &mut common::MessageStats,
-) -> Result<(), talaris::connection::ConnectionError> {
+) -> Result<(), talaris::connection_meta::ConnectionError> {
     if spin_iters == 0 {
         pool.pump_data(|_, ev| record_talaris_event(stats, &ev))
     } else {
@@ -389,10 +392,10 @@ fn should_continue(
 }
 
 const fn diff_ingress(
-    after: talaris::connection::IngressStats,
-    before: talaris::connection::IngressStats,
-) -> talaris::connection::IngressStats {
-    talaris::connection::IngressStats {
+    after: talaris::connection_meta::IngressStats,
+    before: talaris::connection_meta::IngressStats,
+) -> talaris::connection_meta::IngressStats {
+    talaris::connection_meta::IngressStats {
         recv_data_cqes: after.recv_data_cqes.saturating_sub(before.recv_data_cqes),
         recv_bytes: after.recv_bytes.saturating_sub(before.recv_bytes),
         recv_multishot_rearms: after
@@ -413,9 +416,9 @@ const fn diff_ingress(
         plain_recv_copied_bytes: after
             .plain_recv_copied_bytes
             .saturating_sub(before.plain_recv_copied_bytes),
-        plaintext_chunks: after
-            .plaintext_chunks
-            .saturating_sub(before.plaintext_chunks),
+        plaintext_source_chunks: after
+            .plaintext_source_chunks
+            .saturating_sub(before.plaintext_source_chunks),
         plaintext_bytes: after.plaintext_bytes.saturating_sub(before.plaintext_bytes),
         ws_data_drains: after.ws_data_drains.saturating_sub(before.ws_data_drains),
         ws_data_drain_skips: after

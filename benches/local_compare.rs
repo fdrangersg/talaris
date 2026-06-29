@@ -83,7 +83,7 @@ struct Config {
     completion_batch: usize,
     spin_iters: usize,
     post_progress_spin_iters: usize,
-    recv_mode: talaris::connection::RecvMode,
+    recv_mode: talaris::connection_meta::RecvMode,
     copy_batch_bytes: usize,
     timestamps: bool,
     user_cpu: Option<usize>,
@@ -127,7 +127,7 @@ impl Config {
             completion_batch: common::arg_or("--completion-batch", 64_usize).max(1),
             spin_iters: common::arg_or("--spin-iters", 256_usize),
             post_progress_spin_iters: common::arg_or("--post-progress-spin-iters", 0_usize),
-            recv_mode: common::arg_or("--recv-mode", talaris::connection::RecvMode::Multishot),
+            recv_mode: common::arg_or("--recv-mode", talaris::connection_meta::RecvMode::Multishot),
             copy_batch_bytes: common::arg_or("--copy-batch-bytes", 0_usize),
             timestamps: common::flag_present("--timestamps"),
             user_cpu: common::optional_arg("--user-cpu"),
@@ -191,10 +191,8 @@ fn run_talaris_once(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let addr = server.addr();
     let _pin = cfg.user_cpu.map(|cpu| common::PinGuard::pin("user", cpu));
 
-    let conn_cfg = talaris::connection::ConnectionConfig::new("localhost", addr.port(), "/")
+    let conn_cfg = talaris::connection_meta::ConnectionConfig::new("localhost", addr.port(), "/")
         .with_tls(false)
-        .with_sq_entries(cfg.sq_entries)
-        .with_cq_entries(cfg.cq_entries)
         .with_buf_ring(cfg.buf_size, cfg.buf_entries)
         .with_recv_mode(cfg.recv_mode)
         .with_ws_limits(cfg.actual_payload_len, cfg.actual_payload_len as u64)
@@ -206,14 +204,19 @@ fn run_talaris_once(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
             0
         })
         .with_observability_histograms(false);
-    let proactor_cfg = conn_cfg.proactor;
+    let proactor_cfg = talaris::proactor::ProactorConfig::default()
+        .with_sq_entries(cfg.sq_entries)
+        .with_cq_entries(cfg.cq_entries);
     let mut pool = talaris::Pool::new(
         talaris::PoolConfig::new(proactor_cfg)
             .with_completion_batch_capacity(cfg.completion_batch)
             .with_post_progress_spin_iters(cfg.post_progress_spin_iters),
     )?;
     let handle = pool.connect_blocking_to(conn_cfg, addr)?;
-    assert_eq!(pool.state(handle), Some(talaris::connection::State::Open));
+    assert_eq!(
+        pool.state(handle),
+        Some(talaris::connection_meta::State::Open)
+    );
 
     let mut warmup = common::MessageStats::default();
     let mut warmup_latency = if cfg.timestamps {
@@ -273,7 +276,7 @@ fn pump_talaris(
     timestamps: bool,
     stats: &mut common::MessageStats,
     latency: Option<&mut TalarisLatencyStats>,
-) -> Result<(), talaris::connection::ConnectionError> {
+) -> Result<(), talaris::connection_meta::ConnectionError> {
     if timestamps {
         pump_talaris_marked(
             pool,
@@ -294,7 +297,7 @@ fn pump_talaris_marked(
     spin_iters: usize,
     stats: &mut common::MessageStats,
     latency: &mut TalarisLatencyStats,
-) -> Result<(), talaris::connection::ConnectionError> {
+) -> Result<(), talaris::connection_meta::ConnectionError> {
     if spin_iters == 0 {
         pool.pump_data_marked(|_, ev| record_talaris_marked_event(stats, latency, &ev))
     } else {

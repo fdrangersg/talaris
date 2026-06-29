@@ -1269,6 +1269,9 @@ impl WsClient {
 
         let mut consumed = 0_usize;
         let mut events = 0_usize;
+        let max_frame_payload = self.config.max_frame_payload;
+        let max_message_size = self.config.max_message_size;
+        let assume_text_utf8 = self.config.assume_text_utf8;
         loop {
             let bytes = &self.recv_buf.as_slice()[consumed..];
             if bytes.is_empty() {
@@ -1276,69 +1279,29 @@ impl WsClient {
                 return Ok((events, DirectDataResult::Drained));
             }
 
-            let header = match parse_server_data_header_fast(bytes) {
-                Ok(FastDataHeaderResult::Parsed(header)) => header,
-                Ok(FastDataHeaderResult::NeedMore) => {
+            let frame = match parse_complete_server_data_frame(
+                bytes,
+                max_frame_payload,
+                max_message_size,
+                assume_text_utf8,
+            ) {
+                Ok(FastDataFrameResult::Parsed(frame)) => frame,
+                Ok(FastDataFrameResult::NeedMore) => {
                     self.recv_buf.consume(consumed);
                     return Ok((events, DirectDataResult::WaitForMore));
                 }
-                Ok(FastDataHeaderResult::Fallback) => {
+                Ok(FastDataFrameResult::Fallback) => {
                     self.recv_buf.consume(consumed);
                     return Ok((events, DirectDataResult::Fallback));
                 }
                 Err(e) => {
                     self.recv_buf.consume(consumed);
-                    self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
-                    return Err(WsError::Frame(e));
+                    return Err(self.queue_fast_data_frame_error(e));
                 }
             };
 
-            if header.payload_len_u64 > self.config.max_frame_payload {
-                self.recv_buf.consume(consumed);
-                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                return Err(WsError::MessageTooLarge);
-            }
-
-            let payload_len = header.payload_len;
-            if payload_len > self.config.max_message_size {
-                self.recv_buf.consume(consumed);
-                self.queue_close(
-                    CloseCode::MessageTooBig.as_u16(),
-                    "message exceeds max_message_size",
-                );
-                return Err(WsError::MessageTooLarge);
-            }
-            let Some(frame_len) = header.header_len.checked_add(payload_len) else {
-                self.recv_buf.consume(consumed);
-                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                return Err(WsError::MessageTooLarge);
-            };
-            if bytes.len() < frame_len {
-                self.recv_buf.consume(consumed);
-                return Ok((events, DirectDataResult::WaitForMore));
-            }
-
-            let payload = &bytes[header.header_len..frame_len];
-            match header.opcode {
-                OpCode::Text => {
-                    let text = if self.config.assume_text_utf8 {
-                        // SAFETY: Enabled only through `unsafe`
-                        // `WsConfig::with_assume_text_utf8_unchecked`, whose
-                        // caller promises all server text payloads are UTF-8.
-                        unsafe { std::str::from_utf8_unchecked(payload) }
-                    } else if let Ok(text) = std::str::from_utf8(payload) {
-                        text
-                    } else {
-                        self.recv_buf.consume(consumed);
-                        self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
-                        return Err(WsError::Utf8Invalid);
-                    };
-                    sink(DataEvent::Text(text));
-                }
-                OpCode::Binary => sink(DataEvent::Binary(payload)),
-                _ => unreachable!("guarded above"),
-            }
-            consumed += frame_len;
+            sink(frame.event);
+            consumed += frame.frame_len;
             events += 1;
         }
     }
@@ -1364,6 +1327,9 @@ impl WsClient {
 
         let mut consumed = 0_usize;
         let mut events = 0_usize;
+        let max_frame_payload = self.config.max_frame_payload;
+        let max_message_size = self.config.max_message_size;
+        let assume_text_utf8 = self.config.assume_text_utf8;
         loop {
             let bytes = &self.recv_buf.as_slice()[consumed..];
             if bytes.is_empty() {
@@ -1371,63 +1337,29 @@ impl WsClient {
                 return Ok((events, DirectDataResult::Drained));
             }
 
-            let header = match parse_server_data_header_fast(bytes) {
-                Ok(FastDataHeaderResult::Parsed(header)) => header,
-                Ok(FastDataHeaderResult::NeedMore) => {
+            let frame = match parse_complete_server_data_frame(
+                bytes,
+                max_frame_payload,
+                max_message_size,
+                assume_text_utf8,
+            ) {
+                Ok(FastDataFrameResult::Parsed(frame)) => frame,
+                Ok(FastDataFrameResult::NeedMore) => {
                     self.recv_buf.consume(consumed);
                     return Ok((events, DirectDataResult::WaitForMore));
                 }
-                Ok(FastDataHeaderResult::Fallback) => {
+                Ok(FastDataFrameResult::Fallback) => {
                     self.recv_buf.consume(consumed);
                     return Ok((events, DirectDataResult::Fallback));
                 }
                 Err(e) => {
                     self.recv_buf.consume(consumed);
-                    self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
-                    return Err(WsError::Frame(e));
+                    return Err(self.queue_fast_data_frame_error(e));
                 }
             };
 
-            if header.payload_len_u64 > self.config.max_frame_payload {
-                self.recv_buf.consume(consumed);
-                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                return Err(WsError::MessageTooLarge);
-            }
-
-            let payload_len = header.payload_len;
-            if payload_len > self.config.max_message_size {
-                self.recv_buf.consume(consumed);
-                self.queue_close(
-                    CloseCode::MessageTooBig.as_u16(),
-                    "message exceeds max_message_size",
-                );
-                return Err(WsError::MessageTooLarge);
-            }
-            let Some(frame_len) = header.header_len.checked_add(payload_len) else {
-                self.recv_buf.consume(consumed);
-                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                return Err(WsError::MessageTooLarge);
-            };
-            if bytes.len() < frame_len {
-                self.recv_buf.consume(consumed);
-                return Ok((events, DirectDataResult::WaitForMore));
-            }
-
-            let payload = &bytes[header.header_len..frame_len];
-            match header.opcode {
-                OpCode::Text => {
-                    let text = if self.config.assume_text_utf8 {
-                        // SAFETY: Enabled only through `unsafe`
-                        // `WsConfig::with_assume_text_utf8_unchecked`, whose
-                        // caller promises all server text payloads are UTF-8.
-                        unsafe { std::str::from_utf8_unchecked(payload) }
-                    } else if let Ok(text) = std::str::from_utf8(payload) {
-                        text
-                    } else {
-                        self.recv_buf.consume(consumed);
-                        self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
-                        return Err(WsError::Utf8Invalid);
-                    };
+            match frame.event {
+                DataEvent::Text(text) => {
                     emit_marked_text(
                         text,
                         base_meta,
@@ -1437,7 +1369,7 @@ impl WsClient {
                         sink,
                     );
                 }
-                OpCode::Binary => {
+                DataEvent::Binary(payload) => {
                     emit_marked_binary(
                         payload,
                         base_meta,
@@ -1447,9 +1379,8 @@ impl WsClient {
                         sink,
                     );
                 }
-                _ => unreachable!("guarded above"),
             }
-            consumed += frame_len;
+            consumed += frame.frame_len;
             events += 1;
         }
     }
@@ -1472,6 +1403,9 @@ impl WsClient {
         let mut consumed = 0_usize;
         let mut events = 0_usize;
         let mut batch = DataEventBatch::new();
+        let max_frame_payload = self.config.max_frame_payload;
+        let max_message_size = self.config.max_message_size;
+        let assume_text_utf8 = self.config.assume_text_utf8;
         loop {
             let parse = {
                 let bytes = &self.recv_buf.as_slice()[consumed..];
@@ -1481,14 +1415,19 @@ impl WsClient {
                     return Ok((events, DirectDataResult::Drained));
                 }
 
-                let header = match parse_server_data_header_fast(bytes) {
-                    Ok(FastDataHeaderResult::Parsed(header)) => header,
-                    Ok(FastDataHeaderResult::NeedMore) => {
+                match parse_complete_server_data_frame(
+                    bytes,
+                    max_frame_payload,
+                    max_message_size,
+                    assume_text_utf8,
+                ) {
+                    Ok(FastDataFrameResult::Parsed(frame)) => frame,
+                    Ok(FastDataFrameResult::NeedMore) => {
                         flush_data_event_batch(&mut batch, sink, true);
                         self.recv_buf.consume(consumed);
                         return Ok((events, DirectDataResult::WaitForMore));
                     }
-                    Ok(FastDataHeaderResult::Fallback) => {
+                    Ok(FastDataFrameResult::Fallback) => {
                         flush_data_event_batch(&mut batch, sink, false);
                         self.recv_buf.consume(consumed);
                         return Ok((events, DirectDataResult::Fallback));
@@ -1496,70 +1435,17 @@ impl WsClient {
                     Err(e) => {
                         flush_data_event_batch(&mut batch, sink, true);
                         self.recv_buf.consume(consumed);
-                        self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
-                        return Err(WsError::Frame(e));
+                        return Err(self.queue_fast_data_frame_error(e));
                     }
-                };
-
-                if header.payload_len_u64 > self.config.max_frame_payload {
-                    flush_data_event_batch(&mut batch, sink, true);
-                    self.recv_buf.consume(consumed);
-                    self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                    return Err(WsError::MessageTooLarge);
                 }
-
-                let payload_len = header.payload_len;
-                if payload_len > self.config.max_message_size {
-                    flush_data_event_batch(&mut batch, sink, true);
-                    self.recv_buf.consume(consumed);
-                    self.queue_close(
-                        CloseCode::MessageTooBig.as_u16(),
-                        "message exceeds max_message_size",
-                    );
-                    return Err(WsError::MessageTooLarge);
-                }
-                let Some(frame_len) = header.header_len.checked_add(payload_len) else {
-                    flush_data_event_batch(&mut batch, sink, true);
-                    self.recv_buf.consume(consumed);
-                    self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                    return Err(WsError::MessageTooLarge);
-                };
-                if bytes.len() < frame_len {
-                    flush_data_event_batch(&mut batch, sink, true);
-                    self.recv_buf.consume(consumed);
-                    return Ok((events, DirectDataResult::WaitForMore));
-                }
-
-                let payload = &bytes[header.header_len..frame_len];
-                let event = match header.opcode {
-                    OpCode::Text => {
-                        let text = if self.config.assume_text_utf8 {
-                            // SAFETY: Enabled only through `unsafe`
-                            // `WsConfig::with_assume_text_utf8_unchecked`, whose
-                            // caller promises all server text payloads are UTF-8.
-                            unsafe { std::str::from_utf8_unchecked(payload) }
-                        } else if let Ok(text) = std::str::from_utf8(payload) {
-                            text
-                        } else {
-                            flush_data_event_batch(&mut batch, sink, true);
-                            self.recv_buf.consume(consumed);
-                            self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
-                            return Err(WsError::Utf8Invalid);
-                        };
-                        DataEvent::Text(text)
-                    }
-                    OpCode::Binary => DataEvent::Binary(payload),
-                    _ => unreachable!("guarded above"),
-                };
-                (event, frame_len)
             };
 
             if batch.is_full() {
                 flush_data_event_batch(&mut batch, sink, false);
             }
-            let pushed = batch.push(parse.0);
+            let pushed = batch.push(parse.event);
             debug_assert!(pushed);
-            consumed += parse.1;
+            consumed += parse.frame_len;
             events += 1;
         }
     }
@@ -1587,6 +1473,9 @@ impl WsClient {
         let mut consumed = 0_usize;
         let mut events = 0_usize;
         let mut batch = MarkedDataEventBatch::new();
+        let max_frame_payload = self.config.max_frame_payload;
+        let max_message_size = self.config.max_message_size;
+        let assume_text_utf8 = self.config.assume_text_utf8;
         loop {
             let parse = {
                 let bytes = &self.recv_buf.as_slice()[consumed..];
@@ -1602,9 +1491,14 @@ impl WsClient {
                     return Ok((events, DirectDataResult::Drained));
                 }
 
-                let header = match parse_server_data_header_fast(bytes) {
-                    Ok(FastDataHeaderResult::Parsed(header)) => header,
-                    Ok(FastDataHeaderResult::NeedMore) => {
+                match parse_complete_server_data_frame(
+                    bytes,
+                    max_frame_payload,
+                    max_message_size,
+                    assume_text_utf8,
+                ) {
+                    Ok(FastDataFrameResult::Parsed(frame)) => frame,
+                    Ok(FastDataFrameResult::NeedMore) => {
                         flush_marked_data_event_batch(
                             &mut batch,
                             sink,
@@ -1615,7 +1509,7 @@ impl WsClient {
                         self.recv_buf.consume(consumed);
                         return Ok((events, DirectDataResult::WaitForMore));
                     }
-                    Ok(FastDataHeaderResult::Fallback) => {
+                    Ok(FastDataFrameResult::Fallback) => {
                         flush_marked_data_event_batch(
                             &mut batch,
                             sink,
@@ -1635,109 +1529,9 @@ impl WsClient {
                             chunk_prior_sink_service_nanos,
                         );
                         self.recv_buf.consume(consumed);
-                        self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
-                        return Err(WsError::Frame(e));
+                        return Err(self.queue_fast_data_frame_error(e));
                     }
-                };
-
-                if header.payload_len_u64 > self.config.max_frame_payload {
-                    flush_marked_data_event_batch(
-                        &mut batch,
-                        sink,
-                        true,
-                        base_meta.sampled,
-                        chunk_prior_sink_service_nanos,
-                    );
-                    self.recv_buf.consume(consumed);
-                    self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                    return Err(WsError::MessageTooLarge);
                 }
-
-                let payload_len = header.payload_len;
-                if payload_len > self.config.max_message_size {
-                    flush_marked_data_event_batch(
-                        &mut batch,
-                        sink,
-                        true,
-                        base_meta.sampled,
-                        chunk_prior_sink_service_nanos,
-                    );
-                    self.recv_buf.consume(consumed);
-                    self.queue_close(
-                        CloseCode::MessageTooBig.as_u16(),
-                        "message exceeds max_message_size",
-                    );
-                    return Err(WsError::MessageTooLarge);
-                }
-                let Some(frame_len) = header.header_len.checked_add(payload_len) else {
-                    flush_marked_data_event_batch(
-                        &mut batch,
-                        sink,
-                        true,
-                        base_meta.sampled,
-                        chunk_prior_sink_service_nanos,
-                    );
-                    self.recv_buf.consume(consumed);
-                    self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                    return Err(WsError::MessageTooLarge);
-                };
-                if bytes.len() < frame_len {
-                    flush_marked_data_event_batch(
-                        &mut batch,
-                        sink,
-                        true,
-                        base_meta.sampled,
-                        chunk_prior_sink_service_nanos,
-                    );
-                    self.recv_buf.consume(consumed);
-                    return Ok((events, DirectDataResult::WaitForMore));
-                }
-
-                let payload = &bytes[header.header_len..frame_len];
-                let event = match header.opcode {
-                    OpCode::Text => {
-                        let text = if self.config.assume_text_utf8 {
-                            // SAFETY: Enabled only through `unsafe`
-                            // `WsConfig::with_assume_text_utf8_unchecked`, whose
-                            // caller promises all server text payloads are UTF-8.
-                            unsafe { std::str::from_utf8_unchecked(payload) }
-                        } else if let Ok(text) = std::str::from_utf8(payload) {
-                            text
-                        } else {
-                            flush_marked_data_event_batch(
-                                &mut batch,
-                                sink,
-                                true,
-                                base_meta.sampled,
-                                chunk_prior_sink_service_nanos,
-                            );
-                            self.recv_buf.consume(consumed);
-                            self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
-                            return Err(WsError::Utf8Invalid);
-                        };
-                        let meta = next_marked_meta(
-                            base_meta,
-                            message_index,
-                            message_sequence,
-                            *chunk_prior_sink_service_nanos,
-                        );
-                        MarkedDataEvent::Text {
-                            payload: text,
-                            meta,
-                        }
-                    }
-                    OpCode::Binary => {
-                        let meta = next_marked_meta(
-                            base_meta,
-                            message_index,
-                            message_sequence,
-                            *chunk_prior_sink_service_nanos,
-                        );
-                        MarkedDataEvent::Binary { payload, meta }
-                    }
-                    _ => unreachable!("guarded above"),
-                };
-                (event, frame_len)
             };
 
             if batch.is_full() {
@@ -1749,9 +1543,33 @@ impl WsClient {
                     chunk_prior_sink_service_nanos,
                 );
             }
-            let pushed = batch.push(parse.0);
+
+            let event = match parse.event {
+                DataEvent::Text(text) => {
+                    let meta = next_marked_meta(
+                        base_meta,
+                        message_index,
+                        message_sequence,
+                        *chunk_prior_sink_service_nanos,
+                    );
+                    MarkedDataEvent::Text {
+                        payload: text,
+                        meta,
+                    }
+                }
+                DataEvent::Binary(payload) => {
+                    let meta = next_marked_meta(
+                        base_meta,
+                        message_index,
+                        message_sequence,
+                        *chunk_prior_sink_service_nanos,
+                    );
+                    MarkedDataEvent::Binary { payload, meta }
+                }
+            };
+            let pushed = batch.push(event);
             debug_assert!(pushed);
-            consumed += parse.1;
+            consumed += parse.frame_len;
             events += 1;
         }
     }
@@ -1763,6 +1581,31 @@ impl WsClient {
             && self.msg_opcode.is_none()
             && self.recv_buf.is_empty()
             && self.borrowed_payload.is_none()
+    }
+
+    #[inline]
+    fn queue_fast_data_frame_error(&mut self, err: FastDataFrameError) -> WsError {
+        match err {
+            FastDataFrameError::Frame(e) => {
+                self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
+                WsError::Frame(e)
+            }
+            FastDataFrameError::FrameTooLarge => {
+                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                WsError::MessageTooLarge
+            }
+            FastDataFrameError::MessageTooLarge => {
+                self.queue_close(
+                    CloseCode::MessageTooBig.as_u16(),
+                    "message exceeds max_message_size",
+                );
+                WsError::MessageTooLarge
+            }
+            FastDataFrameError::Utf8Invalid => {
+                self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
+                WsError::Utf8Invalid
+            }
+        }
     }
 
     /// Direct data-only path over caller-owned ingress bytes. Returns
@@ -1777,79 +1620,41 @@ impl WsClient {
     {
         let original_len = bytes.len();
         let mut events = 0_usize;
+        let max_frame_payload = self.config.max_frame_payload;
+        let max_message_size = self.config.max_message_size;
+        let assume_text_utf8 = self.config.assume_text_utf8;
         loop {
             if bytes.is_empty() {
                 return Ok((events, original_len, DirectDataResult::Drained));
             }
 
-            let header = match parse_server_data_header_fast(bytes) {
-                Ok(FastDataHeaderResult::Parsed(header)) => header,
-                Ok(FastDataHeaderResult::NeedMore) => {
+            let frame = match parse_complete_server_data_frame(
+                bytes,
+                max_frame_payload,
+                max_message_size,
+                assume_text_utf8,
+            ) {
+                Ok(FastDataFrameResult::Parsed(frame)) => frame,
+                Ok(FastDataFrameResult::NeedMore) => {
                     return Ok((
                         events,
                         original_len - bytes.len(),
                         DirectDataResult::WaitForMore,
                     ));
                 }
-                Ok(FastDataHeaderResult::Fallback) => {
+                Ok(FastDataFrameResult::Fallback) => {
                     return Ok((
                         events,
                         original_len - bytes.len(),
                         DirectDataResult::Fallback,
                     ));
                 }
-                Err(e) => {
-                    self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
-                    return Err(WsError::Frame(e));
-                }
+                Err(e) => return Err(self.queue_fast_data_frame_error(e)),
             };
 
-            if header.payload_len_u64 > self.config.max_frame_payload {
-                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                return Err(WsError::MessageTooLarge);
-            }
-
-            let payload_len = header.payload_len;
-            if payload_len > self.config.max_message_size {
-                self.queue_close(
-                    CloseCode::MessageTooBig.as_u16(),
-                    "message exceeds max_message_size",
-                );
-                return Err(WsError::MessageTooLarge);
-            }
-            let Some(frame_len) = header.header_len.checked_add(payload_len) else {
-                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                return Err(WsError::MessageTooLarge);
-            };
-            if bytes.len() < frame_len {
-                return Ok((
-                    events,
-                    original_len - bytes.len(),
-                    DirectDataResult::WaitForMore,
-                ));
-            }
-
-            let payload = &bytes[header.header_len..frame_len];
-            match header.opcode {
-                OpCode::Text => {
-                    let text = if self.config.assume_text_utf8 {
-                        // SAFETY: Enabled only through `unsafe`
-                        // `WsConfig::with_assume_text_utf8_unchecked`, whose
-                        // caller promises all server text payloads are UTF-8.
-                        unsafe { std::str::from_utf8_unchecked(payload) }
-                    } else {
-                        std::str::from_utf8(payload).map_err(|_| {
-                            self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
-                            WsError::Utf8Invalid
-                        })?
-                    };
-                    sink(DataEvent::Text(text));
-                }
-                OpCode::Binary => sink(DataEvent::Binary(payload)),
-                _ => unreachable!("guarded above"),
-            }
+            sink(frame.event);
             events += 1;
-            bytes = &bytes[frame_len..];
+            bytes = &bytes[frame.frame_len..];
         }
     }
 
@@ -1864,15 +1669,23 @@ impl WsClient {
         let original_len = bytes.len();
         let mut events = 0_usize;
         let mut batch = DataEventBatch::new();
+        let max_frame_payload = self.config.max_frame_payload;
+        let max_message_size = self.config.max_message_size;
+        let assume_text_utf8 = self.config.assume_text_utf8;
         loop {
             if bytes.is_empty() {
                 flush_data_event_batch(&mut batch, sink, true);
                 return Ok((events, original_len, DirectDataResult::Drained));
             }
 
-            let header = match parse_server_data_header_fast(bytes) {
-                Ok(FastDataHeaderResult::Parsed(header)) => header,
-                Ok(FastDataHeaderResult::NeedMore) => {
+            let frame = match parse_complete_server_data_frame(
+                bytes,
+                max_frame_payload,
+                max_message_size,
+                assume_text_utf8,
+            ) {
+                Ok(FastDataFrameResult::Parsed(frame)) => frame,
+                Ok(FastDataFrameResult::NeedMore) => {
                     flush_data_event_batch(&mut batch, sink, true);
                     return Ok((
                         events,
@@ -1880,7 +1693,7 @@ impl WsClient {
                         DirectDataResult::WaitForMore,
                     ));
                 }
-                Ok(FastDataHeaderResult::Fallback) => {
+                Ok(FastDataFrameResult::Fallback) => {
                     flush_data_event_batch(&mut batch, sink, false);
                     return Ok((
                         events,
@@ -1890,68 +1703,18 @@ impl WsClient {
                 }
                 Err(e) => {
                     flush_data_event_batch(&mut batch, sink, true);
-                    self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
-                    return Err(WsError::Frame(e));
+                    return Err(self.queue_fast_data_frame_error(e));
                 }
             };
-
-            if header.payload_len_u64 > self.config.max_frame_payload {
-                flush_data_event_batch(&mut batch, sink, true);
-                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                return Err(WsError::MessageTooLarge);
-            }
-
-            let payload_len = header.payload_len;
-            if payload_len > self.config.max_message_size {
-                flush_data_event_batch(&mut batch, sink, true);
-                self.queue_close(
-                    CloseCode::MessageTooBig.as_u16(),
-                    "message exceeds max_message_size",
-                );
-                return Err(WsError::MessageTooLarge);
-            }
-            let Some(frame_len) = header.header_len.checked_add(payload_len) else {
-                flush_data_event_batch(&mut batch, sink, true);
-                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                return Err(WsError::MessageTooLarge);
-            };
-            if bytes.len() < frame_len {
-                flush_data_event_batch(&mut batch, sink, true);
-                return Ok((
-                    events,
-                    original_len - bytes.len(),
-                    DirectDataResult::WaitForMore,
-                ));
-            }
 
             if batch.is_full() {
                 flush_data_event_batch(&mut batch, sink, false);
             }
 
-            let payload = &bytes[header.header_len..frame_len];
-            let event = match header.opcode {
-                OpCode::Text => {
-                    let text = if self.config.assume_text_utf8 {
-                        // SAFETY: Enabled only through `unsafe`
-                        // `WsConfig::with_assume_text_utf8_unchecked`, whose
-                        // caller promises all server text payloads are UTF-8.
-                        unsafe { std::str::from_utf8_unchecked(payload) }
-                    } else if let Ok(text) = std::str::from_utf8(payload) {
-                        text
-                    } else {
-                        flush_data_event_batch(&mut batch, sink, true);
-                        self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
-                        return Err(WsError::Utf8Invalid);
-                    };
-                    DataEvent::Text(text)
-                }
-                OpCode::Binary => DataEvent::Binary(payload),
-                _ => unreachable!("guarded above"),
-            };
-            let pushed = batch.push(event);
+            let pushed = batch.push(frame.event);
             debug_assert!(pushed);
             events += 1;
-            bytes = &bytes[frame_len..];
+            bytes = &bytes[frame.frame_len..];
         }
     }
 
@@ -1969,72 +1732,40 @@ impl WsClient {
     {
         let original_len = bytes.len();
         let mut events = 0_usize;
+        let max_frame_payload = self.config.max_frame_payload;
+        let max_message_size = self.config.max_message_size;
+        let assume_text_utf8 = self.config.assume_text_utf8;
         loop {
             if bytes.is_empty() {
                 return Ok((events, original_len, DirectDataResult::Drained));
             }
 
-            let header = match parse_server_data_header_fast(bytes) {
-                Ok(FastDataHeaderResult::Parsed(header)) => header,
-                Ok(FastDataHeaderResult::NeedMore) => {
+            let frame = match parse_complete_server_data_frame(
+                bytes,
+                max_frame_payload,
+                max_message_size,
+                assume_text_utf8,
+            ) {
+                Ok(FastDataFrameResult::Parsed(frame)) => frame,
+                Ok(FastDataFrameResult::NeedMore) => {
                     return Ok((
                         events,
                         original_len - bytes.len(),
                         DirectDataResult::WaitForMore,
                     ));
                 }
-                Ok(FastDataHeaderResult::Fallback) => {
+                Ok(FastDataFrameResult::Fallback) => {
                     return Ok((
                         events,
                         original_len - bytes.len(),
                         DirectDataResult::Fallback,
                     ));
                 }
-                Err(e) => {
-                    self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
-                    return Err(WsError::Frame(e));
-                }
+                Err(e) => return Err(self.queue_fast_data_frame_error(e)),
             };
 
-            if header.payload_len_u64 > self.config.max_frame_payload {
-                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                return Err(WsError::MessageTooLarge);
-            }
-
-            let payload_len = header.payload_len;
-            if payload_len > self.config.max_message_size {
-                self.queue_close(
-                    CloseCode::MessageTooBig.as_u16(),
-                    "message exceeds max_message_size",
-                );
-                return Err(WsError::MessageTooLarge);
-            }
-            let Some(frame_len) = header.header_len.checked_add(payload_len) else {
-                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                return Err(WsError::MessageTooLarge);
-            };
-            if bytes.len() < frame_len {
-                return Ok((
-                    events,
-                    original_len - bytes.len(),
-                    DirectDataResult::WaitForMore,
-                ));
-            }
-
-            let payload = &bytes[header.header_len..frame_len];
-            match header.opcode {
-                OpCode::Text => {
-                    let text = if self.config.assume_text_utf8 {
-                        // SAFETY: Enabled only through `unsafe`
-                        // `WsConfig::with_assume_text_utf8_unchecked`, whose
-                        // caller promises all server text payloads are UTF-8.
-                        unsafe { std::str::from_utf8_unchecked(payload) }
-                    } else {
-                        std::str::from_utf8(payload).map_err(|_| {
-                            self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
-                            WsError::Utf8Invalid
-                        })?
-                    };
+            match frame.event {
+                DataEvent::Text(text) => {
                     emit_marked_text(
                         text,
                         base_meta,
@@ -2044,7 +1775,7 @@ impl WsClient {
                         sink,
                     );
                 }
-                OpCode::Binary => {
+                DataEvent::Binary(payload) => {
                     emit_marked_binary(
                         payload,
                         base_meta,
@@ -2054,10 +1785,9 @@ impl WsClient {
                         sink,
                     );
                 }
-                _ => unreachable!("guarded above"),
             }
             events += 1;
-            bytes = &bytes[frame_len..];
+            bytes = &bytes[frame.frame_len..];
         }
     }
 
@@ -2077,6 +1807,9 @@ impl WsClient {
         let original_len = bytes.len();
         let mut events = 0_usize;
         let mut batch = MarkedDataEventBatch::new();
+        let max_frame_payload = self.config.max_frame_payload;
+        let max_message_size = self.config.max_message_size;
+        let assume_text_utf8 = self.config.assume_text_utf8;
         loop {
             if bytes.is_empty() {
                 flush_marked_data_event_batch(
@@ -2089,9 +1822,14 @@ impl WsClient {
                 return Ok((events, original_len, DirectDataResult::Drained));
             }
 
-            let header = match parse_server_data_header_fast(bytes) {
-                Ok(FastDataHeaderResult::Parsed(header)) => header,
-                Ok(FastDataHeaderResult::NeedMore) => {
+            let frame = match parse_complete_server_data_frame(
+                bytes,
+                max_frame_payload,
+                max_message_size,
+                assume_text_utf8,
+            ) {
+                Ok(FastDataFrameResult::Parsed(frame)) => frame,
+                Ok(FastDataFrameResult::NeedMore) => {
                     flush_marked_data_event_batch(
                         &mut batch,
                         sink,
@@ -2105,7 +1843,7 @@ impl WsClient {
                         DirectDataResult::WaitForMore,
                     ));
                 }
-                Ok(FastDataHeaderResult::Fallback) => {
+                Ok(FastDataFrameResult::Fallback) => {
                     flush_marked_data_event_batch(
                         &mut batch,
                         sink,
@@ -2127,63 +1865,9 @@ impl WsClient {
                         base_meta.sampled,
                         chunk_prior_sink_service_nanos,
                     );
-                    self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
-                    return Err(WsError::Frame(e));
+                    return Err(self.queue_fast_data_frame_error(e));
                 }
             };
-
-            if header.payload_len_u64 > self.config.max_frame_payload {
-                flush_marked_data_event_batch(
-                    &mut batch,
-                    sink,
-                    true,
-                    base_meta.sampled,
-                    chunk_prior_sink_service_nanos,
-                );
-                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                return Err(WsError::MessageTooLarge);
-            }
-
-            let payload_len = header.payload_len;
-            if payload_len > self.config.max_message_size {
-                flush_marked_data_event_batch(
-                    &mut batch,
-                    sink,
-                    true,
-                    base_meta.sampled,
-                    chunk_prior_sink_service_nanos,
-                );
-                self.queue_close(
-                    CloseCode::MessageTooBig.as_u16(),
-                    "message exceeds max_message_size",
-                );
-                return Err(WsError::MessageTooLarge);
-            }
-            let Some(frame_len) = header.header_len.checked_add(payload_len) else {
-                flush_marked_data_event_batch(
-                    &mut batch,
-                    sink,
-                    true,
-                    base_meta.sampled,
-                    chunk_prior_sink_service_nanos,
-                );
-                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                return Err(WsError::MessageTooLarge);
-            };
-            if bytes.len() < frame_len {
-                flush_marked_data_event_batch(
-                    &mut batch,
-                    sink,
-                    true,
-                    base_meta.sampled,
-                    chunk_prior_sink_service_nanos,
-                );
-                return Ok((
-                    events,
-                    original_len - bytes.len(),
-                    DirectDataResult::WaitForMore,
-                ));
-            }
 
             if batch.is_full() {
                 flush_marked_data_event_batch(
@@ -2195,27 +1879,8 @@ impl WsClient {
                 );
             }
 
-            let payload = &bytes[header.header_len..frame_len];
-            let event = match header.opcode {
-                OpCode::Text => {
-                    let text = if self.config.assume_text_utf8 {
-                        // SAFETY: Enabled only through `unsafe`
-                        // `WsConfig::with_assume_text_utf8_unchecked`, whose
-                        // caller promises all server text payloads are UTF-8.
-                        unsafe { std::str::from_utf8_unchecked(payload) }
-                    } else if let Ok(text) = std::str::from_utf8(payload) {
-                        text
-                    } else {
-                        flush_marked_data_event_batch(
-                            &mut batch,
-                            sink,
-                            true,
-                            base_meta.sampled,
-                            chunk_prior_sink_service_nanos,
-                        );
-                        self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
-                        return Err(WsError::Utf8Invalid);
-                    };
+            let event = match frame.event {
+                DataEvent::Text(text) => {
                     let meta = next_marked_meta(
                         base_meta,
                         message_index,
@@ -2227,7 +1892,7 @@ impl WsClient {
                         meta,
                     }
                 }
-                OpCode::Binary => {
+                DataEvent::Binary(payload) => {
                     let meta = next_marked_meta(
                         base_meta,
                         message_index,
@@ -2236,12 +1901,11 @@ impl WsClient {
                     );
                     MarkedDataEvent::Binary { payload, meta }
                 }
-                _ => unreachable!("guarded above"),
             };
             let pushed = batch.push(event);
             debug_assert!(pushed);
             events += 1;
-            bytes = &bytes[frame_len..];
+            bytes = &bytes[frame.frame_len..];
         }
     }
 
@@ -2744,6 +2408,79 @@ enum FastDataHeaderResult {
     Parsed(FastDataHeader),
     NeedMore,
     Fallback,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FastDataFrame<'a> {
+    event: DataEvent<'a>,
+    frame_len: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FastDataFrameResult<'a> {
+    Parsed(FastDataFrame<'a>),
+    NeedMore,
+    Fallback,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FastDataFrameError {
+    Frame(FrameError),
+    FrameTooLarge,
+    MessageTooLarge,
+    Utf8Invalid,
+}
+
+#[inline]
+fn parse_complete_server_data_frame(
+    bytes: &[u8],
+    max_frame_payload: u64,
+    max_message_size: usize,
+    assume_text_utf8: bool,
+) -> Result<FastDataFrameResult<'_>, FastDataFrameError> {
+    let header = match parse_server_data_header_fast(bytes).map_err(FastDataFrameError::Frame)? {
+        FastDataHeaderResult::Parsed(header) => header,
+        FastDataHeaderResult::NeedMore => return Ok(FastDataFrameResult::NeedMore),
+        FastDataHeaderResult::Fallback => return Ok(FastDataFrameResult::Fallback),
+    };
+
+    if header.payload_len_u64 > max_frame_payload {
+        return Err(FastDataFrameError::FrameTooLarge);
+    }
+
+    let payload_len = header.payload_len;
+    if payload_len > max_message_size {
+        return Err(FastDataFrameError::MessageTooLarge);
+    }
+    let frame_len = header
+        .header_len
+        .checked_add(payload_len)
+        .ok_or(FastDataFrameError::FrameTooLarge)?;
+    if bytes.len() < frame_len {
+        return Ok(FastDataFrameResult::NeedMore);
+    }
+
+    let payload = &bytes[header.header_len..frame_len];
+    let event = match header.opcode {
+        OpCode::Text => {
+            let text = if assume_text_utf8 {
+                // SAFETY: Enabled only through `unsafe`
+                // `WsConfig::with_assume_text_utf8_unchecked`, whose caller
+                // promises all server text payloads are UTF-8.
+                unsafe { std::str::from_utf8_unchecked(payload) }
+            } else {
+                std::str::from_utf8(payload).map_err(|_| FastDataFrameError::Utf8Invalid)?
+            };
+            DataEvent::Text(text)
+        }
+        OpCode::Binary => DataEvent::Binary(payload),
+        _ => unreachable!("guarded by parse_server_data_header_fast"),
+    };
+
+    Ok(FastDataFrameResult::Parsed(FastDataFrame {
+        event,
+        frame_len,
+    }))
 }
 
 #[inline]

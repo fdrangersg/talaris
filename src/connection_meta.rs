@@ -1,4 +1,4 @@
-//! `connection` —— Pool 内单条 conn 的公共类型
+//! `connection_meta` —— Pool 内单条 conn 的公共类型和元数据
 //!
 //! [`State`] / [`ConnectionConfig`] / [`ConnectionError`] 是 [`crate::Pool`] 对外
 //! API 共用的类型。公开 API 不再暴露单独的 `Connection` wrapper；单连接也通过
@@ -14,7 +14,7 @@ use std::{io, sync::Arc};
 use thiserror::Error;
 
 use crate::observability::{ObservabilityError, ObservabilitySampleRate};
-use crate::proactor::{BufferRingError, ProactorConfig, ProactorError, ProactorSetupFlags};
+use crate::proactor::{BufferRingError, ProactorError};
 use crate::tls::TlsError;
 use crate::ws::{WsConfig, WsError};
 
@@ -32,9 +32,20 @@ pub const DEFAULT_BUF_RING_SLOT_SIZE: u32 = 4 * 1024;
 /// 影响 burst 时有多少个 buffer slot 可以同时借给 kernel。
 pub const DEFAULT_BUF_RING_ENTRIES: u16 = 256;
 
+/// Receive opcode variants.
+///
+/// `Multishot` is the mature default: lower kernel requirement, one CQE per
+/// provided buffer, and simpler semantics.
+///
+/// `MultishotBundle` may reduce CQE count for large-payload or bursty feeds,
+/// but requires Linux 6.10+ and must be A/B tested per feed.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum RecvMode {
     /// One long-lived `IORING_OP_RECV_MULTISHOT` CQE per received buffer.
+    /// 提交一次 recv multishot SQE
+    /// 内核之后可以为这条 recv 产生多个 CQE
+    /// 每次有数据到达，就从 provided buffer group 里取一个 buffer 填数据
+    /// 每个 CQE 对应一个被填充的 provided buffer
     #[default]
     Multishot,
     /// Linux 6.10+ `IORING_RECVSEND_BUNDLE` multishot receive. One CQE may
@@ -116,7 +127,7 @@ pub enum ConnectionError {
     PeerClosed,
     #[error("CQE returned unknown OpKind: raw user_data = 0x{0:016x}")]
     UnknownOpKind(u64),
-    /// Pool 的 `conn_id` 或 `bgid` 计数器耗尽。当前 v1 不回收 id，长跑 reconnect
+    /// Pool 的 `conn_id` 或 `bgid` 计数器耗尽。当前不回收 id，长跑 reconnect
     /// 累计到 `UserData` 可编码的 conn_id 空间或 `u16` bgid 空间上限就报这个。
     /// 修复路径：给 Pool 加 free-list 复用槽位。
     #[error("pool {0} id space exhausted; restart or implement id reuse")]
@@ -129,13 +140,14 @@ pub enum ConnectionError {
 pub struct IngressStats {
     /// Positive-length recv data CQEs handled by this connection.
     pub recv_data_cqes: u64,
-    /// Ciphertext bytes carried by those CQEs.
+    /// Bytes carried by positive-length recv data CQEs.
+    /// For TLS these are ciphertext bytes; for plain TCP these are plaintext bytes.
     pub recv_bytes: u64,
     /// Times a recv multishot SQE was submitted or rearmed for this connection.
     pub recv_multishot_rearms: u64,
     /// Multishot recv terminations caused by provided-buffer ring exhaustion.
     pub recv_ring_exhaustions: u64,
-    /// Consecutive plain TCP recv CQE runs handled by the data pump batch path.
+    /// Consecutive **plain** TCP recv CQE runs handled by the data pump batch path.
     pub plain_recv_batches: u64,
     /// Total recv CQEs included in those plain TCP batch runs.
     pub plain_recv_batch_cqes: u64,
@@ -143,14 +155,15 @@ pub struct IngressStats {
     pub plain_recv_copied_batches: u64,
     /// Bytes copied into the reusable plain TCP batch scratch buffer.
     pub plain_recv_copied_bytes: u64,
-    /// Plaintext chunks fed into the WebSocket parser. For TLS connections this
-    /// counts rustls plaintext chunks; for plain TCP this counts recv CQEs.
-    pub plaintext_chunks: u64,
+    /// Plaintext source chunks made available to WebSocket receive processing.
+    /// For TLS connections this counts **rustls plaintext slices**.
+    /// For plain TCP this counts recv/provided-buffer slices before optional copy batching.
+    pub plaintext_source_chunks: u64,
     /// Plaintext bytes fed into the WebSocket parser.
     pub plaintext_bytes: u64,
-    /// Data-pump CQEs that fed plaintext into the WebSocket receive buffer.
+    /// Data-pump plaintext source chunks that reached WebSocket receive processing.
     pub ws_data_drains: u64,
-    /// Data-pump CQEs that skipped WebSocket draining because no plaintext arrived.
+    /// Data-pump drain attempts skipped because no plaintext arrived.
     pub ws_data_drain_skips: u64,
     /// Text/Binary data messages emitted to the user's data sink.
     pub ws_data_events: u64,
@@ -160,9 +173,22 @@ pub struct IngressStats {
     pub ws_binary_events: u64,
 }
 
-/// 构造单条 conn 的参数。`proactor` 是创建 [`Pool`](crate::Pool) 时的便利默认值；
-/// 单条 connect 实际使用 Pool 已持有的 proactor，`conn_id` / `bgid` 也由
-/// [`Pool`](crate::Pool) 内部分配，caller 不应自己设。
+/// Runtime identity assigned by [`Pool`](crate::Pool) when a connection slot is reserved.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct ConnectionRuntimeIdentity {
+    pub conn_id: u32,
+    pub bgid: u16,
+}
+
+/// Internal config passed from [`Pool`](crate::Pool) to `ConnectionState` after runtime assignment.
+#[derive(Debug, Clone)]
+pub(crate) struct AssignedConnectionConfig {
+    pub user: ConnectionConfig,
+    pub identity: ConnectionRuntimeIdentity,
+}
+
+/// Caller-owned connection parameters. Pool-level io_uring config lives in
+/// [`PoolConfig`](crate::PoolConfig); runtime ids are assigned internally by [`Pool`](crate::Pool).
 #[derive(Debug, Clone)]
 pub struct ConnectionConfig {
     pub host: String,
@@ -172,15 +198,11 @@ pub struct ConnectionConfig {
     /// 自定义 rustls client 配置。`None` 使用 webpki roots + `http/1.1` ALPN
     /// 的默认配置；私有 CA、session cache 或 crypto provider 调优可注入配置。
     pub tls_config: Option<Arc<rustls::ClientConfig>>,
-    /// 构造 [`PoolConfig`](crate::PoolConfig) 时传给 [`Proactor::new`](crate::proactor::Proactor::new)。
-    /// HFT 部署主要调 SQ/CQ 容量和 taskrun flags；线程 pinning 由
-    /// [`crate::proactor::pin_current_thread_to`] 单独控制。
-    pub proactor: ProactorConfig,
-    /// 本 conn 的路由 token。由 [`Pool`](crate::Pool) 在 `connect_blocking` 内分配；
-    /// caller 直接构造时留默认 0 即可。低 28 位有效。
-    pub conn_id: u32,
-    /// 本 conn 独占的 buffer ring group id。同样由 Pool 分配。
-    pub bgid: u16,
+    /// 覆盖底层 [`WsClient`](crate::ws::WsClient) 配置。`host` / `path` 最终仍以
+    /// 当前 `ConnectionConfig` 为准，避免 transport endpoint 和 WS handshake
+    /// header 被调参配置意外改散。
+    pub ws_config: Option<WsConfig>,
+
     /// multishot recv 用的 provided buffer 单个 slot 大小（字节）。kernel 每次 RX 最多写满这一格然后 post CQE。
     /// **取多大平衡 latency vs throughput**：
     /// 小（4 KiB 默认）→ CQE 粒度更细 / 单次 parser 输入更短 / 常见高频小帧更可能落在同一 CQE 内；
@@ -189,16 +211,13 @@ pub struct ConnectionConfig {
     /// buffer ring entry 数。必须非零 2 的幂。`entries × buf_size` = 整池字节数；
     /// 太小会让 multishot 在 user space recycle 跟不上时频繁 ENOBUFS。
     pub buf_ring_entries: u16,
-    /// 覆盖底层 [`WsClient`](crate::ws::WsClient) 配置。`host` / `path` 最终仍以
-    /// 当前 `ConnectionConfig` 为准，避免 transport endpoint 和 WS handshake
-    /// header 被调参配置意外改散。
-    pub ws_config: Option<WsConfig>,
     /// io_uring recv opcode variant. Default is classic multishot recv; bundle
     /// is Linux 6.10+ and should be A/B tested per feed.
     pub recv_mode: RecvMode,
     /// Per-socket Linux `SO_BUSY_POLL` budget in microseconds. `None` leaves the
     /// socket default untouched; this is an opt-in low-latency experiment.
     pub socket_busy_poll_usecs: Option<u32>,
+
     /// `send_buf` 初始容量。`None` 表示沿用 `buf_ring_slot_size`。
     ///
     /// 这是 socket/TLS outbound staging buffer；真实 pending 字节仍会按需 grow。
@@ -211,6 +230,7 @@ pub struct ConnectionConfig {
     /// `0` disables copy aggregation. This only affects unmarked plain-WS data
     /// pumps; TLS and marked observability paths preserve per-CQE staging.
     pub plain_recv_batch_copy_max_bytes: usize,
+
     /// 收集 [`IngressStats`]。默认关闭，避免在生产 hot path 上无条件更新计数器。
     pub track_ingress_stats: bool,
     /// Sampling rate for marked observability timestamps. Marked pumps default to
@@ -230,9 +250,6 @@ impl ConnectionConfig {
             path: path.into(),
             use_tls: true,
             tls_config: None,
-            proactor: ProactorConfig::default(),
-            conn_id: 0,
-            bgid: 0,
             buf_ring_slot_size: DEFAULT_BUF_RING_SLOT_SIZE,
             buf_ring_entries: DEFAULT_BUF_RING_ENTRIES,
             ws_config: None,
@@ -258,46 +275,6 @@ impl ConnectionConfig {
     #[must_use]
     pub fn with_tls_config(mut self, config: Arc<rustls::ClientConfig>) -> Self {
         self.tls_config = Some(config);
-        self
-    }
-
-    /// 覆盖 proactor 完整配置。适合统一注入 entries / CQ sizing / taskrun flags。
-    #[must_use]
-    pub const fn with_proactor(mut self, proactor: ProactorConfig) -> Self {
-        self.proactor = proactor;
-        self
-    }
-
-    /// 覆盖 io_uring SQ entries。必须是非零 2 的幂；最终校验由 [`Proactor::new`](crate::proactor::Proactor::new) 完成。
-    #[must_use]
-    pub const fn with_proactor_entries(mut self, entries: u32) -> Self {
-        self.proactor.sq_entries = entries;
-        self
-    }
-
-    /// 覆盖 io_uring SQ entries。语义同 [`Self::with_proactor_entries`]，
-    /// 名字更明确；保留旧方法是为了兼容 bench 和早期调用点。
-    #[must_use]
-    pub const fn with_sq_entries(mut self, entries: u32) -> Self {
-        self.proactor.sq_entries = entries;
-        self
-    }
-
-    /// 覆盖 io_uring CQ entries。`None` 时使用 kernel 默认（通常为 SQ 的 2 倍）。
-    ///
-    /// multishot recv 会在一次 SQE 生命周期内产生大量 CQE。行情 burst 场景建议
-    /// 从 `max(2 * sq_entries, buf_ring_entries)` 起步做 A/B。
-    #[must_use]
-    pub const fn with_cq_entries(mut self, entries: u32) -> Self {
-        self.proactor.cq_entries = Some(entries);
-        self
-    }
-
-    /// 覆盖高级 io_uring setup flags。默认关闭；这些 flag 对 event loop 结构有
-    /// 约束，建议只在明确 benchmark 假设下开启。
-    #[must_use]
-    pub const fn with_proactor_setup_flags(mut self, flags: ProactorSetupFlags) -> Self {
-        self.proactor.setup_flags = flags;
         self
     }
 
