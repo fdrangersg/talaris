@@ -35,9 +35,8 @@ use crate::connection_state::ConnectionState;
 use crate::observability::LatencyHistograms;
 use crate::proactor::{Completion, Proactor, ProactorConfig, ProactorError};
 use crate::ws::{
-    ConnState as WsConnState, DataEvent as WsDataEvent, DataEventBatch as WsDataEventBatch,
-    Event as WsEvent, MarkedDataEvent as WsMarkedDataEvent,
-    MarkedDataEventBatch as WsMarkedDataEventBatch,
+    DataEvent as WsDataEvent, DataEventBatch as WsDataEventBatch, Event as WsEvent,
+    MarkedDataEvent as WsMarkedDataEvent, MarkedDataEventBatch as WsMarkedDataEventBatch,
 };
 
 /// CQE.token() 中 conn_id 的位掩码 —— 28 bit，最多 ~2.6 亿条 conn / Pool，
@@ -65,16 +64,14 @@ pub const DEFAULT_POOL_COMPLETION_BATCH_CAPACITY: usize = 16;
 /// Busy-spin data pumps 默认在首次 progress 后不继续额外 drain。
 pub const DEFAULT_POOL_POST_PROGRESS_SPIN_ITERS: usize = 0;
 
-/// Pool 的多连接调度层；真正 socket/io_uring/recv buffer 相关参数
-/// 主要在 ProactorConfig 和每条连接的 ConnectionConfig 里。
-/// PoolConfig
-///   -> Pool
-///     -> Proactor
-///     -> Vec<ConnectionState>
-///     -> completions_buf
+/// Pool 的多连接调度层。
+///
+/// `proactor` 只配置 io_uring ring 本身；recv mode、provided-buffer 大小、
+/// socket busy-poll、TLS/WS 等 per-connection 参数由
+/// [`ConnectionConfig`](crate::connection_meta::ConnectionConfig) 控制。
 #[derive(Debug, Clone, Copy)]
 pub struct PoolConfig {
-    /// 底层 io_uring 配置，真正控制 ring entries, recv mode, buffer size, 是否绑核等更底层参数
+    /// 底层 io_uring 配置：SQ/CQ sizing 和 setup flags。
     pub proactor: ProactorConfig,
 
     /// Pool 的连接表 conns: Vec<Option<ConnectionState>> 初始容量。
@@ -1038,6 +1035,10 @@ impl Pool {
         // 各 conn drain ws_events —— sink 出错的 event 也聚合而非 abort
         for slot in conns.iter_mut() {
             let Some(conn) = slot.as_mut() else { continue };
+            if matches!(conn.state(), State::Closed) {
+                conn.clear_ws_ingress_dirty();
+                continue;
+            }
             let handle = ConnHandle(conn.conn_id());
             while let Some(res) = conn.ws.poll_event() {
                 match res {
@@ -1081,6 +1082,10 @@ impl Pool {
 
             for slot in conns.iter_mut() {
                 let Some(conn) = slot.as_mut() else { continue };
+                if matches!(conn.state(), State::Closed) {
+                    conn.clear_ws_ingress_dirty();
+                    continue;
+                }
                 let handle = ConnHandle(conn.conn_id());
                 while let Some(res) = conn.ws.poll_event() {
                     progressed = true;
@@ -1656,21 +1661,16 @@ fn write_ingress_prometheus_help<W: fmt::Write>(out: &mut W) -> fmt::Result {
     writeln!(out, "# TYPE talaris_ingress_ws_binary_events_total counter")
 }
 
-/// pump 内 per-conn 错误处理：保留第一条错误，把对应 conn 推到 Closed 以便
-/// 下一轮 submit/rearm short-circuit；这条 conn 在 kernel 端可能仍有 in-flight
-/// op，不强制 cancel（Drop / 显式 close 时清理）。
+/// pump 内 per-conn 错误处理：保留第一条错误，把对应 conn 推到 Closed。
+/// 后续已到达的 CQE 仍会按 conn_id 路由，但 ConnectionState 只回收资源，
+/// 不再推进 WS parser 或调用用户 sink。
 fn fail_conn(
     conn: &mut ConnectionState,
     err: ConnectionError,
     first_err: &mut Option<ConnectionError>,
 ) {
     tracing::warn!(conn_id = conn.conn_id(), error = %err, "pool conn failed");
-    let ws_close_in_progress = matches!(conn.ws.state(), WsConnState::Closing);
-    conn.state = if ws_close_in_progress {
-        State::Closing
-    } else {
-        State::Closed
-    };
+    conn.state = State::Closed;
     if first_err.is_none() {
         *first_err = Some(err);
     }

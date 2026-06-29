@@ -694,8 +694,13 @@ mod tests {
         loop {
             match proactor.submit_nop(UserData::new(OpKind::Nop, pushed)) {
                 Ok(()) => pushed += 1,
-                Err(ProactorError::SqFull) => break,
-                Err(e) => panic!("unexpected submit_nop error: {e}"),
+                Err(e) => {
+                    assert!(
+                        matches!(e, ProactorError::SqFull),
+                        "unexpected submit_nop error: {e}"
+                    );
+                    break;
+                }
             }
             assert!(pushed < 1024, "test failed to fill the submission queue");
         }

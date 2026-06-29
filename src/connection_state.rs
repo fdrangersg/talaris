@@ -5,8 +5,8 @@
 //!
 //! 不对外暴露——`pub(crate)`。
 //!
-//! 字段语义、状态机、buffer 生命周期、inflight 限制完全沿用 `connection.rs`
-//! 模块文档，不再复述。
+//! 公开配置 / 状态 / 错误类型在 [`crate::connection_meta`]；这里只保留
+//! Pool 内部运行时状态和 io_uring/TLS/WS 推进逻辑。
 
 // `.expect("buf_ring …")` 等是 invariant 断言（on_connect_cqe 一定先注册），
 // 走到 panic 等于 driver state machine 已坏 —— 此时 HFT 进程应立即崩并由
@@ -423,6 +423,10 @@ impl ConnectionState {
             .user_data
             .kind()
             .ok_or_else(|| ConnectionError::UnknownOpKind(c.user_data.raw()))?;
+        if matches!(self.state, State::Closed) {
+            self.discard_completion_after_closed(kind, c);
+            return Ok(());
+        }
         match kind {
             OpKind::Connect => self.on_connect_cqe(proactor, c),
             OpKind::Send => self.on_send_cqe(c),
@@ -448,6 +452,10 @@ impl ConnectionState {
             .user_data
             .kind()
             .ok_or_else(|| ConnectionError::UnknownOpKind(c.user_data.raw()))?;
+        if matches!(self.state, State::Closed) {
+            self.discard_completion_after_closed(kind, c);
+            return Ok(0);
+        }
         match kind {
             OpKind::Connect => {
                 self.on_connect_cqe(proactor, c)?;
@@ -479,6 +487,10 @@ impl ConnectionState {
             .user_data
             .kind()
             .ok_or_else(|| ConnectionError::UnknownOpKind(c.user_data.raw()))?;
+        if matches!(self.state, State::Closed) {
+            self.discard_completion_after_closed(kind, c);
+            return Ok(0);
+        }
         match kind {
             OpKind::Connect => {
                 self.on_connect_cqe(proactor, c)?;
@@ -494,6 +506,53 @@ impl ConnectionState {
                 Ok(0)
             }
             OpKind::Nop => Ok(0),
+        }
+    }
+
+    fn discard_completion_after_closed(&mut self, kind: OpKind, c: Completion) {
+        match kind {
+            OpKind::Recv => self.discard_recv_completion_after_closed(c),
+            OpKind::Send => {
+                self.send_inflight = false;
+                self.send_buf.clear();
+                self.send_head = 0;
+            }
+            OpKind::Close => {
+                self.state = State::Closed;
+            }
+            OpKind::Connect | OpKind::Nop => {}
+        }
+    }
+
+    fn discard_recv_completion_after_closed(&mut self, c: Completion) {
+        if !c.has_more() {
+            self.multishot_armed = false;
+        }
+
+        let Some(bid) = c.buffer_id() else {
+            if let Err(e) = c.to_result()
+                && is_recv_buffer_ring_exhausted(&e)
+            {
+                self.record_recv_ring_exhaustion();
+            }
+            return;
+        };
+
+        let result = c.to_result();
+        if let Err(e) = &result
+            && is_recv_buffer_ring_exhausted(e)
+        {
+            self.record_recv_ring_exhaustion();
+            self.multishot_armed = false;
+        }
+
+        let Some(ring) = self.buf_ring.as_mut() else {
+            return;
+        };
+
+        match result {
+            Ok(n) => recycle_recv_buffers(ring, self.cfg.recv_mode, bid, n),
+            Err(_) => ring.recycle(bid),
         }
     }
 
@@ -1181,6 +1240,10 @@ impl ConnectionState {
             .user_data
             .kind()
             .ok_or_else(|| ConnectionError::UnknownOpKind(c.user_data.raw()))?;
+        if matches!(self.state, State::Closed) {
+            self.discard_completion_after_closed(kind, c);
+            return Ok(0);
+        }
         match kind {
             OpKind::Connect => {
                 self.on_connect_cqe(proactor, c)?;
@@ -1212,6 +1275,10 @@ impl ConnectionState {
             .user_data
             .kind()
             .ok_or_else(|| ConnectionError::UnknownOpKind(c.user_data.raw()))?;
+        if matches!(self.state, State::Closed) {
+            self.discard_completion_after_closed(kind, c);
+            return Ok(0);
+        }
         match kind {
             OpKind::Connect => {
                 self.on_connect_cqe(proactor, c)?;
@@ -1237,21 +1304,31 @@ impl ConnectionState {
     ) -> Result<(), ConnectionError> {
         c.to_result().map_err(ConnectionError::ConnectFailed)?;
 
-        let ring = BufferRing::new(
+        let mut ring = BufferRing::new(
             proactor,
             self.identity.bgid,
             self.cfg.buf_ring_entries,
             self.cfg.buf_ring_slot_size,
         )?;
         let bgid = ring.bgid();
-        self.buf_ring = Some(ring);
-        submit_recv_for_mode(
+        if let Err(e) = submit_recv_for_mode(
             proactor,
             self.socket.as_raw_fd(),
             bgid,
             UserData::new(OpKind::Recv, u64::from(self.identity.conn_id)),
             self.cfg.recv_mode,
-        )?;
+        ) {
+            if let Err(unregister_err) = ring.unregister(proactor) {
+                tracing::warn!(
+                    conn_id = self.identity.conn_id,
+                    bgid,
+                    error = %unregister_err,
+                    "failed to unregister buffer ring after recv arm failure"
+                );
+            }
+            return Err(e);
+        }
+        self.buf_ring = Some(ring);
         self.multishot_armed = true;
         self.record_recv_multishot_rearm();
 
@@ -2291,6 +2368,28 @@ fn submit_recv_for_mode(
     Ok(())
 }
 
+fn recycle_recv_buffers(
+    ring: &mut BufferRing,
+    recv_mode: RecvMode,
+    start_bid: u16,
+    total_len: usize,
+) {
+    let entries = ring.entries();
+    debug_assert!(entries.is_power_of_two());
+    let buf_size = ring.buf_size() as usize;
+    let slice_count = match recv_mode {
+        RecvMode::Multishot => 1,
+        RecvMode::MultishotBundle => total_len.div_ceil(buf_size).max(1),
+    }
+    .min(usize::from(entries));
+
+    let mask = entries - 1;
+    for index in 0..slice_count {
+        let bid = start_bid.wrapping_add(u16::try_from(index).unwrap_or(u16::MAX)) & mask;
+        ring.recycle(bid);
+    }
+}
+
 fn for_each_recv_slice<F>(
     ring: &mut BufferRing,
     recv_mode: RecvMode,
@@ -2364,6 +2463,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::vec_init_then_push)]
     fn sockaddr_pointer_survives_connection_state_move() {
         let assigned = AssignedConnectionConfig {
             user: ConnectionConfig::new("127.0.0.1", 443, "/").with_tls(false),
@@ -2372,11 +2472,43 @@ mod tests {
                 bgid: 11,
             },
         };
-        let addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
-        let conn = ConnectionState::new(assigned, addr).unwrap();
+        let addr: SocketAddr = "127.0.0.1:443".parse().expect("valid socket addr");
+        let conn = ConnectionState::new(assigned, addr).expect("connection state");
         let before = conn.addr.as_ptr();
 
-        let moved = vec![conn];
+        let mut moved = Vec::with_capacity(1);
+        moved.push(conn);
         assert_eq!(moved[0].addr.as_ptr(), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closed_state_discards_late_send_completion() {
+        let assigned = AssignedConnectionConfig {
+            user: ConnectionConfig::new("127.0.0.1", 443, "/").with_tls(false),
+            identity: ConnectionRuntimeIdentity {
+                conn_id: 7,
+                bgid: 11,
+            },
+        };
+        let addr: SocketAddr = "127.0.0.1:443".parse().expect("valid socket addr");
+        let mut conn = ConnectionState::new(assigned, addr).expect("connection state");
+        conn.state = State::Closed;
+        conn.send_inflight = true;
+        conn.send_buf.extend_from_slice(b"stale");
+
+        let mut proactor =
+            Proactor::new(crate::proactor::ProactorConfig::default()).expect("proactor init");
+        let completion = Completion {
+            user_data: UserData::new(OpKind::Send, u64::from(conn.conn_id())),
+            result: -libc::EPIPE,
+            flags: 0,
+        };
+
+        conn.handle_completion(&mut proactor, completion)
+            .expect("closed completion is discarded");
+        assert_eq!(conn.state(), State::Closed);
+        assert!(!conn.send_inflight);
+        assert!(conn.send_buf.is_empty());
     }
 }
