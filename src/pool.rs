@@ -1842,11 +1842,201 @@ mod post_progress_tests {
 mod tests {
     use super::*;
     use crate::connection_meta::{ConnectionConfig, State};
-    use crate::test_helpers::run_echo_server;
-    use crate::ws::DataEvent as WsDataEvent;
-    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+    use crate::observability::MarkedDataEvent;
+    use crate::test_helpers::{read_one_frame, run_echo_server};
+    use crate::ws::frame::{MAX_HEADER_LEN, encode_header};
+    use crate::ws::handshake::compute_accept;
+    use crate::ws::mask::mask_inplace;
+    use crate::ws::{DataEvent as WsDataEvent, OpCode};
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
+
+    fn spawn_server<F>(f: F) -> (SocketAddr, thread::JoinHandle<()>)
+    where
+        F: FnOnce(TcpListener) + Send + 'static,
+    {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        (addr, thread::spawn(move || f(listener)))
+    }
+
+    fn accept_ws_upgrade(listener: TcpListener) -> TcpStream {
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream.set_nodelay(true).unwrap();
+
+        let mut buf = [0_u8; 4096];
+        let mut req = Vec::new();
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            assert!(n > 0, "client closed before sending request");
+            req.extend_from_slice(&buf[..n]);
+            if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let req_str = std::str::from_utf8(&req).unwrap();
+        let key = req_str
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("sec-websocket-key:"))
+            .and_then(|line| line.split(':').nth(1))
+            .expect("Sec-WebSocket-Key header")
+            .trim();
+        let accept = compute_accept(key);
+        let resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        );
+        stream.write_all(resp.as_bytes()).unwrap();
+        stream
+    }
+
+    fn write_server_frame(
+        out: &mut Vec<u8>,
+        opcode: OpCode,
+        payload: &[u8],
+        mask: Option<[u8; 4]>,
+    ) {
+        let mut header = [0_u8; MAX_HEADER_LEN];
+        let hn = encode_header(&mut header, true, opcode, mask, payload.len() as u64);
+        out.extend_from_slice(&header[..hn]);
+        if let Some(mask_key) = mask {
+            let mut masked = payload.to_vec();
+            mask_inplace(&mut masked, mask_key);
+            out.extend_from_slice(&masked);
+        } else {
+            out.extend_from_slice(payload);
+        }
+    }
+
+    fn write_server_texts(stream: &mut TcpStream, messages: &[&[u8]]) {
+        let mut frames = Vec::new();
+        for message in messages {
+            write_server_frame(&mut frames, OpCode::Text, message, None);
+        }
+        stream.write_all(&frames).unwrap();
+    }
+
+    fn write_server_close(stream: &mut TcpStream) {
+        let mut frame = Vec::new();
+        write_server_frame(&mut frame, OpCode::Close, &1000_u16.to_be_bytes(), None);
+        stream.write_all(&frame).unwrap();
+    }
+
+    fn run_push_server(listener: TcpListener, messages: Vec<&'static [u8]>) {
+        let mut stream = accept_ws_upgrade(listener);
+        write_server_texts(&mut stream, &messages);
+        let (opcode, _) = read_one_frame(&mut stream);
+        assert_eq!(opcode, OpCode::Close);
+        write_server_close(&mut stream);
+    }
+
+    fn run_delayed_push_server(listener: TcpListener, messages: Vec<&'static [u8]>) {
+        let mut stream = accept_ws_upgrade(listener);
+        thread::sleep(Duration::from_millis(10));
+        write_server_texts(&mut stream, &messages);
+        let (opcode, _) = read_one_frame(&mut stream);
+        assert_eq!(opcode, OpCode::Close);
+        write_server_close(&mut stream);
+    }
+
+    fn run_idle_server(listener: TcpListener) {
+        let mut stream = accept_ws_upgrade(listener);
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut buf = [0_u8; 1024];
+        let _ = stream.read(&mut buf);
+    }
+
+    fn run_close_after_client_text_server(listener: TcpListener) {
+        let mut stream = accept_ws_upgrade(listener);
+        let (opcode, _) = read_one_frame(&mut stream);
+        assert_eq!(opcode, OpCode::Text);
+        write_server_close(&mut stream);
+    }
+
+    fn run_invalid_after_client_text_server(listener: TcpListener) {
+        let mut stream = accept_ws_upgrade(listener);
+        let (opcode, _) = read_one_frame(&mut stream);
+        assert_eq!(opcode, OpCode::Text);
+        let mut frame = Vec::new();
+        write_server_frame(
+            &mut frame,
+            OpCode::Text,
+            b"masked-from-server",
+            Some([1, 2, 3, 4]),
+        );
+        stream.write_all(&frame).unwrap();
+    }
+
+    fn plain_cfg(addr: SocketAddr, path: &str) -> ConnectionConfig {
+        ConnectionConfig::new("localhost", addr.port(), path).with_tls(false)
+    }
+
+    fn drive_until_open(pool: &mut Pool, handles: &[ConnHandle]) {
+        for _ in 0..500 {
+            pool.pump_nowait(|_, _| {}).unwrap();
+            if handles
+                .iter()
+                .all(|&handle| pool.state(handle) == Some(State::Open))
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("connections did not open");
+    }
+
+    fn drive_until_closed(pool: &mut Pool, handle: ConnHandle) {
+        for _ in 0..500 {
+            let _ = pool.pump_nowait(|_, _| {});
+            if pool.state(handle) == Some(State::Closed) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("connection did not close");
+    }
+
+    fn close_and_join(pool: &mut Pool, handle: ConnHandle, server: thread::JoinHandle<()>) {
+        pool.initiate_close(handle, 1000, "bye").unwrap();
+        drive_until_closed(pool, handle);
+        server.join().unwrap();
+    }
+
+    fn wait_for_text_event(pool: &mut Pool, handle: ConnHandle, expected: &str) {
+        let mut got: Option<String> = None;
+        for _ in 0..500 {
+            pool.pump_nowait(|event_handle, event| {
+                assert_eq!(event_handle, handle);
+                if let WsEvent::Text(text) = event {
+                    got = Some(text.to_owned());
+                }
+            })
+            .unwrap();
+            if got.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(got.as_deref(), Some(expected));
+    }
+
+    fn spin_until<F>(mut f: F)
+    where
+        F: FnMut() -> bool,
+    {
+        for _ in 0..500 {
+            if f() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("spin pump did not observe event");
+    }
 
     /// 单 conn 走 Pool 路径（从 connection.rs 搬过来——Migration Step 3 后
     /// `Connection` thin wrapper 删除，单 conn 流程同样走 `Pool::connect_blocking`）。
@@ -2019,5 +2209,258 @@ mod tests {
 
         server_a.join().unwrap();
         server_b.join().unwrap();
+    }
+
+    #[test]
+    fn connect_blocking_to_does_not_drain_existing_connection_data() {
+        let (addr_a, server_a) =
+            spawn_server(|listener| run_push_server(listener, vec![b"pending-a"]));
+        let mut pool = Pool::new(PoolConfig::default()).expect("pool");
+        let h_a = pool
+            .connect_blocking_to(plain_cfg(addr_a, "/a"), addr_a)
+            .expect("connect a");
+        assert_eq!(pool.state(h_a), Some(State::Open));
+
+        let (addr_b, server_b) = spawn_server(|listener| run_push_server(listener, Vec::new()));
+        let h_b = pool
+            .connect_blocking_to(plain_cfg(addr_b, "/b"), addr_b)
+            .expect("connect b");
+        assert_eq!(pool.state(h_b), Some(State::Open));
+        assert_eq!(pool.conn_count(), 2);
+
+        wait_for_text_event(&mut pool, h_a, "pending-a");
+
+        close_and_join(&mut pool, h_a, server_a);
+        close_and_join(&mut pool, h_b, server_b);
+    }
+
+    #[test]
+    fn submit_connect_to_can_drive_multiple_handshakes_concurrently() {
+        let (addr_a, server_a) = spawn_server(|listener| run_push_server(listener, Vec::new()));
+        let (addr_b, server_b) = spawn_server(|listener| run_push_server(listener, Vec::new()));
+
+        let mut pool = Pool::new(PoolConfig::default()).expect("pool");
+        let h_a = pool
+            .submit_connect_to(plain_cfg(addr_a, "/a"), addr_a)
+            .expect("submit a");
+        let h_b = pool
+            .submit_connect_to(plain_cfg(addr_b, "/b"), addr_b)
+            .expect("submit b");
+
+        drive_until_open(&mut pool, &[h_a, h_b]);
+        assert_eq!(pool.conn_count(), 2);
+        assert_eq!(pool.state(h_a), Some(State::Open));
+        assert_eq!(pool.state(h_b), Some(State::Open));
+
+        close_and_join(&mut pool, h_a, server_a);
+        close_and_join(&mut pool, h_b, server_b);
+    }
+
+    #[test]
+    fn active_count_tracks_remote_close_parse_error_connect_failure_and_remove() {
+        let (close_addr, close_server) = spawn_server(run_close_after_client_text_server);
+        let mut pool = Pool::new(PoolConfig::default()).expect("pool");
+        let close_handle = pool
+            .connect_blocking_to(plain_cfg(close_addr, "/close"), close_addr)
+            .expect("connect close server");
+        assert_eq!(pool.conn_count(), 1);
+        pool.send_text(close_handle, b"trigger").unwrap();
+        drive_until_closed(&mut pool, close_handle);
+        assert_eq!(pool.conn_count(), 0);
+        close_server.join().unwrap();
+
+        let (bad_addr, bad_server) = spawn_server(run_invalid_after_client_text_server);
+        let bad_handle = pool
+            .connect_blocking_to(plain_cfg(bad_addr, "/bad"), bad_addr)
+            .expect("connect bad server");
+        assert_eq!(pool.conn_count(), 1);
+        pool.send_text(bad_handle, b"trigger").unwrap();
+        let mut saw_error = false;
+        for _ in 0..500 {
+            if pool.pump_nowait(|_, _| {}).is_err() {
+                saw_error = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(saw_error, "masked server frame must fail the connection");
+        assert_eq!(pool.state(bad_handle), Some(State::Closed));
+        assert_eq!(pool.conn_count(), 0);
+        bad_server.join().unwrap();
+
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let refused_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let err = pool.connect_blocking_to(plain_cfg(refused_addr, "/refused"), refused_addr);
+        assert!(err.is_err(), "connecting to a closed listener should fail");
+        assert_eq!(pool.conn_count(), 0);
+
+        let (idle_addr, idle_server) = spawn_server(run_idle_server);
+        let idle_handle = pool
+            .connect_blocking_to(plain_cfg(idle_addr, "/idle"), idle_addr)
+            .expect("connect idle server");
+        assert_eq!(pool.conn_count(), 1);
+        pool.drop_slot(idle_handle.as_u32());
+        assert_eq!(pool.conn_count(), 0);
+        assert_eq!(pool.state(idle_handle), None);
+        idle_server.join().unwrap();
+    }
+
+    #[test]
+    fn pool_data_batch_and_marked_pumps_preserve_handle_routing() {
+        let (batch_addr, batch_server) = spawn_server(|listener| {
+            run_delayed_push_server(listener, vec![b"batch-a", b"batch-b"]);
+        });
+        let mut pool = Pool::new(PoolConfig::default()).expect("pool");
+        let batch_handle = pool
+            .connect_blocking_to(plain_cfg(batch_addr, "/batch"), batch_addr)
+            .expect("connect batch server");
+
+        let mut batch_texts = Vec::new();
+        for _ in 0..500 {
+            pool.pump_data_batches_nowait(|event_handle, batch| {
+                assert_eq!(event_handle, batch_handle);
+                assert!(!batch.is_empty());
+                for event in batch.iter() {
+                    if let WsDataEvent::Text(text) = event {
+                        batch_texts.push(text.to_owned());
+                    }
+                }
+            })
+            .unwrap();
+            if batch_texts.len() >= 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(batch_texts, ["batch-a", "batch-b"]);
+        close_and_join(&mut pool, batch_handle, batch_server);
+
+        let (marked_addr, marked_server) = spawn_server(|listener| {
+            run_delayed_push_server(listener, vec![b"marked"]);
+        });
+        let marked_cfg = plain_cfg(marked_addr, "/marked")
+            .with_observability_sample_rate_bps(10_000)
+            .with_observability_histograms(true);
+        let marked_handle = pool
+            .connect_blocking_to(marked_cfg, marked_addr)
+            .expect("connect marked server");
+        let mut marked_text: Option<String> = None;
+        let mut marked_sampled = false;
+        for _ in 0..500 {
+            pool.pump_data_marked_nowait(|event_handle, event| {
+                assert_eq!(event_handle, marked_handle);
+                if let MarkedDataEvent::Text { payload, meta } = event {
+                    marked_text = Some(payload.to_owned());
+                    marked_sampled = meta.sampled;
+                }
+            })
+            .unwrap();
+            if marked_text.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(marked_text.as_deref(), Some("marked"));
+        assert!(marked_sampled);
+        close_and_join(&mut pool, marked_handle, marked_server);
+    }
+
+    #[test]
+    fn pool_spin_data_pumps_preserve_handle_routing() {
+        let (data_addr, data_server) = spawn_server(|listener| {
+            run_delayed_push_server(listener, vec![b"spin-data"]);
+        });
+        let mut pool = Pool::new(PoolConfig::default()).expect("pool");
+        let data_handle = pool
+            .connect_blocking_to(plain_cfg(data_addr, "/spin-data"), data_addr)
+            .expect("connect spin data server");
+        let mut data_text: Option<String> = None;
+        spin_until(|| {
+            pool.pump_data_spin(1024, |event_handle, event| {
+                assert_eq!(event_handle, data_handle);
+                if let WsDataEvent::Text(text) = event {
+                    data_text = Some(text.to_owned());
+                }
+            })
+            .unwrap();
+            data_text.is_some()
+        });
+        assert_eq!(data_text.as_deref(), Some("spin-data"));
+        close_and_join(&mut pool, data_handle, data_server);
+
+        let (batch_addr, batch_server) = spawn_server(|listener| {
+            run_delayed_push_server(listener, vec![b"spin-batch"]);
+        });
+        let batch_handle = pool
+            .connect_blocking_to(plain_cfg(batch_addr, "/spin-batch"), batch_addr)
+            .expect("connect spin batch server");
+        let mut batch_text: Option<String> = None;
+        spin_until(|| {
+            pool.pump_data_spin_batches(1024, |event_handle, batch| {
+                assert_eq!(event_handle, batch_handle);
+                for event in batch.iter() {
+                    if let WsDataEvent::Text(text) = event {
+                        batch_text = Some(text.to_owned());
+                    }
+                }
+            })
+            .unwrap();
+            batch_text.is_some()
+        });
+        assert_eq!(batch_text.as_deref(), Some("spin-batch"));
+        close_and_join(&mut pool, batch_handle, batch_server);
+
+        let (marked_addr, marked_server) = spawn_server(|listener| {
+            run_delayed_push_server(listener, vec![b"spin-marked"]);
+        });
+        let marked_cfg =
+            plain_cfg(marked_addr, "/spin-marked").with_observability_sample_rate_bps(10_000);
+        let marked_handle = pool
+            .connect_blocking_to(marked_cfg, marked_addr)
+            .expect("connect spin marked server");
+        let mut marked_text: Option<String> = None;
+        let mut marked_sampled = false;
+        spin_until(|| {
+            pool.pump_data_spin_marked(1024, |event_handle, event| {
+                assert_eq!(event_handle, marked_handle);
+                if let MarkedDataEvent::Text { payload, meta } = event {
+                    marked_text = Some(payload.to_owned());
+                    marked_sampled = meta.sampled;
+                }
+            })
+            .unwrap();
+            marked_text.is_some()
+        });
+        assert_eq!(marked_text.as_deref(), Some("spin-marked"));
+        assert!(marked_sampled);
+        close_and_join(&mut pool, marked_handle, marked_server);
+
+        let (marked_batch_addr, marked_batch_server) = spawn_server(|listener| {
+            run_delayed_push_server(listener, vec![b"spin-marked-batch"]);
+        });
+        let marked_batch_cfg = plain_cfg(marked_batch_addr, "/spin-marked-batch")
+            .with_observability_sample_rate_bps(10_000);
+        let marked_batch_handle = pool
+            .connect_blocking_to(marked_batch_cfg, marked_batch_addr)
+            .expect("connect spin marked batch server");
+        let mut marked_batch_text: Option<String> = None;
+        let mut marked_batch_sampled = false;
+        spin_until(|| {
+            pool.pump_data_spin_marked_batches(1024, |event_handle, batch| {
+                assert_eq!(event_handle, marked_batch_handle);
+                for event in batch.iter() {
+                    if let MarkedDataEvent::Text { payload, meta } = event {
+                        marked_batch_text = Some(payload.to_owned());
+                        marked_batch_sampled = meta.sampled;
+                    }
+                }
+            })
+            .unwrap();
+            marked_batch_text.is_some()
+        });
+        assert_eq!(marked_batch_text.as_deref(), Some("spin-marked-batch"));
+        assert!(marked_batch_sampled);
+        close_and_join(&mut pool, marked_batch_handle, marked_batch_server);
     }
 }
