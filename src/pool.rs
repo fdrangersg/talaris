@@ -346,7 +346,7 @@ impl Pool {
         } = self;
 
         let mut first_err: Option<ConnectionError> = None;
-        submit_conn_ops(conns, proactor, &mut first_err);
+        submit_conn_ops(conns, proactor, active_count, &mut first_err);
         proactor.submit()?;
         proactor.wait_for_cqe(wait_nr)?;
 
@@ -355,17 +355,12 @@ impl Pool {
         for &c in completions_buf.iter() {
             let conn_id = completion_conn_id(c);
             if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
-                match conn.handle_completion(proactor, c) {
-                    Ok(()) => {
-                        conn.sync_ws_open_state();
-                        conn.sync_ws_close_state();
-                    }
-                    Err(e) => fail_conn(conn, e, &mut first_err),
-                }
+                let was_active = conn_is_active(conn);
+                let result = conn.handle_completion(proactor, c);
+                let _ = finish_conn_result(conn, result, &mut first_err, active_count, was_active);
             }
         }
 
-        sync_active_count(conns, active_count);
         first_err.map_or(Ok(()), Err)
     }
 
@@ -604,25 +599,22 @@ impl Pool {
 
         let mut first_err: Option<ConnectionError> = None;
 
-        for slot in conns.iter_mut() {
-            let Some(conn) = slot.as_mut() else { continue };
-            if let Err(e) = conn.try_submit_send(proactor) {
-                fail_conn(conn, e, &mut first_err);
-                continue;
-            }
-            if let Err(e) = conn.try_rearm_multishot(proactor) {
-                fail_conn(conn, e, &mut first_err);
-            }
-        }
+        submit_conn_ops(conns, proactor, active_count, &mut first_err);
 
         proactor.submit()?;
         proactor.wait_for_cqe(wait_nr)?;
 
         completions_buf.clear();
         proactor.drain_completions(|c| completions_buf.push(c));
-        dispatch_conn_completions_data(conns, proactor, completions_buf, &mut sink, &mut first_err);
+        dispatch_conn_completions_data(
+            conns,
+            proactor,
+            completions_buf,
+            active_count,
+            &mut sink,
+            &mut first_err,
+        );
 
-        sync_active_count(conns, active_count);
         first_err.map_or(Ok(()), Err)
     }
 
@@ -644,16 +636,7 @@ impl Pool {
 
         let mut first_err: Option<ConnectionError> = None;
 
-        for slot in conns.iter_mut() {
-            let Some(conn) = slot.as_mut() else { continue };
-            if let Err(e) = conn.try_submit_send(proactor) {
-                fail_conn(conn, e, &mut first_err);
-                continue;
-            }
-            if let Err(e) = conn.try_rearm_multishot(proactor) {
-                fail_conn(conn, e, &mut first_err);
-            }
-        }
+        submit_conn_ops(conns, proactor, active_count, &mut first_err);
 
         proactor.submit()?;
         proactor.wait_for_cqe(wait_nr)?;
@@ -665,17 +648,12 @@ impl Pool {
                 u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
             if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
                 let handle = ConnHandle(conn.conn_id());
-                match conn.handle_completion_data_marked(proactor, c, |ev| sink(handle, ev)) {
-                    Ok(_) => {
-                        conn.sync_ws_open_state();
-                        conn.sync_ws_close_state();
-                    }
-                    Err(e) => fail_conn(conn, e, &mut first_err),
-                }
+                let was_active = conn_is_active(conn);
+                let result = conn.handle_completion_data_marked(proactor, c, |ev| sink(handle, ev));
+                let _ = finish_conn_result(conn, result, &mut first_err, active_count, was_active);
             }
         }
 
-        sync_active_count(conns, active_count);
         first_err.map_or(Ok(()), Err)
     }
 
@@ -697,16 +675,7 @@ impl Pool {
 
         let mut first_err: Option<ConnectionError> = None;
 
-        for slot in conns.iter_mut() {
-            let Some(conn) = slot.as_mut() else { continue };
-            if let Err(e) = conn.try_submit_send(proactor) {
-                fail_conn(conn, e, &mut first_err);
-                continue;
-            }
-            if let Err(e) = conn.try_rearm_multishot(proactor) {
-                fail_conn(conn, e, &mut first_err);
-            }
-        }
+        submit_conn_ops(conns, proactor, active_count, &mut first_err);
 
         proactor.submit()?;
         proactor.wait_for_cqe(wait_nr)?;
@@ -717,11 +686,11 @@ impl Pool {
             conns,
             proactor,
             completions_buf,
+            active_count,
             &mut sink,
             &mut first_err,
         );
 
-        sync_active_count(conns, active_count);
         first_err.map_or(Ok(()), Err)
     }
 
@@ -743,16 +712,7 @@ impl Pool {
 
         let mut first_err: Option<ConnectionError> = None;
 
-        for slot in conns.iter_mut() {
-            let Some(conn) = slot.as_mut() else { continue };
-            if let Err(e) = conn.try_submit_send(proactor) {
-                fail_conn(conn, e, &mut first_err);
-                continue;
-            }
-            if let Err(e) = conn.try_rearm_multishot(proactor) {
-                fail_conn(conn, e, &mut first_err);
-            }
-        }
+        submit_conn_ops(conns, proactor, active_count, &mut first_err);
 
         proactor.submit()?;
         proactor.wait_for_cqe(wait_nr)?;
@@ -763,11 +723,11 @@ impl Pool {
             conns,
             proactor,
             completions_buf,
+            active_count,
             &mut sink,
             &mut first_err,
         );
 
-        sync_active_count(conns, active_count);
         first_err.map_or(Ok(()), Err)
     }
 
@@ -791,7 +751,7 @@ impl Pool {
         let mut first_err: Option<ConnectionError> = None;
         let mut progressed = false;
 
-        submit_conn_ops(conns, proactor, &mut first_err);
+        submit_conn_ops(conns, proactor, active_count, &mut first_err);
         proactor.submit()?;
 
         for iter in 0..=spin_iters {
@@ -799,6 +759,7 @@ impl Pool {
                 conns,
                 proactor,
                 completions_buf,
+                active_count,
                 &mut sink,
                 &mut first_err,
             );
@@ -809,6 +770,7 @@ impl Pool {
                         conns,
                         proactor,
                         completions_buf,
+                        active_count,
                         &mut sink,
                         first_err,
                     );
@@ -823,7 +785,6 @@ impl Pool {
             }
         }
 
-        sync_active_count(conns, active_count);
         match first_err {
             Some(e) => Err(e),
             None => Ok(progressed),
@@ -850,7 +811,7 @@ impl Pool {
         let mut first_err: Option<ConnectionError> = None;
         let mut progressed = false;
 
-        submit_conn_ops(conns, proactor, &mut first_err);
+        submit_conn_ops(conns, proactor, active_count, &mut first_err);
         proactor.submit()?;
 
         for iter in 0..=spin_iters {
@@ -858,6 +819,7 @@ impl Pool {
                 conns,
                 proactor,
                 completions_buf,
+                active_count,
                 &mut sink,
                 &mut first_err,
             );
@@ -868,6 +830,7 @@ impl Pool {
                         conns,
                         proactor,
                         completions_buf,
+                        active_count,
                         &mut sink,
                         first_err,
                     );
@@ -882,7 +845,6 @@ impl Pool {
             }
         }
 
-        sync_active_count(conns, active_count);
         match first_err {
             Some(e) => Err(e),
             None => Ok(progressed),
@@ -909,7 +871,7 @@ impl Pool {
         let mut first_err: Option<ConnectionError> = None;
         let mut progressed = false;
 
-        submit_conn_ops(conns, proactor, &mut first_err);
+        submit_conn_ops(conns, proactor, active_count, &mut first_err);
         proactor.submit()?;
 
         for iter in 0..=spin_iters {
@@ -917,6 +879,7 @@ impl Pool {
                 conns,
                 proactor,
                 completions_buf,
+                active_count,
                 &mut sink,
                 &mut first_err,
             );
@@ -927,6 +890,7 @@ impl Pool {
                         conns,
                         proactor,
                         completions_buf,
+                        active_count,
                         &mut sink,
                         first_err,
                     );
@@ -941,7 +905,6 @@ impl Pool {
             }
         }
 
-        sync_active_count(conns, active_count);
         match first_err {
             Some(e) => Err(e),
             None => Ok(progressed),
@@ -968,7 +931,7 @@ impl Pool {
         let mut first_err: Option<ConnectionError> = None;
         let mut progressed = false;
 
-        submit_conn_ops(conns, proactor, &mut first_err);
+        submit_conn_ops(conns, proactor, active_count, &mut first_err);
         proactor.submit()?;
 
         for iter in 0..=spin_iters {
@@ -976,6 +939,7 @@ impl Pool {
                 conns,
                 proactor,
                 completions_buf,
+                active_count,
                 &mut sink,
                 &mut first_err,
             );
@@ -986,6 +950,7 @@ impl Pool {
                         conns,
                         proactor,
                         completions_buf,
+                        active_count,
                         &mut sink,
                         first_err,
                     );
@@ -1000,7 +965,6 @@ impl Pool {
             }
         }
 
-        sync_active_count(conns, active_count);
         match first_err {
             Some(e) => Err(e),
             None => Ok(progressed),
@@ -1031,16 +995,7 @@ impl Pool {
         let mut first_err: Option<ConnectionError> = None;
 
         // submit phase：per-conn 失败只标这条 conn，不影响其它
-        for slot in conns.iter_mut() {
-            let Some(conn) = slot.as_mut() else { continue };
-            if let Err(e) = conn.try_submit_send(proactor) {
-                fail_conn(conn, e, &mut first_err);
-                continue;
-            }
-            if let Err(e) = conn.try_rearm_multishot(proactor) {
-                fail_conn(conn, e, &mut first_err);
-            }
-        }
+        submit_conn_ops(conns, proactor, active_count, &mut first_err);
 
         // submit pending send / rearm SQE, then wait only when requested.
         // wait_for_cqe(0) 是纯 noop，wait_nr ≥ 1 才阻塞。失败 fatal ——
@@ -1058,10 +1013,10 @@ impl Pool {
                 u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
             // Slot-table O(1) lookup（早期 iter().find 是 O(N)）。
             // stale CQE（已 close 的 conn 残留）落到 None 分支 → 忽略
-            if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut)
-                && let Err(e) = conn.handle_completion(proactor, c)
-            {
-                fail_conn(conn, e, &mut first_err);
+            if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
+                let was_active = conn_is_active(conn);
+                let result = conn.handle_completion(proactor, c);
+                let _ = finish_conn_result(conn, result, &mut first_err, active_count, was_active);
             }
         }
 
@@ -1077,7 +1032,14 @@ impl Pool {
                 match res {
                     Ok(ev) => sink(handle, ev),
                     Err(e) => {
-                        fail_conn(conn, ConnectionError::Ws(e), &mut first_err);
+                        let was_active = conn_is_active(conn);
+                        fail_conn_and_account(
+                            conn,
+                            ConnectionError::Ws(e),
+                            &mut first_err,
+                            active_count,
+                            was_active,
+                        );
                         break;
                     }
                 }
@@ -1087,7 +1049,6 @@ impl Pool {
             conn.clear_ws_ingress_dirty();
         }
 
-        sync_active_count(conns, active_count);
         first_err.map_or(Ok(()), Err)
     }
 
@@ -1106,11 +1067,17 @@ impl Pool {
         let mut first_err: Option<ConnectionError> = None;
         let mut progressed = false;
 
-        submit_conn_ops(conns, proactor, &mut first_err);
+        submit_conn_ops(conns, proactor, active_count, &mut first_err);
         proactor.submit()?;
 
         for iter in 0..=spin_iters {
-            let cqes = drain_conn_completions(conns, proactor, completions_buf, &mut first_err);
+            let cqes = drain_conn_completions(
+                conns,
+                proactor,
+                completions_buf,
+                active_count,
+                &mut first_err,
+            );
             progressed |= cqes > 0;
 
             for slot in conns.iter_mut() {
@@ -1125,7 +1092,14 @@ impl Pool {
                     match res {
                         Ok(ev) => sink(handle, ev),
                         Err(e) => {
-                            fail_conn(conn, ConnectionError::Ws(e), &mut first_err);
+                            let was_active = conn_is_active(conn);
+                            fail_conn_and_account(
+                                conn,
+                                ConnectionError::Ws(e),
+                                &mut first_err,
+                                active_count,
+                                was_active,
+                            );
                             break;
                         }
                     }
@@ -1143,7 +1117,6 @@ impl Pool {
             }
         }
 
-        sync_active_count(conns, active_count);
         match first_err {
             Some(e) => Err(e),
             None => Ok(progressed),
@@ -1234,16 +1207,18 @@ fn resolve_addr(cfg: &ConnectionConfig) -> Result<SocketAddr, ConnectionError> {
 fn submit_conn_ops(
     conns: &mut [Option<ConnectionState>],
     proactor: &mut Proactor,
+    active_count: &mut u32,
     first_err: &mut Option<ConnectionError>,
 ) {
     for slot in conns.iter_mut() {
         let Some(conn) = slot.as_mut() else { continue };
+        let was_active = conn_is_active(conn);
         if let Err(e) = conn.try_submit_send(proactor) {
-            fail_conn(conn, e, first_err);
+            fail_conn_and_account(conn, e, first_err, active_count, was_active);
             continue;
         }
         if let Err(e) = conn.try_rearm_multishot(proactor) {
-            fail_conn(conn, e, first_err);
+            fail_conn_and_account(conn, e, first_err, active_count, was_active);
         }
     }
 }
@@ -1257,6 +1232,7 @@ fn drain_conn_completions(
     conns: &mut [Option<ConnectionState>],
     proactor: &mut Proactor,
     completions_buf: &mut Vec<Completion>,
+    active_count: &mut u32,
     first_err: &mut Option<ConnectionError>,
 ) -> usize {
     completions_buf.clear();
@@ -1264,10 +1240,10 @@ fn drain_conn_completions(
     for &c in completions_buf.iter() {
         let conn_id =
             u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
-        if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut)
-            && let Err(e) = conn.handle_completion(proactor, c)
-        {
-            fail_conn(conn, e, first_err);
+        if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
+            let was_active = conn_is_active(conn);
+            let result = conn.handle_completion(proactor, c);
+            let _ = finish_conn_result(conn, result, first_err, active_count, was_active);
         }
     }
     count
@@ -1279,6 +1255,7 @@ fn drain_conn_completions_data<F>(
     conns: &mut [Option<ConnectionState>],
     proactor: &mut Proactor,
     completions_buf: &mut Vec<Completion>,
+    active_count: &mut u32,
     sink: &mut F,
     first_err: &mut Option<ConnectionError>,
 ) -> usize
@@ -1287,7 +1264,14 @@ where
 {
     completions_buf.clear();
     let count = proactor.drain_completions(|c| completions_buf.push(c));
-    dispatch_conn_completions_data(conns, proactor, completions_buf, sink, first_err);
+    dispatch_conn_completions_data(
+        conns,
+        proactor,
+        completions_buf,
+        active_count,
+        sink,
+        first_err,
+    );
     count
 }
 
@@ -1295,6 +1279,7 @@ fn dispatch_conn_completions_data<F>(
     conns: &mut [Option<ConnectionState>],
     proactor: &mut Proactor,
     completions_buf: &[Completion],
+    active_count: &mut u32,
     sink: &mut F,
     first_err: &mut Option<ConnectionError>,
 ) where
@@ -1323,27 +1308,20 @@ fn dispatch_conn_completions_data<F>(
             }
 
             if end > i + 1 {
-                match conn.handle_plain_recv_data_batch(&completions_buf[i..end], &mut |ev| {
-                    sink(handle, ev);
-                }) {
-                    Ok(_) => {
-                        conn.sync_ws_open_state();
-                        conn.sync_ws_close_state();
-                    }
-                    Err(e) => fail_conn(conn, e, first_err),
-                }
+                let was_active = conn_is_active(conn);
+                let result =
+                    conn.handle_plain_recv_data_batch(&completions_buf[i..end], &mut |ev| {
+                        sink(handle, ev);
+                    });
+                let _ = finish_conn_result(conn, result, first_err, active_count, was_active);
                 i = end;
                 continue;
             }
         }
 
-        match conn.handle_completion_data(proactor, c, |ev| sink(handle, ev)) {
-            Ok(_) => {
-                conn.sync_ws_open_state();
-                conn.sync_ws_close_state();
-            }
-            Err(e) => fail_conn(conn, e, first_err),
-        }
+        let was_active = conn_is_active(conn);
+        let result = conn.handle_completion_data(proactor, c, |ev| sink(handle, ev));
+        let _ = finish_conn_result(conn, result, first_err, active_count, was_active);
         i += 1;
     }
 }
@@ -1352,6 +1330,7 @@ fn drain_conn_completions_data_marked<F>(
     conns: &mut [Option<ConnectionState>],
     proactor: &mut Proactor,
     completions_buf: &mut Vec<Completion>,
+    active_count: &mut u32,
     sink: &mut F,
     first_err: &mut Option<ConnectionError>,
 ) -> usize
@@ -1360,7 +1339,14 @@ where
 {
     completions_buf.clear();
     let count = proactor.drain_completions(|c| completions_buf.push(c));
-    dispatch_conn_completions_data_marked(conns, proactor, completions_buf, sink, first_err);
+    dispatch_conn_completions_data_marked(
+        conns,
+        proactor,
+        completions_buf,
+        active_count,
+        sink,
+        first_err,
+    );
     count
 }
 
@@ -1368,6 +1354,7 @@ fn dispatch_conn_completions_data_marked<F>(
     conns: &mut [Option<ConnectionState>],
     proactor: &mut Proactor,
     completions_buf: &[Completion],
+    active_count: &mut u32,
     sink: &mut F,
     first_err: &mut Option<ConnectionError>,
 ) where
@@ -1396,30 +1383,20 @@ fn dispatch_conn_completions_data_marked<F>(
             }
 
             if end > i + 1 {
-                match conn.handle_plain_recv_data_batch_marked(
-                    &completions_buf[i..end],
-                    &mut |ev| {
+                let was_active = conn_is_active(conn);
+                let result =
+                    conn.handle_plain_recv_data_batch_marked(&completions_buf[i..end], &mut |ev| {
                         sink(handle, ev);
-                    },
-                ) {
-                    Ok(_) => {
-                        conn.sync_ws_open_state();
-                        conn.sync_ws_close_state();
-                    }
-                    Err(e) => fail_conn(conn, e, first_err),
-                }
+                    });
+                let _ = finish_conn_result(conn, result, first_err, active_count, was_active);
                 i = end;
                 continue;
             }
         }
 
-        match conn.handle_completion_data_marked(proactor, c, |ev| sink(handle, ev)) {
-            Ok(_) => {
-                conn.sync_ws_open_state();
-                conn.sync_ws_close_state();
-            }
-            Err(e) => fail_conn(conn, e, first_err),
-        }
+        let was_active = conn_is_active(conn);
+        let result = conn.handle_completion_data_marked(proactor, c, |ev| sink(handle, ev));
+        let _ = finish_conn_result(conn, result, first_err, active_count, was_active);
         i += 1;
     }
 }
@@ -1428,6 +1405,7 @@ fn drain_conn_completions_data_batches<F>(
     conns: &mut [Option<ConnectionState>],
     proactor: &mut Proactor,
     completions_buf: &mut Vec<Completion>,
+    active_count: &mut u32,
     sink: &mut F,
     first_err: &mut Option<ConnectionError>,
 ) -> usize
@@ -1436,7 +1414,14 @@ where
 {
     completions_buf.clear();
     let count = proactor.drain_completions(|c| completions_buf.push(c));
-    dispatch_conn_completions_data_batches(conns, proactor, completions_buf, sink, first_err);
+    dispatch_conn_completions_data_batches(
+        conns,
+        proactor,
+        completions_buf,
+        active_count,
+        sink,
+        first_err,
+    );
     count
 }
 
@@ -1444,6 +1429,7 @@ fn dispatch_conn_completions_data_batches<F>(
     conns: &mut [Option<ConnectionState>],
     proactor: &mut Proactor,
     completions_buf: &[Completion],
+    active_count: &mut u32,
     sink: &mut F,
     first_err: &mut Option<ConnectionError>,
 ) where
@@ -1471,29 +1457,19 @@ fn dispatch_conn_completions_data_batches<F>(
                 end += 1;
             }
 
-            match conn.handle_plain_recv_data_event_batches(
-                &completions_buf[i..end],
-                &mut |batch| {
+            let was_active = conn_is_active(conn);
+            let result =
+                conn.handle_plain_recv_data_event_batches(&completions_buf[i..end], &mut |batch| {
                     sink(handle, batch);
-                },
-            ) {
-                Ok(_) => {
-                    conn.sync_ws_open_state();
-                    conn.sync_ws_close_state();
-                }
-                Err(e) => fail_conn(conn, e, first_err),
-            }
+                });
+            let _ = finish_conn_result(conn, result, first_err, active_count, was_active);
             i = end;
             continue;
         }
 
-        match conn.handle_completion_data_batch(proactor, c, |batch| sink(handle, batch)) {
-            Ok(_) => {
-                conn.sync_ws_open_state();
-                conn.sync_ws_close_state();
-            }
-            Err(e) => fail_conn(conn, e, first_err),
-        }
+        let was_active = conn_is_active(conn);
+        let result = conn.handle_completion_data_batch(proactor, c, |batch| sink(handle, batch));
+        let _ = finish_conn_result(conn, result, first_err, active_count, was_active);
         i += 1;
     }
 }
@@ -1502,6 +1478,7 @@ fn drain_conn_completions_data_marked_batches<F>(
     conns: &mut [Option<ConnectionState>],
     proactor: &mut Proactor,
     completions_buf: &mut Vec<Completion>,
+    active_count: &mut u32,
     sink: &mut F,
     first_err: &mut Option<ConnectionError>,
 ) -> usize
@@ -1514,6 +1491,7 @@ where
         conns,
         proactor,
         completions_buf,
+        active_count,
         sink,
         first_err,
     );
@@ -1524,6 +1502,7 @@ fn dispatch_conn_completions_data_marked_batches<F>(
     conns: &mut [Option<ConnectionState>],
     proactor: &mut Proactor,
     completions_buf: &[Completion],
+    active_count: &mut u32,
     sink: &mut F,
     first_err: &mut Option<ConnectionError>,
 ) where
@@ -1551,29 +1530,22 @@ fn dispatch_conn_completions_data_marked_batches<F>(
                 end += 1;
             }
 
-            match conn.handle_plain_recv_data_event_batches_marked(
+            let was_active = conn_is_active(conn);
+            let result = conn.handle_plain_recv_data_event_batches_marked(
                 &completions_buf[i..end],
                 &mut |batch| {
                     sink(handle, batch);
                 },
-            ) {
-                Ok(_) => {
-                    conn.sync_ws_open_state();
-                    conn.sync_ws_close_state();
-                }
-                Err(e) => fail_conn(conn, e, first_err),
-            }
+            );
+            let _ = finish_conn_result(conn, result, first_err, active_count, was_active);
             i = end;
             continue;
         }
 
-        match conn.handle_completion_data_marked_batch(proactor, c, |batch| sink(handle, batch)) {
-            Ok(_) => {
-                conn.sync_ws_open_state();
-                conn.sync_ws_close_state();
-            }
-            Err(e) => fail_conn(conn, e, first_err),
-        }
+        let was_active = conn_is_active(conn);
+        let result =
+            conn.handle_completion_data_marked_batch(proactor, c, |batch| sink(handle, batch));
+        let _ = finish_conn_result(conn, result, first_err, active_count, was_active);
         i += 1;
     }
 }
@@ -1701,23 +1673,62 @@ fn fail_conn(
     conn: &mut ConnectionState,
     err: ConnectionError,
     first_err: &mut Option<ConnectionError>,
-) {
+) -> bool {
+    let was_active = conn_is_active(conn);
     tracing::warn!(conn_id = conn.conn_id(), error = %err, "pool conn failed");
     conn.state = State::Closed;
     if first_err.is_none() {
         *first_err = Some(err);
     }
+    was_active
 }
 
-fn sync_active_count(conns: &[Option<ConnectionState>], active_count: &mut u32) {
-    let count = conns
-        .iter()
-        .filter(|slot| {
-            slot.as_ref()
-                .is_some_and(|conn| !matches!(conn.state(), State::Closed))
-        })
-        .count();
-    *active_count = u32::try_from(count).unwrap_or(u32::MAX);
+#[inline]
+fn conn_is_active(conn: &ConnectionState) -> bool {
+    !matches!(conn.state(), State::Closed)
+}
+
+#[inline]
+fn account_closed_transition(active_count: &mut u32, was_active: bool, conn: &ConnectionState) {
+    if was_active && !conn_is_active(conn) {
+        *active_count = active_count.saturating_sub(1);
+    }
+}
+
+#[inline]
+fn finish_conn_result<T>(
+    conn: &mut ConnectionState,
+    result: Result<T, ConnectionError>,
+    first_err: &mut Option<ConnectionError>,
+    active_count: &mut u32,
+    was_active: bool,
+) -> Option<T> {
+    match result {
+        Ok(value) => {
+            conn.sync_ws_open_state();
+            conn.sync_ws_close_state();
+            account_closed_transition(active_count, was_active, conn);
+            Some(value)
+        }
+        Err(e) => {
+            fail_conn_and_account(conn, e, first_err, active_count, was_active);
+            None
+        }
+    }
+}
+
+#[inline]
+fn fail_conn_and_account(
+    conn: &mut ConnectionState,
+    err: ConnectionError,
+    first_err: &mut Option<ConnectionError>,
+    active_count: &mut u32,
+    was_active: bool,
+) {
+    let failed_active = fail_conn(conn, err, first_err);
+    if was_active || failed_active {
+        *active_count = active_count.saturating_sub(1);
+    }
 }
 
 impl Drop for Pool {
