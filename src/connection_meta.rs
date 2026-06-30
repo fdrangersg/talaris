@@ -173,11 +173,44 @@ pub struct IngressStats {
     pub ws_binary_events: u64,
 }
 
+/// CQE token bits reserved for the Pool slot id.
+pub(crate) const CONN_ID_MASK: u64 = 0x0FFF_FFFF;
+/// CQE token bits reserved for the Pool slot generation.
+pub(crate) const CONN_GENERATION_MASK: u64 = 0x0FFF_FFFF;
+pub(crate) const CONN_GENERATION_SHIFT: u32 = 28;
+
+#[inline]
+#[must_use]
+pub(crate) const fn encode_conn_token(conn_id: u32, generation: u32) -> u64 {
+    ((generation as u64) << CONN_GENERATION_SHIFT) | (conn_id as u64)
+}
+
+#[inline]
+#[must_use]
+pub(crate) const fn token_conn_id(token: u64) -> u32 {
+    (token & CONN_ID_MASK) as u32
+}
+
+#[inline]
+#[must_use]
+pub(crate) const fn token_generation(token: u64) -> u32 {
+    ((token >> CONN_GENERATION_SHIFT) & CONN_GENERATION_MASK) as u32
+}
+
 /// Runtime identity assigned by [`Pool`](crate::Pool) when a connection slot is reserved.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct ConnectionRuntimeIdentity {
     pub conn_id: u32,
+    pub generation: u32,
     pub bgid: u16,
+}
+
+impl ConnectionRuntimeIdentity {
+    #[inline]
+    #[must_use]
+    pub(crate) const fn token(self) -> u64 {
+        encode_conn_token(self.conn_id, self.generation)
+    }
 }
 
 /// Internal config passed from [`Pool`](crate::Pool) to `ConnectionState` after runtime assignment.

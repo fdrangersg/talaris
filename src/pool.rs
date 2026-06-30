@@ -28,8 +28,9 @@ use std::marker::PhantomData;
 use std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::connection_meta::{
-    AssignedConnectionConfig, ConnectionConfig, ConnectionError, ConnectionRuntimeIdentity,
-    IngressStats, State,
+    AssignedConnectionConfig, CONN_GENERATION_MASK, CONN_ID_MASK, ConnectionConfig,
+    ConnectionError, ConnectionRuntimeIdentity, IngressStats, State, encode_conn_token,
+    token_conn_id, token_generation,
 };
 use crate::connection_state::ConnectionState;
 use crate::observability::LatencyHistograms;
@@ -39,11 +40,13 @@ use crate::ws::{
     MarkedDataEvent as WsMarkedDataEvent, MarkedDataEventBatch as WsMarkedDataEventBatch,
 };
 
-/// CQE.token() 中 conn_id 的位掩码 —— 28 bit，最多 ~2.6 亿条 conn / Pool，
-/// 远超任何实际场景。bits 55..28 预留给 op-seq dedup（v1 不使用）。
-/// | bits 63..56 |  bits 55..28    | bits 27..0 |
-/// |    OpKind   | reserved op-seq |  conn_id   |
-const CONN_ID_MASK: u64 = 0x0FFF_FFFF;
+/// CQE.token() layout used by Pool:
+/// | bits 63..56 |  bits 55..28  | bits 27..0 |
+/// |    OpKind   |  generation   |  slot_id   |
+///
+/// `generation` is bumped whenever a slot is removed. A late CQE from an old
+/// connection can therefore never be routed into a new connection that reused
+/// the same slot id.
 
 /// Pool slot table 默认初始容量。0 表示按 `Vec` 默认策略延迟分配。
 /// 大多数场景连接数很少，提前分配意义不大。不影响 recv/parse/pump
@@ -134,13 +137,37 @@ impl Default for PoolConfig {
 /// - conns slot index
 /// - CQE token 低 28 位编码的连接编号
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub struct ConnHandle(u32);
+pub struct ConnHandle(u64);
 
 impl ConnHandle {
     #[inline]
     #[must_use]
     pub const fn as_u32(self) -> u32 {
+        token_conn_id(self.0)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
         self.0
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        token_generation(self.0)
+    }
+
+    #[inline]
+    #[must_use]
+    const fn from_parts(conn_id: u32, generation: u32) -> Self {
+        Self(encode_conn_token(conn_id, generation))
+    }
+
+    #[inline]
+    #[must_use]
+    const fn from_conn(conn: &ConnectionState) -> Self {
+        Self(conn.token())
     }
 }
 
@@ -159,13 +186,20 @@ pub struct Pool {
     proactor: Proactor,
     /// slot table：conn_id 直接索引。None 是关闭/失败留下的 tombstone（暂不复用）。
     conns: Vec<Option<ConnectionState>>,
+    /// Per-slot generation. Incremented when a slot is removed, so stale
+    /// handles/CQEs cannot alias a future connection that reuses the slot.
+    generations: Vec<u32>,
+    /// Vacant slot ids available for reconnect/remove churn.
+    free_conn_ids: Vec<u32>,
+    /// Buffer group ids safe to reuse. We only recycle a bgid after its old
+    /// BufferRing was successfully unregistered, or when no ring was ever
+    /// registered for that connection.
+    free_bgids: Vec<u16>,
     /// 活 conn 数。每次 push Some / 写 None 时同步维护，避免 hot path filter scan。
     active_count: u32,
-    /// 下一条连接要分配的连接 ID。单调递增。
+    /// 下一条 fresh slot id。slot id 仍受 28-bit token 空间限制。
     next_conn_id: u32,
-    /// 下一条连接的 buffer group id。
-    /// 在 io_uring provided-buffer 模式下，每条连接有自己的 buffer group，
-    /// 避免不同连接的 buffer 混用。
+    /// 下一条 fresh buffer group id。复用优先走 free_bgids。
     next_bgid: u16,
     /// pump_impl 内 drain CQE 暂存区。持久字段避免每轮 alloc（dhat 审计发现
     /// 这是 hot loop 第一大 alloc：每轮 pump 重新分配一个 `Vec<Completion>`）。
@@ -187,6 +221,8 @@ impl std::fmt::Debug for Pool {
             .field("slot_capacity", &self.conns.capacity())
             .field("next_conn_id", &self.next_conn_id)
             .field("next_bgid", &self.next_bgid)
+            .field("free_conn_ids", &self.free_conn_ids.len())
+            .field("free_bgids", &self.free_bgids.len())
             .finish()
     }
 }
@@ -197,6 +233,9 @@ impl Pool {
         Ok(Self {
             proactor,
             conns: Vec::with_capacity(cfg.initial_conn_capacity),
+            generations: Vec::with_capacity(cfg.initial_conn_capacity),
+            free_conn_ids: Vec::new(),
+            free_bgids: Vec::new(),
             active_count: 0,
             next_conn_id: 0,
             next_bgid: 0,
@@ -228,11 +267,11 @@ impl Pool {
         addr: SocketAddr,
     ) -> Result<ConnHandle, ConnectionError> {
         let handle = self.submit_connect_to(cfg, addr)?;
-        let conn_id = handle.0;
+        let conn_id = handle.as_u32();
         match self.drive_conn_until_open(conn_id) {
             Ok(()) => Ok(handle),
             Err(e) => {
-                self.drop_slot(conn_id);
+                let _ = self.retire_slot(conn_id, Some(handle.generation()));
                 Err(e)
             }
         }
@@ -273,51 +312,226 @@ impl Pool {
         cfg: ConnectionConfig,
         addr: SocketAddr,
     ) -> Result<ConnHandle, ConnectionError> {
-        // 预先 reserve 一个 conn_id / bgid，超额时直接 Err（早期 .expect() 会
-        // 在长跑 reconnect 后 panic 整个 HFT 进程）。conn_id 上限是 28-bit
-        // mask 而非 u32::MAX。
+        let identity = self.reserve_runtime_identity()?;
+        let assigned = AssignedConnectionConfig {
+            user: cfg,
+            identity,
+        };
+
+        let mut conn = match ConnectionState::new(assigned, addr) {
+            Ok(conn) => conn,
+            Err(e) => {
+                self.release_reserved_identity(identity);
+                return Err(e);
+            }
+        };
+        if let Err(e) = conn.submit_connect(&mut self.proactor) {
+            self.release_reserved_identity(identity);
+            return Err(e);
+        }
+
+        let conn_id = identity.conn_id;
+        let slot = self
+            .conns
+            .get_mut(conn_id as usize)
+            .expect("reserved slot must exist");
+        debug_assert!(slot.is_none());
+        *slot = Some(conn);
+        self.active_count += 1;
+        Ok(ConnHandle::from_parts(
+            identity.conn_id,
+            identity.generation,
+        ))
+    }
+
+    /// 强制移除一条连接并释放其 Pool slot / bgid 供后续重连复用。
+    ///
+    /// 这是运行时诊断/故障恢复 API，不执行 WebSocket close handshake；如果需要
+    /// 协议级优雅关闭，先调用 [`Self::initiate_close`] 并继续 pump close handshake。
+    /// stale handle 或已被移除的 slot 返回 [`ConnectionError::InvalidState`].
+    pub fn remove_conn(&mut self, h: ConnHandle) -> Result<(), ConnectionError> {
+        if self.retire_slot(h.as_u32(), Some(h.generation())) {
+            Ok(())
+        } else {
+            Err(ConnectionError::InvalidState(State::Closed))
+        }
+    }
+
+    /// Blocking reconnect convenience API. Resolves DNS, removes `old`, submits
+    /// a fresh connection, then drives it to `Open`.
+    pub fn reconnect(
+        &mut self,
+        old: ConnHandle,
+        cfg: ConnectionConfig,
+    ) -> Result<ConnHandle, ConnectionError> {
+        let addr = resolve_addr(&cfg)?;
+        self.reconnect_to(old, cfg, addr)
+    }
+
+    /// Blocking reconnect convenience API with caller-provided address.
+    ///
+    /// Production hot loops should prefer [`Self::submit_reconnect_to`] so the
+    /// main pump loop keeps processing other connections while the new TCP/TLS/WS
+    /// handshake progresses.
+    pub fn reconnect_to(
+        &mut self,
+        old: ConnHandle,
+        cfg: ConnectionConfig,
+        addr: SocketAddr,
+    ) -> Result<ConnHandle, ConnectionError> {
+        let handle = self.submit_reconnect_to(old, cfg, addr)?;
+        let conn_id = handle.as_u32();
+        match self.drive_conn_until_open(conn_id) {
+            Ok(()) => Ok(handle),
+            Err(e) => {
+                let _ = self.retire_slot(conn_id, Some(handle.generation()));
+                Err(e)
+            }
+        }
+    }
+
+    /// Non-blocking reconnect. Resolves DNS, removes `old`, submits the new
+    /// connection, then returns immediately.
+    pub fn submit_reconnect(
+        &mut self,
+        old: ConnHandle,
+        cfg: ConnectionConfig,
+    ) -> Result<ConnHandle, ConnectionError> {
+        let addr = resolve_addr(&cfg)?;
+        self.submit_reconnect_to(old, cfg, addr)
+    }
+
+    /// Non-blocking reconnect with caller-provided address.
+    ///
+    /// The old connection is removed first; if creating/submitting the new
+    /// connection fails, the old connection remains gone and the slot/bgid are
+    /// returned to the freelists. This API is for diagnostic reconnect, not
+    /// keep-old-until-new-open cutover.
+    pub fn submit_reconnect_to(
+        &mut self,
+        old: ConnHandle,
+        cfg: ConnectionConfig,
+        addr: SocketAddr,
+    ) -> Result<ConnHandle, ConnectionError> {
+        self.remove_conn(old)?;
+        self.submit_connect_to(cfg, addr)
+    }
+
+    fn reserve_runtime_identity(&mut self) -> Result<ConnectionRuntimeIdentity, ConnectionError> {
+        let bgid = self.reserve_bgid()?;
+        let conn_id = match self.reserve_conn_id() {
+            Ok(conn_id) => conn_id,
+            Err(e) => {
+                self.release_bgid(bgid);
+                return Err(e);
+            }
+        };
+        let generation = self
+            .generations
+            .get(conn_id as usize)
+            .copied()
+            .expect("reserved generation must exist");
+        Ok(ConnectionRuntimeIdentity {
+            conn_id,
+            generation,
+            bgid,
+        })
+    }
+
+    fn reserve_conn_id(&mut self) -> Result<u32, ConnectionError> {
+        if let Some(conn_id) = self.free_conn_ids.pop() {
+            return Ok(conn_id);
+        }
         let conn_id = self.next_conn_id;
         if conn_id > CONN_ID_MASK as u32 {
             return Err(ConnectionError::IdSpaceExhausted("conn_id"));
         }
+        self.next_conn_id = conn_id + 1;
+        self.conns.push(None);
+        self.generations.push(0);
+        Ok(conn_id)
+    }
 
+    fn reserve_bgid(&mut self) -> Result<u16, ConnectionError> {
+        if let Some(bgid) = self.free_bgids.pop() {
+            return Ok(bgid);
+        }
         let bgid = self.next_bgid;
         let Some(next_bgid) = self.next_bgid.checked_add(1) else {
             return Err(ConnectionError::IdSpaceExhausted("bgid"));
         };
-
-        let assigned = AssignedConnectionConfig {
-            user: cfg,
-            identity: ConnectionRuntimeIdentity { conn_id, bgid },
-        };
-
-        let mut conn = ConnectionState::new(assigned, addr)?;
-        // 没 push 之前失败：socket / addr 由 conn drop 清理；id 不回退（单调）。
-        conn.submit_connect(&mut self.proactor)?;
-        // conn_id == conns.len() 不变式：slot table 直接 push 到末尾保证
-        // conns[conn_id] = Some(conn)，O(1) 查找。
-        debug_assert_eq!(self.conns.len(), conn_id as usize);
-        self.conns.push(Some(conn));
-        self.active_count += 1;
-        // 计数器单调推进。bgid 溢出必须在提交 SQE 前检查，避免留下
-        // "已提交 connect 但 Pool 不再持有 conn" 的半完成状态。
-        self.next_conn_id = conn_id + 1;
         self.next_bgid = next_bgid;
-        Ok(ConnHandle(conn_id))
+        Ok(bgid)
     }
 
-    /// 把 slot 置 None 并 unregister 其 buf_ring。`active_count` 同步 -1。
-    /// 重复 drop 同一 slot 是 no-op（idempotent）。
-    fn drop_slot(&mut self, conn_id: u32) {
+    fn release_reserved_identity(&mut self, identity: ConnectionRuntimeIdentity) {
+        debug_assert!(
+            self.conns
+                .get(identity.conn_id as usize)
+                .is_some_and(Option::is_none)
+        );
+        self.free_conn_ids.push(identity.conn_id);
+        self.release_bgid(identity.bgid);
+    }
+
+    fn release_bgid(&mut self, bgid: u16) {
+        self.free_bgids.push(bgid);
+    }
+
+    /// Retire a slot and make it reusable. Returns false when the slot is absent,
+    /// vacant, or the expected generation does not match.
+    fn retire_slot(&mut self, conn_id: u32, expected_generation: Option<u32>) -> bool {
         let Some(slot) = self.conns.get_mut(conn_id as usize) else {
-            return;
+            return false;
         };
-        if let Some(mut dead) = slot.take() {
-            if let Some(mut ring) = dead.buf_ring.take() {
-                let _ = ring.unregister(&mut self.proactor);
+        let Some(conn) = slot.as_ref() else {
+            return false;
+        };
+        if expected_generation.is_some_and(|expected| expected != conn.generation()) {
+            return false;
+        }
+
+        let mut dead = slot.take().expect("slot was Some above");
+        let was_active = conn_is_active(&dead);
+        let bgid = dead.bgid();
+        let mut recycle_bgid = dead.buf_ring.is_none();
+        if let Some(mut ring) = dead.buf_ring.take() {
+            match ring.unregister(&mut self.proactor) {
+                Ok(()) => recycle_bgid = true,
+                Err(e) => tracing::warn!(
+                    conn_id,
+                    bgid,
+                    error = %e,
+                    "failed to unregister buffer ring while removing connection; bgid will not be reused"
+                ),
             }
+        }
+        drop(dead);
+
+        if was_active {
             self.active_count = self.active_count.saturating_sub(1);
         }
+        self.recycle_conn_slot(conn_id);
+        if recycle_bgid {
+            self.release_bgid(bgid);
+        }
+        true
+    }
+
+    fn recycle_conn_slot(&mut self, conn_id: u32) {
+        let Some(generation) = self.generations.get_mut(conn_id as usize) else {
+            return;
+        };
+        if u64::from(*generation) >= CONN_GENERATION_MASK {
+            tracing::warn!(
+                conn_id,
+                generation = *generation,
+                "connection slot generation exhausted; slot will not be reused"
+            );
+            return;
+        }
+        *generation += 1;
+        self.free_conn_ids.push(conn_id);
     }
 
     /// pump 单 conn 直到它进 Open（或失败）。其它 conn 的 CQE 也会顺道被路由
@@ -397,8 +611,7 @@ impl Pool {
         completions_buf.clear();
         proactor.drain_completions(|c| completions_buf.push(c));
         for &c in completions_buf.iter() {
-            let conn_id = completion_conn_id(c);
-            if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
+            if let Some(conn) = conn_for_completion(conns, c) {
                 let was_active = conn_is_active(conn);
                 let result = conn.handle_completion(proactor, c);
                 let _ = finish_conn_result(conn, result, &mut first_err, active_count, was_active);
@@ -1051,11 +1264,9 @@ impl Pool {
         completions_buf.clear();
         proactor.drain_completions(|c| completions_buf.push(c));
         for &c in completions_buf.iter() {
-            let conn_id =
-                u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
-            // Slot-table O(1) lookup（早期 iter().find 是 O(N)）。
-            // stale CQE（已 close 的 conn 残留）落到 None 分支 → 忽略
-            if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
+            // Slot-table O(1) lookup with generation guard. Stale CQEs from a
+            // removed/reused slot are ignored before they can touch new state.
+            if let Some(conn) = conn_for_completion(conns, c) {
                 let was_active = conn_is_active(conn);
                 let result = conn.handle_completion(proactor, c);
                 let _ = finish_conn_result(conn, result, &mut first_err, active_count, was_active);
@@ -1069,7 +1280,7 @@ impl Pool {
                 conn.clear_ws_ingress_dirty();
                 continue;
             }
-            let handle = ConnHandle(conn.conn_id());
+            let handle = ConnHandle::from_conn(conn);
             while let Some(res) = conn.ws.poll_event() {
                 match res {
                     Ok(ev) => sink(handle, ev),
@@ -1128,7 +1339,7 @@ impl Pool {
                     conn.clear_ws_ingress_dirty();
                     continue;
                 }
-                let handle = ConnHandle(conn.conn_id());
+                let handle = ConnHandle::from_conn(conn);
                 while let Some(res) = conn.ws.poll_event() {
                     progressed = true;
                     match res {
@@ -1167,8 +1378,9 @@ impl Pool {
 
     pub fn state(&self, h: ConnHandle) -> Option<State> {
         self.conns
-            .get(h.0 as usize)
+            .get(h.as_u32() as usize)
             .and_then(Option::as_ref)
+            .filter(|conn| conn.token() == h.as_u64())
             .map(ConnectionState::state)
     }
 
@@ -1182,8 +1394,9 @@ impl Pool {
     #[must_use]
     pub fn ingress_stats(&self, h: ConnHandle) -> Option<IngressStats> {
         self.conns
-            .get(h.0 as usize)
+            .get(h.as_u32() as usize)
             .and_then(Option::as_ref)
+            .filter(|conn| conn.token() == h.as_u64())
             .map(ConnectionState::ingress_stats)
     }
 
@@ -1232,10 +1445,16 @@ impl Pool {
     }
 
     fn conn_mut(&mut self, h: ConnHandle) -> Result<&mut ConnectionState, ConnectionError> {
-        self.conns
-            .get_mut(h.0 as usize)
+        let conn = self
+            .conns
+            .get_mut(h.as_u32() as usize)
             .and_then(Option::as_mut)
-            .ok_or(ConnectionError::InvalidState(State::Closed))
+            .ok_or(ConnectionError::InvalidState(State::Closed))?;
+        if conn.token() == h.as_u64() {
+            Ok(conn)
+        } else {
+            Err(ConnectionError::InvalidState(State::Closed))
+        }
     }
 }
 
@@ -1266,8 +1485,19 @@ fn submit_conn_ops(
 }
 
 #[inline]
-fn completion_conn_id(c: Completion) -> u32 {
-    u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32")
+fn completion_token(c: Completion) -> u64 {
+    c.user_data.token()
+}
+
+#[inline]
+fn conn_for_completion(
+    conns: &mut [Option<ConnectionState>],
+    c: Completion,
+) -> Option<&mut ConnectionState> {
+    let token = completion_token(c);
+    let conn_id = token_conn_id(token);
+    let conn = conns.get_mut(conn_id as usize).and_then(Option::as_mut)?;
+    (conn.token() == token).then_some(conn)
 }
 
 fn drain_conn_completions(
@@ -1280,9 +1510,7 @@ fn drain_conn_completions(
     completions_buf.clear();
     let count = proactor.drain_completions(|c| completions_buf.push(c));
     for &c in completions_buf.iter() {
-        let conn_id =
-            u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
-        if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
+        if let Some(conn) = conn_for_completion(conns, c) {
             let was_active = conn_is_active(conn);
             let result = conn.handle_completion(proactor, c);
             let _ = finish_conn_result(conn, result, first_err, active_count, was_active);
@@ -1330,20 +1558,18 @@ fn dispatch_conn_completions_data<F>(
     let mut i = 0_usize;
     while i < completions_buf.len() {
         let c = completions_buf[i];
-        let conn_id = completion_conn_id(c);
-        let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) else {
+        let token = completion_token(c);
+        let Some(conn) = conn_for_completion(conns, c) else {
             i += 1;
             continue;
         };
 
-        let handle = ConnHandle(conn.conn_id());
+        let handle = ConnHandle::from_conn(conn);
         if conn.can_handle_plain_recv_data_batch(c) {
             let mut end = i + 1;
             while end < completions_buf.len() {
                 let next = completions_buf[end];
-                if completion_conn_id(next) != conn_id
-                    || !conn.can_handle_plain_recv_data_batch(next)
-                {
+                if completion_token(next) != token || !conn.can_handle_plain_recv_data_batch(next) {
                     break;
                 }
                 end += 1;
@@ -1405,20 +1631,18 @@ fn dispatch_conn_completions_data_marked<F>(
     let mut i = 0_usize;
     while i < completions_buf.len() {
         let c = completions_buf[i];
-        let conn_id = completion_conn_id(c);
-        let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) else {
+        let token = completion_token(c);
+        let Some(conn) = conn_for_completion(conns, c) else {
             i += 1;
             continue;
         };
 
-        let handle = ConnHandle(conn.conn_id());
+        let handle = ConnHandle::from_conn(conn);
         if conn.can_handle_plain_recv_data_batch(c) {
             let mut end = i + 1;
             while end < completions_buf.len() {
                 let next = completions_buf[end];
-                if completion_conn_id(next) != conn_id
-                    || !conn.can_handle_plain_recv_data_batch(next)
-                {
+                if completion_token(next) != token || !conn.can_handle_plain_recv_data_batch(next) {
                     break;
                 }
                 end += 1;
@@ -1480,20 +1704,18 @@ fn dispatch_conn_completions_data_batches<F>(
     let mut i = 0_usize;
     while i < completions_buf.len() {
         let c = completions_buf[i];
-        let conn_id = completion_conn_id(c);
-        let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) else {
+        let token = completion_token(c);
+        let Some(conn) = conn_for_completion(conns, c) else {
             i += 1;
             continue;
         };
 
-        let handle = ConnHandle(conn.conn_id());
+        let handle = ConnHandle::from_conn(conn);
         if conn.can_handle_plain_recv_data_batch(c) {
             let mut end = i + 1;
             while end < completions_buf.len() {
                 let next = completions_buf[end];
-                if completion_conn_id(next) != conn_id
-                    || !conn.can_handle_plain_recv_data_batch(next)
-                {
+                if completion_token(next) != token || !conn.can_handle_plain_recv_data_batch(next) {
                     break;
                 }
                 end += 1;
@@ -1553,20 +1775,18 @@ fn dispatch_conn_completions_data_marked_batches<F>(
     let mut i = 0_usize;
     while i < completions_buf.len() {
         let c = completions_buf[i];
-        let conn_id = completion_conn_id(c);
-        let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) else {
+        let token = completion_token(c);
+        let Some(conn) = conn_for_completion(conns, c) else {
             i += 1;
             continue;
         };
 
-        let handle = ConnHandle(conn.conn_id());
+        let handle = ConnHandle::from_conn(conn);
         if conn.can_handle_plain_recv_data_batch(c) {
             let mut end = i + 1;
             while end < completions_buf.len() {
                 let next = completions_buf[end];
-                if completion_conn_id(next) != conn_id
-                    || !conn.can_handle_plain_recv_data_batch(next)
-                {
+                if completion_token(next) != token || !conn.can_handle_plain_recv_data_batch(next) {
                     break;
                 }
                 end += 1;
@@ -1847,6 +2067,7 @@ mod tests {
     use super::*;
     use crate::connection_meta::{ConnectionConfig, State};
     use crate::observability::MarkedDataEvent;
+    use crate::proactor::{OpKind, UserData};
     use crate::test_helpers::{read_one_frame, run_echo_server};
     use crate::ws::frame::{MAX_HEADER_LEN, encode_header};
     use crate::ws::handshake::compute_accept;
@@ -2350,10 +2571,141 @@ mod tests {
             .connect_blocking_to(plain_cfg(idle_addr, "/idle"), idle_addr)
             .expect("connect idle server");
         assert_eq!(pool.conn_count(), 1);
-        pool.drop_slot(idle_handle.as_u32());
+        pool.remove_conn(idle_handle).expect("remove idle conn");
         assert_eq!(pool.conn_count(), 0);
         assert_eq!(pool.state(idle_handle), None);
         idle_server.join().unwrap();
+    }
+
+    #[test]
+    fn remove_conn_reuses_slot_with_new_generation_and_rejects_stale_handle() {
+        let (addr_a, server_a) = spawn_server(run_idle_server);
+        let mut pool = Pool::new(PoolConfig::default()).expect("pool");
+        let old = pool
+            .connect_blocking_to(plain_cfg(addr_a, "/old"), addr_a)
+            .expect("connect old");
+        assert_eq!(pool.conn_count(), 1);
+        assert_eq!(pool.state(old), Some(State::Open));
+        assert_eq!(old.as_u32(), 0);
+        assert_eq!(old.generation(), 0);
+
+        pool.remove_conn(old).expect("remove old");
+        assert_eq!(pool.conn_count(), 0);
+        assert_eq!(pool.state(old), None);
+        assert!(pool.send_text(old, b"stale").is_err());
+        server_a.join().unwrap();
+
+        let (addr_b, server_b) = spawn_server(run_idle_server);
+        let new = pool
+            .connect_blocking_to(plain_cfg(addr_b, "/new"), addr_b)
+            .expect("connect new");
+        assert_eq!(pool.conn_count(), 1);
+        assert_eq!(pool.state(new), Some(State::Open));
+        assert_eq!(new.as_u32(), old.as_u32());
+        assert_eq!(new.generation(), old.generation() + 1);
+        assert_ne!(new, old);
+        assert_eq!(pool.state(old), None);
+        assert!(pool.send_text(old, b"still stale").is_err());
+
+        close_and_join(&mut pool, new, server_b);
+    }
+
+    #[test]
+    fn stale_completion_from_removed_generation_is_ignored_after_slot_reuse() {
+        let (addr_a, server_a) = spawn_server(run_idle_server);
+        let mut pool = Pool::new(PoolConfig::default()).expect("pool");
+        let old = pool
+            .connect_blocking_to(plain_cfg(addr_a, "/old"), addr_a)
+            .expect("connect old");
+        let old_token = old.as_u64();
+        pool.remove_conn(old).expect("remove old");
+        server_a.join().unwrap();
+
+        let (addr_b, server_b) = spawn_server(run_idle_server);
+        let new = pool
+            .connect_blocking_to(plain_cfg(addr_b, "/new"), addr_b)
+            .expect("connect new");
+        assert_eq!(new.as_u32(), old.as_u32());
+        assert_ne!(new.as_u64(), old_token);
+
+        let stale = Completion {
+            user_data: UserData::new(OpKind::Recv, old_token),
+            result: -libc::ECANCELED,
+            flags: 0,
+        };
+        let mut first_err = None;
+        let Pool {
+            proactor,
+            conns,
+            active_count,
+            ..
+        } = &mut pool;
+        dispatch_conn_completions_data(
+            conns,
+            proactor,
+            &[stale],
+            active_count,
+            &mut |_, _| panic!("stale completion must not reach sink"),
+            &mut first_err,
+        );
+        assert!(first_err.is_none());
+        assert_eq!(pool.state(new), Some(State::Open));
+        assert_eq!(pool.conn_count(), 1);
+
+        close_and_join(&mut pool, new, server_b);
+    }
+
+    #[test]
+    fn submit_reconnect_reuses_slot_and_invalidates_old_handle() {
+        let (addr_a, server_a) = spawn_server(run_idle_server);
+        let (addr_b, server_b) = spawn_server(run_idle_server);
+        let mut pool = Pool::new(PoolConfig::default()).expect("pool");
+        let old = pool
+            .connect_blocking_to(plain_cfg(addr_a, "/old"), addr_a)
+            .expect("connect old");
+
+        let new = pool
+            .submit_reconnect_to(old, plain_cfg(addr_b, "/new"), addr_b)
+            .expect("submit reconnect");
+        assert_eq!(pool.state(old), None);
+        assert_eq!(new.as_u32(), old.as_u32());
+        assert_eq!(new.generation(), old.generation() + 1);
+        assert_eq!(pool.conn_count(), 1);
+        server_a.join().unwrap();
+
+        drive_until_open(&mut pool, &[new]);
+        assert_eq!(pool.state(new), Some(State::Open));
+        assert!(pool.send_text(old, b"stale").is_err());
+
+        close_and_join(&mut pool, new, server_b);
+    }
+
+    #[test]
+    fn reconnect_failure_retires_new_slot_and_keeps_pool_count_consistent() {
+        let (addr, server) = spawn_server(run_idle_server);
+        let mut pool = Pool::new(PoolConfig::default()).expect("pool");
+        let old = pool
+            .connect_blocking_to(plain_cfg(addr, "/old"), addr)
+            .expect("connect old");
+        assert_eq!(pool.conn_count(), 1);
+
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let refused_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let err = pool.reconnect_to(old, plain_cfg(refused_addr, "/refused"), refused_addr);
+        assert!(err.is_err(), "reconnect to a closed listener should fail");
+        assert_eq!(pool.state(old), None);
+        assert_eq!(pool.conn_count(), 0);
+        server.join().unwrap();
+
+        let (addr_next, server_next) = spawn_server(run_idle_server);
+        let next = pool
+            .connect_blocking_to(plain_cfg(addr_next, "/next"), addr_next)
+            .expect("connect after failed reconnect");
+        assert_eq!(next.as_u32(), old.as_u32());
+        assert!(next.generation() > old.generation());
+        assert_eq!(pool.conn_count(), 1);
+        close_and_join(&mut pool, next, server_next);
     }
 
     #[test]

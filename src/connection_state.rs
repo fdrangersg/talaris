@@ -170,6 +170,21 @@ impl ConnectionState {
     }
 
     #[inline]
+    pub(crate) const fn generation(&self) -> u32 {
+        self.identity.generation
+    }
+
+    #[inline]
+    pub(crate) const fn token(&self) -> u64 {
+        self.identity.token()
+    }
+
+    #[inline]
+    pub(crate) const fn bgid(&self) -> u16 {
+        self.identity.bgid
+    }
+
+    #[inline]
     pub(crate) const fn state(&self) -> State {
         self.state
     }
@@ -290,7 +305,7 @@ impl ConnectionState {
         &mut self,
         proactor: &mut Proactor,
     ) -> Result<(), ConnectionError> {
-        let ud = UserData::new(OpKind::Connect, u64::from(self.identity.conn_id));
+        let ud = UserData::new(OpKind::Connect, self.identity.token());
         // SAFETY: self.addr 与 self 同寿命；CQE 回来前不会被 move/drop
         // Box 内部地址稳定，即使 ConnectionState 被 move 进 Vec 也不变。
         unsafe {
@@ -356,7 +371,7 @@ impl ConnectionState {
             return Ok(());
         }
 
-        let ud = UserData::new(OpKind::Send, u64::from(self.identity.conn_id));
+        let ud = UserData::new(OpKind::Send, self.identity.token());
         let len = u32::try_from(pending).unwrap_or(u32::MAX);
         // SAFETY: send_buf 是 self 的 Vec，CQE 回来前不会 drop/realloc/compact
         // （send_inflight=true 阻塞 compact_send_buf_if_needed 和 extend）
@@ -406,7 +421,7 @@ impl ConnectionState {
             proactor,
             self.socket.as_raw_fd(),
             bgid,
-            UserData::new(OpKind::Recv, u64::from(self.identity.conn_id)),
+            UserData::new(OpKind::Recv, self.identity.token()),
             self.cfg.recv_mode,
         )?;
         self.multishot_armed = true;
@@ -1315,7 +1330,7 @@ impl ConnectionState {
             proactor,
             self.socket.as_raw_fd(),
             bgid,
-            UserData::new(OpKind::Recv, u64::from(self.identity.conn_id)),
+            UserData::new(OpKind::Recv, self.identity.token()),
             self.cfg.recv_mode,
         ) {
             if let Err(unregister_err) = ring.unregister(proactor) {
@@ -2469,6 +2484,7 @@ mod tests {
             user: ConnectionConfig::new("127.0.0.1", 443, "/").with_tls(false),
             identity: ConnectionRuntimeIdentity {
                 conn_id: 7,
+                generation: 0,
                 bgid: 11,
             },
         };
@@ -2487,6 +2503,7 @@ mod tests {
             user: ConnectionConfig::new("127.0.0.1", 443, "/").with_tls(false),
             identity: ConnectionRuntimeIdentity {
                 conn_id: 7,
+                generation: 0,
                 bgid: 11,
             },
         };
@@ -2499,6 +2516,7 @@ mod tests {
             user: ConnectionConfig::new("localhost", 443, "/"),
             identity: ConnectionRuntimeIdentity {
                 conn_id: 8,
+                generation: 0,
                 bgid: 12,
             },
         };
@@ -2516,6 +2534,7 @@ mod tests {
                 .with_ingress_stats(true),
             identity: ConnectionRuntimeIdentity {
                 conn_id: 7,
+                generation: 0,
                 bgid: 11,
             },
         };
@@ -2546,6 +2565,7 @@ mod tests {
             user: ConnectionConfig::new("127.0.0.1", 443, "/").with_tls(false),
             identity: ConnectionRuntimeIdentity {
                 conn_id: 7,
+                generation: 0,
                 bgid: 11,
             },
         };
