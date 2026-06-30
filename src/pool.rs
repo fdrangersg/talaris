@@ -67,8 +67,8 @@ pub const DEFAULT_POOL_POST_PROGRESS_SPIN_ITERS: usize = 0;
 /// Pool 的多连接调度层。
 ///
 /// `proactor` 只配置 io_uring ring 本身；recv mode、provided-buffer 大小、
-/// socket busy-poll、TLS/WS 等 per-connection 参数由
-/// [`ConnectionConfig`](crate::connection_meta::ConnectionConfig) 控制。
+/// socket busy-poll、TLS/WS 等 per-connection 参数
+/// 由 [`ConnectionConfig`] 控制。
 #[derive(Debug, Clone, Copy)]
 pub struct PoolConfig {
     /// 底层 io_uring 配置：SQ/CQ sizing 和 setup flags。
@@ -219,6 +219,9 @@ impl Pool {
     }
 
     /// 同 `connect_blocking`，但跳过 DNS。
+    /// 这是一个同步建连便利 API，适合“还没进入行情 hot loop”之前使用。
+    /// 不要在 hot pool 活跃收包时动态 blocking connect；
+    /// 初始化阶段用 submit_connect_to() 并发建连。
     pub fn connect_blocking_to(
         &mut self,
         cfg: ConnectionConfig,
@@ -264,6 +267,7 @@ impl Pool {
     }
 
     /// 同 [`submit_connect`](Self::submit_connect)，跳过 DNS。
+    /// production multi-conn startup API
     pub fn submit_connect_to(
         &mut self,
         cfg: ConnectionConfig,
