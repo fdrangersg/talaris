@@ -56,10 +56,10 @@ pub const DEFAULT_POOL_INITIAL_CONN_CAPACITY: usize = 0;
 ///
 /// Pool 需要先把当前 CQ 里的 completions 收集起来，再统一处理。
 /// 尤其 batch path 里还会看相邻 CQE 是否属于同一连接。
-/// 16 的含义是：默认先给这个 Vec 分配 16 个 Completion 的容量，避免每轮 pump 重新分配。
-/// 单连接或少量连接场景，一轮 pump 通常只有很少 CQE，比如 recv、send、close、nop 等。
-/// 16 足够覆盖常见情况，同时不浪费太多初始内存。
-pub const DEFAULT_POOL_COMPLETION_BATCH_CAPACITY: usize = 16;
+/// 64 的含义是：默认先给这个 Vec 分配 64 个 Completion 的容量，避免每轮 pump 重新分配。
+/// 单连接或少量连接场景，一轮 pump 通常只有很少 CQE，比如 recv、send、close、nop 等；
+/// 64 仍是很小的初始内存成本，同时更贴近 high fanout / burst 的生产低延迟默认。
+pub const DEFAULT_POOL_COMPLETION_BATCH_CAPACITY: usize = 64;
 
 /// Busy-spin data pumps 默认在首次 progress 后不继续额外 drain。
 pub const DEFAULT_POOL_POST_PROGRESS_SPIN_ITERS: usize = 0;
@@ -168,8 +168,8 @@ pub struct Pool {
     /// 避免不同连接的 buffer 混用。
     next_bgid: u16,
     /// pump_impl 内 drain CQE 暂存区。持久字段避免每轮 alloc（dhat 审计发现
-    /// 这是 hot loop 第一大 alloc：每轮 pump 一次 `Vec::with_capacity(16)`）。
-    /// 初始 cap 16 已足够单 conn 单轮 ≤ 4 CQE；多 conn 高峰按需 grow 一次后稳定。
+    /// 这是 hot loop 第一大 alloc：每轮 pump 重新分配一个 `Vec<Completion>`）。
+    /// 默认 cap 64 让高 fanout / burst 场景更少在第一轮 hot path grow。
     completions_buf: Vec<Completion>,
     /// 从 PoolConfig 拷进来的运行时配置
     post_progress_spin_iters: usize,
@@ -1002,8 +1002,8 @@ impl Pool {
         proactor.wait_for_cqe(wait_nr)?;
 
         // drain 所有 ready CQE 到持久 buf，避免 drain callback 重入 proactor +
-        // 每轮 alloc。F3 dhat 审计：原 `Vec::with_capacity(16)` 每轮 alloc 256 B
-        // × ~3/s = hot loop 第一大 alloc 点；移字段后 0 alloc。
+        // 每轮 alloc。F3 dhat 审计：原先每轮新建 `Vec<Completion>` 是
+        // hot loop 第一大 alloc 点；移字段后 0 alloc。
         completions_buf.clear();
         proactor.drain_completions(|c| completions_buf.push(c));
         for &c in completions_buf.iter() {
