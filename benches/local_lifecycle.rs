@@ -64,11 +64,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     server.join().expect("server join")?;
 
     let avg_ns = elapsed.as_nanos() as f64 / cycles as f64;
+    let avg_us = avg_ns / 1_000.0;
+    let avg_ms = avg_us / 1_000.0;
     println!(
-        "bench_result bench=local_lifecycle cycles={} total_ms={:.3} avg_reconnect_ns={:.0} slot={} generation_start={} generation_end={} conn_count={}",
+        "bench_result bench=local_lifecycle cycles={} total_ms={:.3} avg_reconnect_ns={:.0} avg_reconnect_us={:.3} avg_reconnect_ms={:.6} slot={} generation_start={} generation_end={} conn_count={}",
         cycles,
         elapsed.as_secs_f64() * 1_000.0,
         avg_ns,
+        avg_us,
+        avg_ms,
         slot,
         start_generation,
         handle.generation(),
