@@ -321,6 +321,7 @@ impl Pool {
     fn drive_conn_until_open(&mut self, conn_id: u32) -> Result<(), ConnectionError> {
         loop {
             self.drive_open_once(1)?;
+            self.drive_target_handshake_event(conn_id)?;
 
             let conn = self
                 .conns
@@ -334,6 +335,45 @@ impl Pool {
                 _ => {}
             }
         }
+    }
+
+    fn drive_target_handshake_event(&mut self, conn_id: u32) -> Result<(), ConnectionError> {
+        let Self {
+            conns,
+            active_count,
+            ..
+        } = self;
+        let conn = conns
+            .get_mut(conn_id as usize)
+            .and_then(Option::as_mut)
+            .expect("just-added conn must exist");
+
+        if matches!(conn.state(), State::Open | State::Closed) {
+            return Ok(());
+        }
+
+        let was_active = conn_is_active(conn);
+        if let Some(res) = conn.ws.poll_event() {
+            match res {
+                Ok(WsEvent::HandshakeComplete) => {}
+                Ok(_) => {}
+                Err(e) => {
+                    let mut first_err = None;
+                    fail_conn_and_account(
+                        conn,
+                        ConnectionError::Ws(e),
+                        &mut first_err,
+                        active_count,
+                        was_active,
+                    );
+                    return Err(first_err.expect("fail_conn_and_account stores first error"));
+                }
+            }
+        }
+        conn.sync_ws_open_state();
+        conn.sync_ws_close_state();
+        account_closed_transition(active_count, was_active, conn);
+        Ok(())
     }
 
     fn drive_open_once(&mut self, wait_nr: usize) -> Result<(), ConnectionError> {
