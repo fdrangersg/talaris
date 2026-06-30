@@ -643,16 +643,14 @@ impl Pool {
 
         completions_buf.clear();
         proactor.drain_completions(|c| completions_buf.push(c));
-        for &c in completions_buf.iter() {
-            let conn_id =
-                u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
-            if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
-                let handle = ConnHandle(conn.conn_id());
-                let was_active = conn_is_active(conn);
-                let result = conn.handle_completion_data_marked(proactor, c, |ev| sink(handle, ev));
-                let _ = finish_conn_result(conn, result, &mut first_err, active_count, was_active);
-            }
-        }
+        dispatch_conn_completions_data_marked(
+            conns,
+            proactor,
+            completions_buf,
+            active_count,
+            &mut sink,
+            &mut first_err,
+        );
 
         first_err.map_or(Ok(()), Err)
     }
