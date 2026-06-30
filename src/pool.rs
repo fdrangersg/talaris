@@ -317,10 +317,10 @@ impl Pool {
     }
 
     /// pump 单 conn 直到它进 Open（或失败）。其它 conn 的 CQE 也会顺道被路由
-    /// 推进（pump_impl 内部对所有 conn 一视同仁）。
+    /// 推进，但不会 drain 非目标连接已经解析出的 WS business events。
     fn drive_conn_until_open(&mut self, conn_id: u32) -> Result<(), ConnectionError> {
         loop {
-            self.pump_impl(1, |_, _| { /* discard pre-open events */ })?;
+            self.drive_open_once(1)?;
 
             let conn = self
                 .conns
@@ -334,6 +334,39 @@ impl Pool {
                 _ => {}
             }
         }
+    }
+
+    fn drive_open_once(&mut self, wait_nr: usize) -> Result<(), ConnectionError> {
+        let Self {
+            proactor,
+            conns,
+            completions_buf,
+            active_count,
+            ..
+        } = self;
+
+        let mut first_err: Option<ConnectionError> = None;
+        submit_conn_ops(conns, proactor, &mut first_err);
+        proactor.submit()?;
+        proactor.wait_for_cqe(wait_nr)?;
+
+        completions_buf.clear();
+        proactor.drain_completions(|c| completions_buf.push(c));
+        for &c in completions_buf.iter() {
+            let conn_id = completion_conn_id(c);
+            if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
+                match conn.handle_completion(proactor, c) {
+                    Ok(()) => {
+                        conn.sync_ws_open_state();
+                        conn.sync_ws_close_state();
+                    }
+                    Err(e) => fail_conn(conn, e, &mut first_err),
+                }
+            }
+        }
+
+        sync_active_count(conns, active_count);
+        first_err.map_or(Ok(()), Err)
     }
 
     pub fn send_text(&mut self, h: ConnHandle, payload: &[u8]) -> Result<(), ConnectionError> {
