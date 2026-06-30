@@ -20,7 +20,7 @@
 NIC / kernel TCP stack
   -> socket receive queue                  // 有序 TLS ciphertext byte stream
   -> IORING_OP_RECV_MULTISHOT              // kernel 从 socket queue copy 到 provided buffer
-  -> per-connection BufferRing slot        // CQE 携带 conn_id + bid + len；slot 内仍是 ciphertext
+  -> per-connection BufferRing slot        // CQE 携带 conn token + bid + len；slot 内仍是 ciphertext
   -> Pool drain CQE batch                  // 单线程按 CQE 顺序路由到 ConnectionState
   -> ConnectionState resolves bid -> &[u8] // 借用 BufferRing slot；处理完立即 recycle
   -> rustls.read_tls()                     // ciphertext 进入 rustls deframer
@@ -240,7 +240,7 @@ batch；除最后一个外，`is_chunk_end()` 都是 `false`。非 direct fallba
 | **CQE**              | io_uring completion event；recv CQE 告诉用户态哪个 conn、哪个 buffer、多少 bytes。 | `src/proactor/op.rs::Completion`           |
 | **Pool**             | 一个 Proactor 驱动 N 条 WS conn 的单线程 owner；负责 CQE 路由和回调。                 | `src/pool.rs::Pool`                        |
 | **PoolConfig**       | Pool 级配置：io_uring SQ/CQ sizing、setup flags、completion batch 等。          | `src/pool.rs::PoolConfig`                  |
-| **ConnHandle**       | 对外的不透明 conn 引用；本质是 Pool 分配的 `u32 conn_id`。                           | `src/pool.rs::ConnHandle`                  |
+| **ConnHandle**       | 对外的不透明 conn 引用；包含 slot id + generation，避免 stale handle / late CQE 串到复用 slot。 | `src/pool.rs::ConnHandle`                  |
 | **ConnectionConfig** | 单条 conn 的配置：host/path/TLS、recv mode、BufferRing、socket、observability。 | `src/connection_meta.rs::ConnectionConfig` |
 | **BufferRing**       | 每条 conn 自己的 provided-buffer ring；kernel 写 slot，CQE 通过 `bid` 指回该 slot。 | `src/proactor/buf_ring.rs::BufferRing`     |
 | **bid**              | buffer id；BufferRing 内一个 slot 的编号，处理完必须 recycle 还给 kernel。          | `Completion::buffer_id()`                  |
@@ -327,9 +327,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 // 1. 起一个单线程 Pool。默认 PoolConfig 已包含默认 ProactorConfig。
 let mut pool = Pool::new(PoolConfig::default())?;
 
-// 2. 建连接：阻塞版会完成 TCP connect + TLS handshake + WS upgrade。
+// 2. 建连接。
+// 阻塞版会完成 TCP connect + TLS handshake + WS upgrade；适合启动期 / smoke / tests。
 let h: ConnHandle = pool.connect_blocking(cfg)?;
 // let h = pool.connect_blocking_to(cfg, addr)?; // 跳过 DNS / IP racing 时使用
+
+// 并发建连用 submit_*：先 reserve slot，再由后续 pump 驱动到 Open。
+let h2 = pool.submit_connect(cfg2)?;
+// let h2 = pool.submit_connect_to(cfg2, addr2)?; // 已经完成 DNS/IP racing 时使用
 
 // 3. 主动发送。Text/Binary 是业务 data frame；Ping/Pong/Close 是 control frame。
 pool.send_text(h, br#"{"op":"subscribe"}"#)?;
@@ -344,7 +349,12 @@ pool.pump_data(|h, data| { /* only Text/Binary data */ })?;
 let progressed = pool.pump_data_spin(256, |h, data| { /* busy-poll data path */ })?;
 let progressed = pool.pump_data_spin_batches(256, |h, batch| { /* chunk-level batch */ })?;
 
-// 5. 观测和状态。
+// 5. 生命周期管理。
+pool.remove_conn(h2)?; // hard remove：释放 slot/bgid，旧 ConnHandle 立即失效
+let h = pool.submit_reconnect_to(h, cfg, addr)?; // 非阻塞 diagnostic reconnect
+// let h = pool.reconnect_to(h, cfg, addr)?;      // 阻塞 convenience，不建议放 hot loop
+
+// 6. 观测和状态。
 let state = pool.state(h);       // Option<State>
 let active = pool.conn_count();  // active conn count
 let metrics = pool.prometheus_metrics();
@@ -354,6 +364,23 @@ let metrics = pool.prometheus_metrics();
 `*_nowait` 立即返回，适合 close cleanup 或和外部 loop 集成。
 `*_spin` 不等待 syscall，适合 isolated CPU 上的低抖动 hot loop。
 `*_marked` / `*_marked_batches` 会携带 observability metadata；未 marked 路径不读时钟。
+
+### Pool lifecycle / reconnect 语义
+
+`ConnHandle` 是 opaque token，不只是 slot id。内部编码了 `slot_id + generation`：
+slot 被 `remove_conn` / reconnect 回收后 generation 会递增，旧 handle 和旧 generation
+的 late CQE 都不会命中新连接。这是长期运行进程能安全诊断重连的核心约束。
+
+- `connect_blocking` / `connect_blocking_to`：启动期和测试最方便；会自己 drive open。
+  专用 open-driving path 不会 drain 已有连接的业务 Text/Binary。
+- `submit_connect` / `submit_connect_to`：生产启动期推荐；可一次提交多条连接，让 TCP/TLS/WS
+  handshake 并发推进，后续用 `pump*` 驱动到 `State::Open`。
+- `remove_conn`：hard remove，不发送 graceful close。它会 unregister buffer ring、drop fd、
+  递减 active count，并在安全时回收 slot/bgid。旧 handle 后续 `state/send/remove` 都会失败或返回 `None`。
+- `submit_reconnect` / `submit_reconnect_to`：先移除旧连接，再提交新连接；用于故障诊断 / 重连。
+  如果新连接失败，旧连接不会自动恢复，调用方应按策略重新提交。
+- `reconnect` / `reconnect_to`：blocking convenience，适合测试 / CLI / smoke；生产 hot loop
+  更推荐 `submit_reconnect_to`，避免在关键路径里阻塞握手。
 
 ### Opt-in observability
 
@@ -772,8 +799,10 @@ in-flight ciphertext bytes，并给 recycle 留余量。
 - **HTTP/1.1 codec** — minimal, sized for WS Upgrade. Header size cap (16 KiB)
   / count cap (64) / explicit `Transfer-Encoding` reject for DoS hardening.
 - **Pool** — single io_uring drives N WebSocket connections. CQE routing is
-  O(1) slot-table lookup. `submit_connect` returns a handle immediately so
-  N connections can hand-shake concurrently.
+  O(1) generation-guarded slot-table lookup. `submit_connect` returns a
+  handle immediately so N connections can hand-shake concurrently; `remove_conn`
+  / `submit_reconnect_to` recycle slots without letting stale handles or late CQEs
+  alias a new connection.
 
 ## Platform
 

@@ -1,22 +1,22 @@
 //! `Pool` —— multi-connection driver
 //!
 //! 一个 [`Proactor`] 服务同 venue 的多条 WS。
-//! CQE 通过 [`crate::proactor::UserData::token`] 低 28 位编码 conn_id；
-//! Pool drain 后按 id 路由到对应 [`crate::connection_state::ConnectionState`]。
+//! CQE 通过 [`crate::proactor::UserData::token`] 携带 Pool token：低 28 位是
+//! slot id，bits 55..28 是 slot generation。Pool drain 后先做 generation guard，
+//! 再按 slot id 路由到对应 [`crate::connection_state::ConnectionState`]。
 //!
 //! ## 关键不变式
 //!
 //! - **单线程占用**：`Pool: !Send + !Sync`（`PhantomData<*const ()>` 标记）。
 //!   io_uring 内部状态不能跨线程。
-//! - **conn_id 编码 ≤ 28 bit**：[`crate::proactor::UserData`] 高 8 位是 OpKind，低 56 位是
-//!   caller token；这里再约定低 28 位为 conn_id，bits 55..28 预留给 op-seq
-//! - **bgid 单调递增**：每条 conn 独占一个 bgid（kernel 看，跨 conn 不重叠）。
-//!   暂时不回收 bgid（短期）；64 K 上限远超实际部署。
+//! - **slot id 编码 ≤ 28 bit**：[`crate::proactor::UserData`] 高 8 位是 OpKind，低 56 位是
+//!   caller token；Pool 约定 token 低 28 位为 slot id，bits 55..28 为 generation。
+//! - **generation guard**：`remove_conn` / reconnect 会递增 slot generation；旧 handle
+//!   和 late CQE 都不能 alias 到复用后的新连接。
+//! - **bgid 安全复用**：每条 live conn 独占 bgid；只有 unregister buffer ring 成功，
+//!   或该连接从未注册 ring 时，bgid 才进入 free list。
 //! - **drain 顺序**：每轮 pump 先 submit pending send + rearm multishot，
-//!   再`submit_and_wait`，最后 drain CQE 路由 + drain ws_events。
-//!
-//! - 多 conn pump 已能跑（CQE 按 conn_id 路由）。
-//! - 还未做：slot 复用 / Tombstone / pool 内重连。
+//!   再 `submit_and_wait`，最后 drain CQE 路由 + drain ws_events。
 //!
 
 // `expect()` 用法均为 invariant 断言（just-pushed conn 一定存在；28-bit mask
@@ -173,18 +173,17 @@ impl ConnHandle {
 
 /// Multi-conn driver/dispatcher:
 ///   - 单线程持有 [`Proactor`];
-///   - 持有 Vec<Option<ConnectionState>>;
+///   - 持有 `Vec<Option<ConnectionState>>` slot table;
 ///   - drain CQE;
-///   - 从 CQE user_data 中解析 conn_id;
-///   - 找到对应 ConnectionState (真正干活的是ConnectionState)；
-///   - 调用 conn.handle_completion...
+///   - 从 CQE user_data 中解析 token，做 generation guard;
+///   - 找到对应 `ConnectionState`（真正干活的是 ConnectionState）；
+///   - 调用 `conn.handle_completion...`。
 ///
-/// **Slot table 路由**：`conns: Vec<Option<ConnectionState>>`，conn_id
-/// 既是 routing token 也是 slot index —— CQE 拿到 user_data 解出 conn_id 后
-/// `conns.get(conn_id as usize)` 是 O(1)。
+/// **Slot table 路由**：slot id 直接索引 `conns`，O(1)。generation guard
+/// 让 stale handle / late CQE 无法命中复用后的 slot。
 pub struct Pool {
     proactor: Proactor,
-    /// slot table：conn_id 直接索引。None 是关闭/失败留下的 tombstone（暂不复用）。
+    /// Slot table: slot id 直接索引。`None` 表示空闲/已移除，可被 free list 复用。
     conns: Vec<Option<ConnectionState>>,
     /// Per-slot generation. Incremented when a slot is removed, so stale
     /// handles/CQEs cannot alias a future connection that reuses the slot.
@@ -1384,7 +1383,7 @@ impl Pool {
             .map(ConnectionState::state)
     }
 
-    /// 当前 active conn 数（不含 tombstone slot）。
+    /// 当前 active conn 数（不含空闲 slot）。
     #[must_use]
     pub fn conn_count(&self) -> usize {
         self.active_count as usize
