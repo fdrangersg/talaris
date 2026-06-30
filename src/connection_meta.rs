@@ -472,3 +472,112 @@ impl ConnectionConfig {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recv_mode_display_and_parse_are_stable() {
+        assert_eq!(RecvMode::Multishot.to_string(), "multishot");
+        assert_eq!(RecvMode::MultishotBundle.to_string(), "multishot-bundle");
+        assert_eq!(
+            "multishot".parse::<RecvMode>().unwrap(),
+            RecvMode::Multishot
+        );
+        assert_eq!("multi".parse::<RecvMode>().unwrap(), RecvMode::Multishot);
+        assert_eq!(
+            "recv-bundle".parse::<RecvMode>().unwrap(),
+            RecvMode::MultishotBundle
+        );
+        assert!("edge-triggered".parse::<RecvMode>().is_err());
+    }
+
+    #[test]
+    fn connection_config_defaults_are_low_latency_safe() {
+        let cfg = ConnectionConfig::new("example.com", 443, "/ws");
+        assert_eq!(cfg.host, "example.com");
+        assert_eq!(cfg.port, 443);
+        assert_eq!(cfg.path, "/ws");
+        assert!(cfg.use_tls);
+        assert_eq!(cfg.buf_ring_slot_size, DEFAULT_BUF_RING_SLOT_SIZE);
+        assert_eq!(cfg.buf_ring_entries, DEFAULT_BUF_RING_ENTRIES);
+        assert_eq!(cfg.recv_mode, RecvMode::Multishot);
+        assert_eq!(cfg.socket_busy_poll_usecs, None);
+        assert_eq!(cfg.plain_recv_batch_copy_max_bytes, 0);
+        assert!(!cfg.track_ingress_stats);
+        assert_eq!(
+            cfg.observability_sample_rate.basis_points(),
+            ObservabilitySampleRate::MAX_BASIS_POINTS
+        );
+        assert!(!cfg.record_observability_histograms);
+    }
+
+    #[test]
+    fn connection_config_builder_preserves_all_tuning_knobs() {
+        let ws = WsConfig::new("wrong-host", "/wrong")
+            .with_max_message_size(1024)
+            .with_max_frame_payload(2048)
+            .with_initial_buffer_capacities(11, 22, 33);
+
+        let cfg = ConnectionConfig::new("venue.example", 9443, "/real")
+            .with_tls(false)
+            .with_ws_config(ws)
+            .with_ws_limits(4096, 8192)
+            .with_ws_recv_buffer_capacity(128)
+            .with_ws_message_buffer_capacity(256)
+            .with_ws_tx_buffer_capacity(512)
+            .with_auto_pong(false)
+            .with_buf_ring(2048, 512)
+            .with_recv_mode(RecvMode::MultishotBundle)
+            .with_socket_busy_poll_usecs(100)
+            .with_connection_buffer_capacities(4096, 8192)
+            .with_plain_recv_batch_copy_max_bytes(16 * 1024)
+            .with_ingress_stats(true)
+            .with_observability_sample_rate_bps(12_345)
+            .with_observability_histograms(true);
+
+        assert_eq!(cfg.host, "venue.example");
+        assert_eq!(cfg.port, 9443);
+        assert_eq!(cfg.path, "/real");
+        assert!(!cfg.use_tls);
+        assert_eq!(cfg.buf_ring_slot_size, 2048);
+        assert_eq!(cfg.buf_ring_entries, 512);
+        assert_eq!(cfg.recv_mode, RecvMode::MultishotBundle);
+        assert_eq!(cfg.socket_busy_poll_usecs, Some(100));
+        assert_eq!(cfg.send_buffer_initial_capacity, Some(4096));
+        assert_eq!(cfg.tls_pending_out_initial_capacity, Some(8192));
+        assert_eq!(cfg.plain_recv_batch_copy_max_bytes, 16 * 1024);
+        assert!(cfg.track_ingress_stats);
+        assert_eq!(
+            cfg.observability_sample_rate.basis_points(),
+            ObservabilitySampleRate::MAX_BASIS_POINTS
+        );
+        assert!(cfg.record_observability_histograms);
+
+        let ws = cfg.ws_config.expect("ws config");
+        assert_eq!(ws.host, "wrong-host");
+        assert_eq!(ws.path, "/wrong");
+        assert_eq!(ws.max_message_size, 4096);
+        assert_eq!(ws.max_frame_payload, 8192);
+        assert_eq!(ws.initial_recv_buffer_capacity, Some(128));
+        assert_eq!(ws.initial_message_buffer_capacity, Some(256));
+        assert_eq!(ws.initial_tx_buffer_capacity, Some(512));
+        assert!(!ws.auto_pong);
+    }
+
+    #[test]
+    fn connection_config_individual_buffer_builders_are_composable() {
+        let cfg = ConnectionConfig::new("venue.example", 443, "/ws")
+            .with_send_buffer_capacity(1)
+            .with_tls_pending_out_capacity(2)
+            .with_ws_buffer_capacities(3, 4, 5);
+
+        assert_eq!(cfg.send_buffer_initial_capacity, Some(1));
+        assert_eq!(cfg.tls_pending_out_initial_capacity, Some(2));
+        let ws = cfg.ws_config.expect("ws config");
+        assert_eq!(ws.initial_recv_buffer_capacity, Some(3));
+        assert_eq!(ws.initial_message_buffer_capacity, Some(4));
+        assert_eq!(ws.initial_tx_buffer_capacity, Some(5));
+    }
+}
