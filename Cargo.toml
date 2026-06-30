@@ -104,6 +104,10 @@ name    = "local_redundancy"
 harness = false
 
 [[bench]]
+name    = "local_lifecycle"
+harness = false
+
+[[bench]]
 name    = "live_redundancy"
 harness = false
 
