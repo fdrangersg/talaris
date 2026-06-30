@@ -40,7 +40,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let addr = listener.local_addr()?;
     let accepts = cycles + 1;
     let (server_done_tx, server_done_rx) = std::sync::mpsc::channel();
-    let server = thread::spawn(move || run_server(listener, accepts, server_done_rx));
+    let server = thread::spawn(move || run_server(&listener, accepts, &server_done_rx));
 
     let mut pool = Pool::new(PoolConfig::default())?;
     let mut handle = pool.connect_blocking_to(plain_cfg(addr.port()), addr)?;
@@ -84,13 +84,13 @@ fn plain_cfg(port: u16) -> talaris::ConnectionConfig {
 
 #[cfg(target_os = "linux")]
 fn run_server(
-    listener: std::net::TcpListener,
+    listener: &std::net::TcpListener,
     accepts: u64,
-    done: std::sync::mpsc::Receiver<()>,
+    done: &std::sync::mpsc::Receiver<()>,
 ) -> Result<(), String> {
     let mut streams = Vec::with_capacity(usize::try_from(accepts).unwrap_or(usize::MAX));
     for _ in 0..accepts {
-        streams.push(accept_ws_upgrade(&listener).map_err(|e| e.to_string())?);
+        streams.push(accept_ws_upgrade(listener).map_err(|e| e.to_string())?);
     }
     done.recv_timeout(std::time::Duration::from_secs(10))
         .map_err(|e| e.to_string())?;
@@ -112,7 +112,8 @@ fn accept_ws_upgrade(listener: &std::net::TcpListener) -> std::io::Result<std::n
                 "client closed during handshake",
             ));
         }
-        req.extend_from_slice(&buf[..n]);
+        let chunk = buf.get(..n).expect("read length is within buffer");
+        req.extend_from_slice(chunk);
         if req.windows(4).any(|w| w == b"\r\n\r\n") {
             break;
         }

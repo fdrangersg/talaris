@@ -47,7 +47,7 @@ use crate::ws::{
 /// `generation` is bumped whenever a slot is removed. A late CQE from an old
 /// connection can therefore never be routed into a new connection that reused
 /// the same slot id.
-
+///
 /// Pool slot table 默认初始容量。0 表示按 `Vec` 默认策略延迟分配。
 /// 大多数场景连接数很少，提前分配意义不大。不影响 recv/parse/pump
 /// 热路径延迟，只影响 Pool 初始化或动态新增连接时的 Vec grow 内存分配行为。

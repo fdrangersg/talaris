@@ -514,15 +514,18 @@ mod tests {
     fn recv_mode_display_and_parse_are_stable() {
         assert_eq!(RecvMode::Multishot.to_string(), "multishot");
         assert_eq!(RecvMode::MultishotBundle.to_string(), "multishot-bundle");
-        assert_eq!(
-            "multishot".parse::<RecvMode>().unwrap(),
-            RecvMode::Multishot
-        );
-        assert_eq!("multi".parse::<RecvMode>().unwrap(), RecvMode::Multishot);
-        assert_eq!(
-            "recv-bundle".parse::<RecvMode>().unwrap(),
-            RecvMode::MultishotBundle
-        );
+        assert!(matches!(
+            "multishot".parse::<RecvMode>(),
+            Ok(RecvMode::Multishot)
+        ));
+        assert!(matches!(
+            "multi".parse::<RecvMode>(),
+            Ok(RecvMode::Multishot)
+        ));
+        assert!(matches!(
+            "recv-bundle".parse::<RecvMode>(),
+            Ok(RecvMode::MultishotBundle)
+        ));
         assert!("edge-triggered".parse::<RecvMode>().is_err());
     }
 
@@ -547,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_config_builder_preserves_all_tuning_knobs() {
+    fn connection_config_builder_preserves_all_tuning_knobs() -> Result<(), &'static str> {
         let ws = WsConfig::new("wrong-host", "/wrong")
             .with_max_message_size(1024)
             .with_max_frame_payload(2048)
@@ -588,7 +591,7 @@ mod tests {
         );
         assert!(cfg.record_observability_histograms);
 
-        let ws = cfg.ws_config.expect("ws config");
+        let ws = cfg.ws_config.ok_or("missing ws config")?;
         assert_eq!(ws.host, "wrong-host");
         assert_eq!(ws.path, "/wrong");
         assert_eq!(ws.max_message_size, 4096);
@@ -597,10 +600,11 @@ mod tests {
         assert_eq!(ws.initial_message_buffer_capacity, Some(256));
         assert_eq!(ws.initial_tx_buffer_capacity, Some(512));
         assert!(!ws.auto_pong);
+        Ok(())
     }
 
     #[test]
-    fn connection_config_individual_buffer_builders_are_composable() {
+    fn connection_config_individual_buffer_builders_are_composable() -> Result<(), &'static str> {
         let cfg = ConnectionConfig::new("venue.example", 443, "/ws")
             .with_send_buffer_capacity(1)
             .with_tls_pending_out_capacity(2)
@@ -608,9 +612,10 @@ mod tests {
 
         assert_eq!(cfg.send_buffer_initial_capacity, Some(1));
         assert_eq!(cfg.tls_pending_out_initial_capacity, Some(2));
-        let ws = cfg.ws_config.expect("ws config");
+        let ws = cfg.ws_config.ok_or("missing ws config")?;
         assert_eq!(ws.initial_recv_buffer_capacity, Some(3));
         assert_eq!(ws.initial_message_buffer_capacity, Some(4));
         assert_eq!(ws.initial_tx_buffer_capacity, Some(5));
+        Ok(())
     }
 }

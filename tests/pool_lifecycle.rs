@@ -16,11 +16,11 @@ use talaris::{ConnectionConfig, Pool, PoolConfig, State};
 fn spawn_idle_ws(path: &'static str) -> (SocketAddr, thread::JoinHandle<()>) {
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = thread::spawn(move || run_idle_ws(listener, path));
+    let server = thread::spawn(move || run_idle_ws(&listener, path));
     (addr, server)
 }
 
-fn run_idle_ws(listener: TcpListener, expected_path: &'static str) {
+fn run_idle_ws(listener: &TcpListener, expected_path: &'static str) {
     let mut stream = accept_ws_upgrade(listener, expected_path);
     stream
         .set_read_timeout(Some(Duration::from_millis(500)))
@@ -43,7 +43,7 @@ fn run_idle_ws(listener: TcpListener, expected_path: &'static str) {
     }
 }
 
-fn accept_ws_upgrade(listener: TcpListener, expected_path: &str) -> TcpStream {
+fn accept_ws_upgrade(listener: &TcpListener, expected_path: &str) -> TcpStream {
     let (mut stream, _) = listener.accept().expect("accept");
     stream.set_nodelay(true).unwrap();
 
@@ -52,7 +52,8 @@ fn accept_ws_upgrade(listener: TcpListener, expected_path: &str) -> TcpStream {
     loop {
         let n = stream.read(&mut buf).unwrap();
         assert!(n > 0, "client closed before upgrade request");
-        req.extend_from_slice(&buf[..n]);
+        let chunk = buf.get(..n).expect("read length is within buffer");
+        req.extend_from_slice(chunk);
         if req.windows(4).any(|w| w == b"\r\n\r\n") {
             break;
         }
