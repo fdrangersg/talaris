@@ -12,7 +12,7 @@
 //!
 //! 展示 3 件事：
 //!   1. 怎样把 talaris 加进 Cargo.toml 并 `use` 起来；
-//!   2. 怎样组装 [`talaris::Pool`] / [`talaris::connection::ConnectionConfig`]，
+//!   2. 怎样组装 [`talaris::Pool`] / [`talaris::connection_meta::ConnectionConfig`]，
 //!      跑通一条 plain WebSocket 连接；
 //!   3. 怎样把 user 线程钉到指定 CPU，降低 scheduler migration 抖动。
 //!
