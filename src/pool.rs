@@ -1847,12 +1847,14 @@ mod tests {
     use crate::ws::frame::{MAX_HEADER_LEN, encode_header};
     use crate::ws::handshake::compute_accept;
     use crate::ws::mask::mask_inplace;
-    use crate::ws::{DataEvent as WsDataEvent, OpCode};
+    use crate::ws::{DataEvent as WsDataEvent, OpCode, WsConfig};
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+
+    static COPY_BATCH_PAYLOAD: [u8; 512] = [b'x'; 512];
 
     fn spawn_server<F>(f: F) -> (SocketAddr, thread::JoinHandle<()>)
     where
@@ -1891,6 +1893,50 @@ mod tests {
         );
         stream.write_all(resp.as_bytes()).unwrap();
         stream
+    }
+
+    fn accept_ws_upgrade_recording_request(listener: TcpListener) -> (TcpStream, String) {
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream.set_nodelay(true).unwrap();
+
+        let mut buf = [0_u8; 4096];
+        let mut req = Vec::new();
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            assert!(n > 0, "client closed before sending request");
+            req.extend_from_slice(&buf[..n]);
+            if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let req_str = std::str::from_utf8(&req).unwrap().to_owned();
+        let key = req_str
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("sec-websocket-key:"))
+            .and_then(|line| line.split(':').nth(1))
+            .expect("Sec-WebSocket-Key header")
+            .trim();
+        let accept = compute_accept(key);
+        let resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        );
+        stream.write_all(resp.as_bytes()).unwrap();
+        (stream, req_str)
+    }
+
+    fn run_request_assertion_server(listener: TcpListener) {
+        let (mut stream, req) = accept_ws_upgrade_recording_request(listener);
+        assert!(
+            req.starts_with("GET /real HTTP/1.1\r\n"),
+            "request was {req:?}"
+        );
+        assert!(req.contains("Host: localhost"), "request was {req:?}");
+        assert!(!req.contains("wrong-host"), "request was {req:?}");
+        assert!(!req.contains("GET /wrong"), "request was {req:?}");
+        let (opcode, _) = read_one_frame(&mut stream);
+        assert_eq!(opcode, OpCode::Close);
+        write_server_close(&mut stream);
     }
 
     fn write_server_frame(
@@ -2364,6 +2410,79 @@ mod tests {
         assert_eq!(marked_text.as_deref(), Some("marked"));
         assert!(marked_sampled);
         close_and_join(&mut pool, marked_handle, marked_server);
+    }
+
+    #[test]
+    fn connection_config_endpoint_overrides_inner_ws_config_at_handshake() {
+        let (addr, server) = spawn_server(run_request_assertion_server);
+        let ws = WsConfig::new("wrong-host", "/wrong").with_initial_buffer_capacities(11, 22, 33);
+        let cfg = plain_cfg(addr, "/real").with_ws_config(ws);
+        let mut pool = Pool::new(PoolConfig::default()).expect("pool");
+        let handle = pool.connect_blocking_to(cfg, addr).expect("connect");
+        assert_eq!(pool.state(handle), Some(State::Open));
+        close_and_join(&mut pool, handle, server);
+    }
+
+    #[test]
+    fn plain_copy_batch_records_ingress_stats() {
+        let (addr, server) = spawn_server(|listener| {
+            run_delayed_push_server(listener, vec![&COPY_BATCH_PAYLOAD]);
+        });
+        let cfg = plain_cfg(addr, "/copy-batch")
+            .with_buf_ring(64, 64)
+            .with_plain_recv_batch_copy_max_bytes(4096)
+            .with_ingress_stats(true);
+        let mut pool = Pool::new(PoolConfig::default()).expect("pool");
+        let handle = pool.connect_blocking_to(cfg, addr).expect("connect");
+
+        let mut got_len = None;
+        for _ in 0..500 {
+            pool.pump_data_nowait(|event_handle, event| {
+                assert_eq!(event_handle, handle);
+                if let WsDataEvent::Text(text) = event {
+                    got_len = Some(text.len());
+                }
+            })
+            .unwrap();
+            if got_len.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(got_len, Some(COPY_BATCH_PAYLOAD.len()));
+
+        let stats = pool.ingress_stats(handle).expect("stats");
+        assert!(stats.recv_data_cqes > 1, "stats: {stats:?}");
+        assert!(stats.plain_recv_batches > 0, "stats: {stats:?}");
+        assert!(stats.plain_recv_batch_cqes > 1, "stats: {stats:?}");
+        assert!(stats.plain_recv_copied_batches > 0, "stats: {stats:?}");
+        assert!(
+            stats.plain_recv_copied_bytes >= COPY_BATCH_PAYLOAD.len() as u64,
+            "stats: {stats:?}"
+        );
+
+        close_and_join(&mut pool, handle, server);
+    }
+
+    #[test]
+    #[ignore = "requires Linux 6.10+ IORING_RECVSEND_BUNDLE support"]
+    fn multishot_bundle_plain_ws_echo_roundtrip() {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let local_addr = listener.local_addr().unwrap();
+
+        let (_shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+        let server = thread::spawn(move || run_echo_server(listener, shutdown_rx));
+
+        let cfg = ConnectionConfig::new("localhost", local_addr.port(), "/echo")
+            .with_tls(false)
+            .with_recv_mode(crate::connection_meta::RecvMode::MultishotBundle);
+        let mut pool = Pool::new(PoolConfig::default()).expect("pool");
+        let handle = pool.connect_blocking_to(cfg, local_addr).expect("connect");
+        assert_eq!(pool.state(handle), Some(State::Open));
+
+        pool.send_text(handle, b"bundle").unwrap();
+        wait_for_text_event(&mut pool, handle, "bundle");
+        close_and_join(&mut pool, handle, server);
     }
 
     #[test]

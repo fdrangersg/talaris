@@ -2481,6 +2481,64 @@ mod tests {
         assert_eq!(moved[0].addr.as_ptr(), before);
     }
 
+    #[test]
+    fn connection_state_constructs_plain_and_tls_variants() {
+        let plain = AssignedConnectionConfig {
+            user: ConnectionConfig::new("127.0.0.1", 443, "/").with_tls(false),
+            identity: ConnectionRuntimeIdentity {
+                conn_id: 7,
+                bgid: 11,
+            },
+        };
+        let addr: SocketAddr = "127.0.0.1:443".parse().expect("valid socket addr");
+        let plain_conn = ConnectionState::new(plain, addr).expect("plain connection state");
+        assert!(plain_conn.tls.is_none());
+        assert_eq!(plain_conn.state(), State::Init);
+
+        let tls = AssignedConnectionConfig {
+            user: ConnectionConfig::new("localhost", 443, "/"),
+            identity: ConnectionRuntimeIdentity {
+                conn_id: 8,
+                bgid: 12,
+            },
+        };
+        let tls_conn = ConnectionState::new(tls, addr).expect("tls connection state");
+        assert!(tls_conn.tls.is_some());
+        assert_eq!(tls_conn.state(), State::Init);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closed_state_discards_late_recv_enobufs_completion() {
+        let assigned = AssignedConnectionConfig {
+            user: ConnectionConfig::new("127.0.0.1", 443, "/")
+                .with_tls(false)
+                .with_ingress_stats(true),
+            identity: ConnectionRuntimeIdentity {
+                conn_id: 7,
+                bgid: 11,
+            },
+        };
+        let addr: SocketAddr = "127.0.0.1:443".parse().expect("valid socket addr");
+        let mut conn = ConnectionState::new(assigned, addr).expect("connection state");
+        conn.state = State::Closed;
+        conn.multishot_armed = true;
+
+        let mut proactor =
+            Proactor::new(crate::proactor::ProactorConfig::default()).expect("proactor init");
+        let completion = Completion {
+            user_data: UserData::new(OpKind::Recv, u64::from(conn.conn_id())),
+            result: -libc::ENOBUFS,
+            flags: 0,
+        };
+
+        conn.handle_completion(&mut proactor, completion)
+            .expect("closed recv completion is discarded");
+        assert_eq!(conn.state(), State::Closed);
+        assert!(!conn.multishot_armed);
+        assert_eq!(conn.ingress_stats().recv_ring_exhaustions, 1);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn closed_state_discards_late_send_completion() {
