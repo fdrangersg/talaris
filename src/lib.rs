@@ -66,8 +66,8 @@ pub(crate) mod cursor_buf;
 pub(crate) mod connection_state;
 
 pub use pool::{
-    ConnHandle, DEFAULT_POOL_COMPLETION_BATCH_CAPACITY, DEFAULT_POOL_INITIAL_CONN_CAPACITY, Pool,
-    PoolConfig,
+    ConnHandle, DEFAULT_POOL_COMPLETION_BATCH_CAPACITY, DEFAULT_POOL_INITIAL_CONN_CAPACITY,
+    DEFAULT_POOL_POST_PROGRESS_SPIN_ITERS, Pool, PoolConfig,
 };
 
 #[cfg(test)]
